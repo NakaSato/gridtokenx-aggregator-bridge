@@ -1,0 +1,79 @@
+   Compiling gridtokenx-oracle-bridge v0.1.0 (/Users/chanthawat/Developments/gridtokenx-platform-infa/gridtokenx-oracle-bridge)
+warning: unused imports: `DateTime` and `Utc`
+ --> gridtokenx-oracle-bridge/src/aggregator/mod.rs:2:14
+  |
+2 | use chrono::{DateTime, Utc};
+  |              ^^^^^^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::protocol::battery::BatteryAdapter`
+  --> gridtokenx-oracle-bridge/src/handlers.rs:14:5
+   |
+14 | use crate::protocol::battery::BatteryAdapter;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::protocol::stacks::ocpp::OcppStack`
+  --> gridtokenx-oracle-bridge/src/handlers.rs:15:5
+   |
+15 | use crate::protocol::stacks::ocpp::OcppStack;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated module `solana_sdk::system_program`: Use `solana_system_interface::program` instead
+ --> gridtokenx-oracle-bridge/src/blockchain/mod.rs:7:17
+  |
+7 | use solana_sdk::system_program;
+  |                 ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: method `get_zone_summary` is never used
+  --> gridtokenx-oracle-bridge/src/aggregator/mod.rs:40:12
+   |
+15 | impl Aggregator {
+   | --------------- method in this implementation
+...
+40 |     pub fn get_zone_summary(&self, zone_id: i32) -> Option<(D...
+   |            ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `protocol_name` and `device_types` are never used
+  --> gridtokenx-oracle-bridge/src/protocol/mod.rs:22:8
+   |
+20 | pub trait DeviceProtocol: Send + Sync {
+   |           -------------- methods in this trait
+21 |     /// Human-readable protocol name (e.g.,...
+22 |     fn protocol_name(&self) -> &str;
+   |        ^^^^^^^^^^^^^
+...
+25 |     fn device_types(&self) -> Vec<DeviceType>;
+   |        ^^^^^^^^^^^^
+
+warning: method `name` is never used
+  --> gridtokenx-oracle-bridge/src/protocol/stacks/mod.rs:15:8
+   |
+14 | pub trait ProtocolStack: Send + Sync {
+   |           ------------- method in this trait
+15 |     fn name(&self) -> &'static str;
+   |        ^^^^
+
+warning: `gridtokenx-oracle-bridge` (bin "gridtokenx-oracle-bridge") generated 7 warnings (run `cargo fix --bin "gridtokenx-oracle-bridge" -p gridtokenx-oracle-bridge` to apply 3 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.45s
+     Running `/Users/chanthawat/Developments/gridtokenx-platform-infa/target/debug/gridtokenx-oracle-bridge`
+[2m2026-03-25T06:13:25.326727Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🚀 Starting GridTokenX Oracle Bridge + IoT Gateway
+[2m2026-03-25T06:13:25.326841Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🔗 Redis: redis://127.0.0.1:6379
+[2m2026-03-25T06:13:25.326847Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🔗 Solana RPC: http://127.0.0.1:8899
+[2m2026-03-25T06:13:25.326852Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🌐 IoT Gateway port: 4010
+[2m2026-03-25T06:13:25.328006Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::blockchain[0m[2m:[0m 🔑 Authority Loaded: 7rdNNcszvgNcYqQezZicnFHZ9kxyPcSpFCnRNB52meHK
+[2m2026-03-25T06:13:25.328014Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::blockchain[0m[2m:[0m 🔗 Oracle Program: YEyAcHFbsV6e4E3G3H1ZBoQJ7YiMVaZf3vrdcVxjkAT
+[2m2026-03-25T06:13:25.332214Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::router[0m[2m:[0m 📏 Redis stream MAXLEN cap: ~100000
+[2m2026-03-25T06:13:25.332453Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m ✅ Oracle Bridge + IoT Gateway initialized
+[2m2026-03-25T06:13:25.332460Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m    📡 IoT Gateway accepting connections on 0.0.0.0:4010
+[2m2026-03-25T06:13:25.332466Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m    👂 Oracle Bridge listening on Redis stream
+[2m2026-03-25T06:13:25.334642Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 👂 Listening to streams: ["gridtokenx:events:v1", "gridtokenx:ev:v1", "gridtokenx:battery:v1"] (group: oracle_bridge_group)
+[2m2026-03-25T06:13:25.336460Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0060 (LOAD-TEST-0060)
+[2m2026-03-25T06:13:40.399121Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0060 - TX: 35MMesYPajBBjBp6EU8zZFCMuMvLMXPE7aY89xEnV24EnvKgYEkXZbPsknDRZ2ZpkeYYAbUZFT4cnynvBWpaiWpq
+[2m2026-03-25T06:13:40.399302Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0093 (LOAD-TEST-0093)
+[2m2026-03-25T06:13:54.960975Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0093 - TX: 2V2zmyD252pzDhv2D3y5yZuTVT9awiqyWzP2VFmRmTDGJoe6zBMfjyyX12UaKARPuZoWmAUjrDEJAw2T7vSQWVwB
+[2m2026-03-25T06:13:54.961024Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0062 (LOAD-TEST-0062)

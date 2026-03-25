@@ -1,0 +1,109 @@
+   Compiling gridtokenx-oracle-bridge v0.1.0 (/Users/chanthawat/Developments/gridtokenx-platform-infa/gridtokenx-oracle-bridge)
+warning: unused imports: `DateTime` and `Utc`
+ --> gridtokenx-oracle-bridge/src/aggregator/mod.rs:2:14
+  |
+2 | use chrono::{DateTime, Utc};
+  |              ^^^^^^^^  ^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: use of deprecated module `solana_sdk::system_program`: Use `solana_system_interface::program` instead
+ --> gridtokenx-oracle-bridge/src/blockchain/mod.rs:7:17
+  |
+7 | use solana_sdk::system_program;
+  |                 ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(deprecated)]` on by default
+
+warning: method `get_zone_summary` is never used
+  --> gridtokenx-oracle-bridge/src/aggregator/mod.rs:40:12
+   |
+15 | impl Aggregator {
+   | --------------- method in this implementation
+...
+40 |     pub fn get_zone_summary(&self, zone_id: i32) -> Option<(Decimal, De...
+   |            ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `protocol_name` and `device_types` are never used
+  --> gridtokenx-oracle-bridge/src/protocol/mod.rs:21:8
+   |
+19 | pub trait DeviceProtocol: Send + Sync {
+   |           -------------- methods in this trait
+20 |     /// Human-readable protocol name (e.g., "DLMS/COSEM", "OCPP 1.6").
+21 |     fn protocol_name(&self) -> &str;
+   |        ^^^^^^^^^^^^^
+...
+24 |     fn device_types(&self) -> Vec<DeviceType>;
+   |        ^^^^^^^^^^^^
+
+warning: `gridtokenx-oracle-bridge` (bin "gridtokenx-oracle-bridge") generated 4 warnings (run `cargo fix --bin "gridtokenx-oracle-bridge" -p gridtokenx-oracle-bridge` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.18s
+     Running `/Users/chanthawat/Developments/gridtokenx-platform-infa/target/debug/gridtokenx-oracle-bridge`
+[2m2026-03-25T06:06:31.222974Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🚀 Starting GridTokenX Oracle Bridge + IoT Gateway
+[2m2026-03-25T06:06:31.223145Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🔗 Redis: redis://127.0.0.1:6379
+[2m2026-03-25T06:06:31.223152Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🔗 Solana RPC: http://127.0.0.1:8899
+[2m2026-03-25T06:06:31.223156Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m 🌐 IoT Gateway port: 4010
+[2m2026-03-25T06:06:31.224307Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::blockchain[0m[2m:[0m 🔑 Authority Loaded: 7rdNNcszvgNcYqQezZicnFHZ9kxyPcSpFCnRNB52meHK
+[2m2026-03-25T06:06:31.224318Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::blockchain[0m[2m:[0m 🔗 Oracle Program: YEyAcHFbsV6e4E3G3H1ZBoQJ7YiMVaZf3vrdcVxjkAT
+[2m2026-03-25T06:06:31.229374Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::router[0m[2m:[0m 📏 Redis stream MAXLEN cap: ~100000
+[2m2026-03-25T06:06:31.229639Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m ✅ Oracle Bridge + IoT Gateway initialized
+[2m2026-03-25T06:06:31.229647Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m    📡 IoT Gateway accepting connections on 0.0.0.0:4010
+[2m2026-03-25T06:06:31.229653Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge[0m[2m:[0m    👂 Oracle Bridge listening on Redis stream
+[2m2026-03-25T06:06:31.230713Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 👂 Listening to streams: ["gridtokenx:events:v1", "gridtokenx:ev:v1", "gridtokenx:battery:v1"] (group: oracle_bridge_group)
+[2m2026-03-25T06:06:31.232401Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0046 (LOAD-TEST-0046)
+[2m2026-03-25T06:06:45.799699Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0046 - TX: 5o5qxH4v4TY4crGH8iGkYPkcheTmtVRLp6P78WHt29g6odnEVG5c2i6bouvpTrGhWiQuTobRSFxueuDSJPGcEWUz
+[2m2026-03-25T06:06:45.799758Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0023 (LOAD-TEST-0023)
+[2m2026-03-25T06:07:00.897254Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0023 - TX: 3tzoPe8sh5y657C3UJE2FM9qpiFsEtYqF7PrXHow9Uero7xt6khwTvz6xSQcck5kwet4f24q1h2PydMXSmhkJaaQ
+[2m2026-03-25T06:07:00.897305Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0048 (LOAD-TEST-0048)
+[2m2026-03-25T06:07:15.982694Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0048 - TX: 2D9w7N9txfs4SiuPsRm4rXpi8sKoTW8qA5s2QdCto1zg1k5UzhG6u2XbF7xBMb48V1Xd3GoxH9ur57H6RGdzJNaa
+[2m2026-03-25T06:07:15.982770Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0050 (LOAD-TEST-0050)
+[2m2026-03-25T06:07:30.547044Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0050 - TX: 3bHWuzSzkyvwkBwAGVreVQQzGUAQGd4tPvvhm3ZvVaVcFvQT4uwh6dx7xPKDxm5EYUmmKR7mkLjYE2K9SEHb6Xcy
+[2m2026-03-25T06:07:30.547097Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0044 (LOAD-TEST-0044)
+[2m2026-03-25T06:07:45.614687Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0044 - TX: 2FLyn1HGbGJ3Yivx6A6iczFypLJiytyzuH7yBADcAtCdegbEsbwnAg3YbVMbhdxUWZ2JHSihKqLXHkinACX9qWXo
+[2m2026-03-25T06:07:45.615406Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0053 (LOAD-TEST-0053)
+[2m2026-03-25T06:08:00.177983Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0053 - TX: 4Y5ncNYFLPbUdR3u7M2zPtaoDERFhosDeKZB33cEUzZ2CfLBJGe4sbg9zRs52v4wU3gBZYLHiWMWtBRZRYDoEoe2
+[2m2026-03-25T06:08:00.178039Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0058 (LOAD-TEST-0058)
+[2m2026-03-25T06:08:15.241682Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0058 - TX: ydb9Xknx5HbE7LdRhnPZgPpGdJKVyozGjQSsfj6GGyWC4KNRzNoPEMdkN9fCNyJFZbHNnjqs9VYZk2aSJ1L6qVs
+[2m2026-03-25T06:08:15.241739Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0049 (LOAD-TEST-0049)
+[2m2026-03-25T06:08:29.805982Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0049 - TX: 3Vs2rYMLe5PXWrkC3Ne7Fx8q17Rvk9QGWJV8FRXW7MQ3Z5aPaBkF7F7jXV1J3Jp5EtBfLdfh748Nt5WNZwLgmWKp
+[2m2026-03-25T06:08:29.806033Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0072 (LOAD-TEST-0072)
+[2m2026-03-25T06:08:44.867267Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0072 - TX: 2WFon5xynLSigSxCsysoF3Yud344gg3RCvNwnDuoCYK7kFkjXiduoURtk21ZBNreeaW2ru6seUvuJME7QuifjjPF
+[2m2026-03-25T06:08:44.867325Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received SmartMeter reading: LOAD-TEST-0071 (LOAD-TEST-0071)
+[2m2026-03-25T06:08:59.932334Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [SmartMeter] LOAD-TEST-0071 - TX: 2ybCFjHRytJPUfY17e7diUCMqF4AcsPeVY6ecHDQdMsn3sGQQrF9u5GKzSfsZoAA6cwbPkcwwvCQ5hLPQA8tiNiF
+[2m2026-03-25T06:08:59.932393Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0041 (LOAD-TEST-0041)
+[2m2026-03-25T06:09:15.015807Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0041 - TX: 3yFkUnsJ5WhYTG4m9QMgvS3Q8VBo1bvUY9KyApZ99AdRvSvRoGoG5ZjwuufTV1EcoqhyatzMsDm2DMFKKsBUWXbb
+[2m2026-03-25T06:09:15.016088Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0038 (LOAD-TEST-0038)
+[2m2026-03-25T06:09:30.082396Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0038 - TX: 4kMmCyHb8Dad6N2Ji3dtnNb1pV7PXJz9XLcbhzDgKch1giKc5wjpfqXLyQpDvAXBNwewXXfSvLG33cJ5WSMBLnDf
+[2m2026-03-25T06:09:30.082451Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0055 (LOAD-TEST-0055)
+[2m2026-03-25T06:09:44.642490Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0055 - TX: jF7GYpnruZ58qxJFXyNhTcQcMwMqB33kmn66DbyE1o9bk3uJXrkRyJSygZz2mKZ1QHQ4VjauHSzQsTEdWA5cQYf
+[2m2026-03-25T06:09:44.642540Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0057 (LOAD-TEST-0057)
+[2m2026-03-25T06:09:59.708122Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0057 - TX: 5GeXPJ3gtK6pnvYwaEUH2Ab3GTaCVVdEX3F8iuHXzg9h5hHCN1VyFDi1g4ziZVJ6B7MQPVozWWwHTBEiXis9ETry
+[2m2026-03-25T06:09:59.708225Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0063 (LOAD-TEST-0063)
+[2m2026-03-25T06:10:14.773515Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0063 - TX: qDeqi8vhNkpomRgEfgVZSGkfS4R3XumdiYjHTdrZHmV9q4MaA6cNQA68wzPk2jtcT2aJ6G4SUJaKv63carbi2Ny
+[2m2026-03-25T06:10:14.773567Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0070 (LOAD-TEST-0070)
+[2m2026-03-25T06:10:29.336552Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0070 - TX: 2zmeJhSQ7cRPSyviHnkzHmM9ceYffpqEBrT6pekrVjyqZ28N7pLVi6AGt6SStycZkGj1scekgZm9mMgHCRxoZZpZ
+[2m2026-03-25T06:10:29.336603Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0069 (LOAD-TEST-0069)
+[2m2026-03-25T06:10:44.414225Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0069 - TX: 2qcFv4z9yqx9ZHJkurf8Eqf3JnvsserCWdB5PcAJdYnfub8zFhQUZapxLaiaTP1zV3ZbrxrriWj6dpXS7cSaBmpy
+[2m2026-03-25T06:10:44.415226Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0066 (LOAD-TEST-0066)
+[2m2026-03-25T06:10:58.985945Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0066 - TX: 4awvAvJCRhAh7AEuxhnLwm8HpCqfZwAK8ArbEVRywMdMUdVu25f7s9vzh85z8TtnqEVgdPmMHbXM3idWgpLbg5vP
+[2m2026-03-25T06:10:58.986202Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0074 (LOAD-TEST-0074)
+[2m2026-03-25T06:11:14.054795Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0074 - TX: 21zpE3pYXSXgwciNAdHN1XRT8t6Twv1tsPrxBBc8Z62SDKriXhdhoQpcwfxGZTsBX3GDoYCNYxyJ5y55GSLpAyvs
+[2m2026-03-25T06:11:14.054847Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received EvCharger reading: LOAD-TEST-0073 (LOAD-TEST-0073)
+[2m2026-03-25T06:11:29.121675Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [EvCharger] LOAD-TEST-0073 - TX: VB2zFWjnwzLGjbPEUs54LexnPLuJLTuNV32Si5kCGdbajbYZJMdDENn13eSeTx1PmRtSnHNMawhdTv69jCcPFEW
+[2m2026-03-25T06:11:29.122245Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0056 (LOAD-TEST-0056)
+[2m2026-03-25T06:11:43.687567Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0056 - TX: 3JvRY8UJEuf1QkqjNPM2VVJoCdr5VGzrHRftEuQnBiANgvwcviiNt5DwEoJBv3PfcyBLhoFETqfDbQhB9K2HZaQH
+[2m2026-03-25T06:11:43.688259Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0051 (LOAD-TEST-0051)
+[2m2026-03-25T06:11:58.749515Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0051 - TX: 5WTpSdSyh7jsBphMzQEDjAGsh1C4XM1Y1pZFeE1wsUoaXqxS5knVckC5Bctf4rQ3UULgvvqfo5iAQPmuniVqMtsb
+[2m2026-03-25T06:11:58.749572Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0059 (LOAD-TEST-0059)
+[2m2026-03-25T06:12:13.816571Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0059 - TX: 4Wym6ZsNXCTMD899JeY4UgKCPFnFsxUHkN6ApfSHVMdaU3MdUA71pvVM1tgSuVAPc23bqgKrU7wWNiXqsELepYXU
+[2m2026-03-25T06:12:13.817037Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0061 (LOAD-TEST-0061)
+[2m2026-03-25T06:12:28.380654Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0061 - TX: 5GoGDzDt2Pm6sURyHTECjfQtTDmUjX61MdDBk8theAoSPxdWLwVwU1ufWjEh3tGXZv7fEqi9LXzdYkDYrrmFWFo3
+[2m2026-03-25T06:12:28.380992Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0094 (LOAD-TEST-0094)
+[2m2026-03-25T06:12:43.457023Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0094 - TX: 4ZuGxzEbKQKUM2AEQ84KXCEmjBXZD4DmJTQN5qQT2B5N4QTLDgDvvS4BjUbHMj1saRv1xfuAVA6ypdPuBJ8NvFuM
+[2m2026-03-25T06:12:43.457075Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0078 (LOAD-TEST-0078)
+[2m2026-03-25T06:12:58.517178Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0078 - TX: 49fHBcMW4MwufDizxifSbDCn4PKbSafHPHzwfUiFwsCPT29tJgY8uuP7Dv1ZqyfcgeeWBao9rerstoskZ5CR3uqZ
+[2m2026-03-25T06:12:58.517612Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0088 (LOAD-TEST-0088)
+[2m2026-03-25T06:13:13.635441Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m ⛓️ On-Chain Update Success: [Battery] LOAD-TEST-0088 - TX: 3Y1UR6goc1ZRbVftniLoRAVTVXze7SbpiGpMXXndo9wYUJ8cRVDkySFqYXjppJWKG5aj7SYFW2o2XBhMP2jQUNXZ
+[2m2026-03-25T06:13:13.636174Z[0m [32m INFO[0m [2mgridtokenx_oracle_bridge::ingester[0m[2m:[0m 🌐 Received Battery reading: LOAD-TEST-0089 (LOAD-TEST-0089)

@@ -1,0 +1,42 @@
+[package]
+name = "gridtokenx-oracle-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "GridTokenX Oracle Bridge + IoT Gateway - Unified ingestion and on-chain synchronization"
+
+[dependencies]
+# Async Runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Web Framework (IoT Gateway)
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["cors", "trace"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Caching/Events
+redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
+
+# Blockchain
+solana-client = { workspace = true }
+solana-sdk = { workspace = true }
+solana-program = { workspace = true }
+anchor-client = { workspace = true }
+anchor-lang = { workspace = true }
+
+# Utils
+chrono = { workspace = true }
+uuid = { workspace = true }
+rust_decimal = { workspace = true, features = ["serde-float", "maths"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+dotenvy = { workspace = true }
+bs58 = { workspace = true }
+
