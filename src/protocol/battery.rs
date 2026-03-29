@@ -16,14 +16,6 @@ impl BatteryAdapter {
 
 #[async_trait::async_trait]
 impl DeviceProtocol for BatteryAdapter {
-    fn protocol_name(&self) -> &str {
-        "Battery Storage (REST/JSON)"
-    }
-
-    fn device_types(&self) -> Vec<DeviceType> {
-        vec![DeviceType::Battery]
-    }
-
     fn parse(&self, raw: &RawPayload) -> Result<DeviceReading> {
         let payload: BatteryPayload = serde_json::from_value(raw.body.clone())?;
 

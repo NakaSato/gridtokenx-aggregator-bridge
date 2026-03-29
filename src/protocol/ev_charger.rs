@@ -17,14 +17,6 @@ impl EvChargerAdapter {
 
 #[async_trait::async_trait]
 impl DeviceProtocol for EvChargerAdapter {
-    fn protocol_name(&self) -> &str {
-        "EV Charger (OCPP-compatible REST/JSON)"
-    }
-
-    fn device_types(&self) -> Vec<DeviceType> {
-        vec![DeviceType::EvCharger]
-    }
-
     fn parse(&self, raw: &RawPayload) -> Result<DeviceReading> {
         let payload: EvChargerPayload = serde_json::from_value(raw.body.clone())?;
 

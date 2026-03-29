@@ -9,8 +9,8 @@ use uuid::Uuid;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::blockchain::BlockchainClient;
 use crate::aggregator::Aggregator;
+use std::sync::atomic::AtomicI64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeterReadingPayload {
@@ -35,7 +35,7 @@ pub enum Event {
     SmartMeterReading(crate::models::DeviceReading),
     EvChargingEvent(crate::models::DeviceReading),
     BatteryStateUpdate(crate::models::DeviceReading),
-    
+
     OrderMatched(serde_json::Value),
     OrderUpdate(serde_json::Value),
     SettlementRequested(serde_json::Value),
@@ -51,19 +51,26 @@ pub struct EventIngester {
     streams: Vec<String>,
     group_name: String,
     consumer_name: String,
-    blockchain_client: Arc<BlockchainClient>,
+    api_gateway_url: String,
+    http_client: reqwest::Client,
     aggregator: Arc<Mutex<Aggregator>>,
+    #[allow(dead_code)] // Reserved for future clock synchronization features
+    clock_offset: Arc<AtomicI64>,
+    metrics: Arc<crate::state::Metrics>,
 }
 
 impl EventIngester {
     pub async fn new(
         redis_url: &str,
-        blockchain_client: Arc<BlockchainClient>,
+        api_gateway_url: &str,
         aggregator: Arc<Mutex<Aggregator>>,
+        metrics: Arc<crate::state::Metrics>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
-        let connection_manager = ConnectionManager::new(client).await?;
         
+        // Try to create connection manager with retry
+        let connection_manager = Self::create_connection_manager(&client).await?;
+
         let streams = vec![
             std::env::var("EVENT_STREAM_NAME")
                 .unwrap_or_else(|_| "gridtokenx:events:v1".to_string()),
@@ -78,16 +85,49 @@ impl EventIngester {
             streams,
             group_name,
             consumer_name,
-            blockchain_client,
+            api_gateway_url: api_gateway_url.to_string(),
+            http_client: reqwest::Client::new(),
             aggregator,
+            clock_offset: Arc::new(AtomicI64::new(0)),
+            metrics,
         })
     }
 
-    pub async fn run(&self) -> Result<()> {
+    async fn create_connection_manager(client: &Client) -> Result<ConnectionManager> {
+        use tokio::time::{sleep, Duration};
+        
+        for attempt in 1..=10 {
+            match ConnectionManager::new(client.clone()).await {
+                Ok(cm) => {
+                    info!("✅ Redis connection manager created");
+                    return Ok(cm);
+                }
+                Err(e) => {
+                    if attempt <= 5 {
+                        warn!("⚠️ Redis connection attempt {} failed: {}. Retrying in {}s...", 
+                              attempt, e, attempt);
+                        sleep(Duration::from_secs(attempt)).await;
+                    } else {
+                        return Err(anyhow::anyhow!("Failed to connect to Redis after {} attempts: {}", attempt, e));
+                    }
+                }
+            }
+        }
+        
+        Err(anyhow::anyhow!("Failed to connect to Redis"))
+    }
+
+    pub async fn run(self: Arc<Self>) -> Result<()> {
         self.setup_consumer_groups().await?;
-        
+
         info!("👂 Listening to streams: {:?} (group: {})", self.streams, self.group_name);
-        
+
+        // Start background clock sync
+        let ingester_clone = self.clone();
+        tokio::spawn(async move {
+            ingester_clone.sync_clock_loop().await;
+        });
+
         loop {
             if let Err(e) = self.process_next_batch().await {
                 error!("⚠️ Error processing batch: {}", e);
@@ -96,20 +136,35 @@ impl EventIngester {
         }
     }
 
+    async fn sync_clock_loop(&self) {
+        // Clock sync no longer needed since we're not submitting directly to blockchain
+        // Keep this as a no-op for future use
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+        }
+    }
+
     async fn setup_consumer_groups(&self) -> Result<()> {
         let mut conn = self.connection_manager.clone();
-        
+
         for stream in &self.streams {
-            // Ensure stream exists and create group
-            let _: redis::RedisResult<()> = conn.xgroup_create_mkstream(stream, &self.group_name, "$").await;
+            // Ensure stream exists and create group (ignore error if group already exists)
+            let result: redis::RedisResult<()> = conn.xgroup_create_mkstream(stream, &self.group_name, "$").await;
+            if let Err(e) = result {
+                let err_str = e.to_string();
+                if !err_str.contains("BUSYGROUP") {
+                    // Only log error if it's not "group already exists"
+                    warn!("⚠️ Could not create consumer group for {}: {}", stream, e);
+                }
+            }
         }
-        
+
         Ok(())
     }
 
     async fn process_next_batch(&self) -> Result<()> {
         let mut conn = self.connection_manager.clone();
-        
+
         let options = StreamReadOptions::default()
             .group(&self.group_name, &self.consumer_name)
             .block(2000)
@@ -157,7 +212,7 @@ impl EventIngester {
                             }
                         }
                     }
-                    
+
                     // Return the pair to ACK
                     (stream_name_clone, entry_clone.id)
                 });
@@ -166,7 +221,7 @@ impl EventIngester {
 
         if !futures.is_empty() {
             let results = futures::future::join_all(futures).await;
-            
+
             // Batch ACK
             for (stream_name, entry_id) in results {
                 let _: redis::RedisResult<()> = conn.xack(&stream_name, &self.group_name, &[&entry_id]).await;
@@ -178,70 +233,104 @@ impl EventIngester {
 
     async fn handle_meter_reading(&self, payload: MeterReadingPayload) -> Result<()> {
         info!("📈 Received MeterReadingCreated: {} ({} kWh)", payload.meter_serial, payload.kwh);
-        
-        // 1. Update Aggregator
+
+        // 1. Update Aggregator (local stats)
         {
             let mut agg = self.aggregator.lock().await;
             agg.handle_reading(payload.clone());
         }
 
-        // 2. Submit to Blockchain
-        let produced = (payload.energy_generated.unwrap_or(Decimal::ZERO) * Decimal::from(1000)).to_string().parse::<u64>().unwrap_or(0);
-        let consumed = (payload.energy_consumed.unwrap_or(Decimal::ZERO) * Decimal::from(1000)).to_string().parse::<u64>().unwrap_or(0);
-        let timestamp = Utc::now().timestamp();
-
-        match self.blockchain_client.submit_meter_reading(
-            payload.meter_serial.clone(),
-            produced,
-            consumed,
-            timestamp
-        ).await {
-            Ok(sig) => info!("⛓️ On-Chain Update Success: [Meter] {} - TX: {}", payload.meter_serial, sig),
-            Err(e) => error!("❌ On-Chain Update Failed: [Meter] {} - {}", payload.meter_serial, e),
-        }
+        // 2. Forward to API Gateway for blockchain submission
+        self.forward_to_api_gateway(&payload).await?;
 
         Ok(())
     }
 
     async fn handle_iot_reading(&self, reading: crate::models::DeviceReading) -> Result<()> {
         use crate::models::DeviceMetrics;
-        
+        use rust_decimal::Decimal;
+
         info!(
             "🌐 Received {:?} reading: {} ({})",
             reading.device_type, reading.serial_number, reading.device_id
         );
 
-        // Map DeviceReading to Blockchain submission
-        // We use the same submit_meter_reading but map metrics accordingly
-        let (produced, consumed) = match reading.metrics {
+        // Map DeviceReading to MeterReadingPayload for API Gateway
+        let (energy_generated, energy_consumed) = match reading.metrics {
             DeviceMetrics::Energy { generated_kwh, consumed_kwh, .. } => {
-                ((generated_kwh * 1000.0) as u64, (consumed_kwh * 1000.0) as u64)
+                (Some(generated_kwh), Some(consumed_kwh))
             }
             DeviceMetrics::EvSession { energy_delivered_kwh, .. } => {
                 // EV charging is "consumed" energy from the grid's perspective
-                (0, (energy_delivered_kwh * 1000.0) as u64)
+                (Some(0.0), Some(energy_delivered_kwh))
             }
             DeviceMetrics::BatteryState { power_kw, mode, .. } => {
-                // Approximate energy based on power if available, or just use 0 if state-only
-                // For now, let's treat power_kw as the "rate"
                 match mode {
-                    crate::models::BatteryMode::Charging => (0, (power_kw.abs() * 1000.0) as u64),
-                    crate::models::BatteryMode::Discharging => ((power_kw.abs() * 1000.0) as u64, 0),
-                    crate::models::BatteryMode::Idle => (0, 0),
+                    crate::models::BatteryMode::Charging => (Some(0.0), Some(power_kw.abs())),
+                    crate::models::BatteryMode::Discharging => (Some(power_kw.abs()), Some(0.0)),
+                    crate::models::BatteryMode::Idle => (Some(0.0), Some(0.0)),
                 }
             }
         };
 
-        let timestamp = reading.timestamp.timestamp();
+        let payload = MeterReadingPayload {
+            reading_id: Uuid::new_v4(),
+            meter_id: Uuid::new_v4(), // DeviceReading doesn't have meter_id
+            meter_serial: reading.serial_number,
+            user_id: Uuid::nil(), // DeviceReading doesn't have user_id
+            wallet_address: String::new(), // DeviceReading doesn't have wallet_address
+            zone_id: reading.zone_id,
+            kwh: Decimal::ZERO, // Not used for IoT readings
+            energy_generated: energy_generated.and_then(|v| Decimal::from_f64_retain(v)),
+            energy_consumed: energy_consumed.and_then(|v| Decimal::from_f64_retain(v)),
+            timestamp: reading.timestamp,
+        };
 
-        match self.blockchain_client.submit_meter_reading(
-            reading.serial_number.clone(),
-            produced,
-            consumed,
-            timestamp
-        ).await {
-            Ok(sig) => info!("⛓️ On-Chain Update Success: [{:?}] {} - TX: {}", reading.device_type, reading.serial_number, sig),
-            Err(e) => error!("❌ On-Chain Update Failed: [{:?}] {} - {}", reading.device_type, reading.serial_number, e),
+        // Forward to API Gateway
+        self.forward_to_api_gateway(&payload).await?;
+
+        Ok(())
+    }
+
+    /// Forward meter reading to API Gateway for blockchain submission
+    async fn forward_to_api_gateway(&self, payload: &MeterReadingPayload) -> Result<()> {
+        let url = format!("{}/api/v1/oracle/submit-reading", self.api_gateway_url);
+
+        // Convert timestamp to i64
+        let timestamp = payload.timestamp.timestamp();
+
+        let response = self.http_client
+            .post(&url)
+            .json(&serde_json::json!({
+                "reading_id": payload.reading_id,
+                "meter_id": payload.meter_id,
+                "meter_serial": payload.meter_serial,
+                "user_id": payload.user_id,
+                "wallet_address": payload.wallet_address,
+                "zone_id": payload.zone_id,
+                "kwh": payload.kwh.to_string(),
+                "energy_generated": payload.energy_generated.map(|d| d.to_string()),
+                "energy_consumed": payload.energy_consumed.map(|d| d.to_string()),
+                "timestamp": timestamp,
+            }))
+            .send()
+            .await
+            .context("Failed to send request to API Gateway")?;
+
+        if response.status().is_success() {
+            let result: serde_json::Value = response.json().await
+                .context("Failed to parse API Gateway response")?;
+            
+            if let Some(signature) = result.get("signature").and_then(|v| v.as_str()) {
+                info!("⛓️ API Gateway submitted to blockchain: TX: {}", signature);
+                self.metrics.record_sync();
+            } else {
+                warn!("⚠️ API Gateway response missing signature");
+            }
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+            error!("❌ API Gateway rejected reading: {}", error_text);
+            return Err(anyhow::anyhow!("API Gateway error: {}", error_text));
         }
 
         Ok(())

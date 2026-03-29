@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use uuid::Uuid;
 use tracing::info;
@@ -35,9 +34,5 @@ impl Aggregator {
         }
 
         info!("🧮 Aggregated reading for meter {} in zone {:?}", payload.meter_serial, payload.zone_id);
-    }
-
-    pub fn get_zone_summary(&self, zone_id: i32) -> Option<(Decimal, Decimal, u64)> {
-        self.zone_stats.get(&zone_id).copied()
     }
 }

@@ -12,8 +12,6 @@ use anyhow::Result;
 /// may involve state machines or multi-step handshake logic.
 #[async_trait]
 pub trait ProtocolStack: Send + Sync {
-    fn name(&self) -> &'static str;
-    
     /// Handle a raw incoming message from a private network device.
     /// This may return a canonical `DeviceReading` if the message
     /// contains enough information to update the ledger.

@@ -90,6 +90,7 @@ pub enum BatteryMode {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SmartMeterPayload {
+    #[serde(alias = "meter_serial", alias = "meter_id")]
     pub device_id: String,
     pub serial_number: Option<String>,
     pub zone_id: Option<i32>,
@@ -97,8 +98,13 @@ pub struct SmartMeterPayload {
     pub energy_generated: f64,
     pub energy_consumed: f64,
     pub reading_value: Option<f64>,
-    #[serde(default)]
+    #[serde(flatten, default)]
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchSmartMeterPayload {
+    pub readings: Vec<SmartMeterPayload>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

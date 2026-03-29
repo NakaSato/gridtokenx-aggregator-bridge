@@ -18,12 +18,6 @@ pub struct RawPayload {
 /// payloads into the canonical `DeviceReading` format.
 #[async_trait]
 pub trait DeviceProtocol: Send + Sync {
-    /// Human-readable protocol name (e.g., "DLMS/COSEM", "OCPP 1.6").
-    fn protocol_name(&self) -> &str;
-
-    /// Which device types this adapter handles.
-    fn device_types(&self) -> Vec<DeviceType>;
-
     /// Parse raw payload into a canonical `DeviceReading`.
     fn parse(&self, raw: &RawPayload) -> Result<DeviceReading>;
 }

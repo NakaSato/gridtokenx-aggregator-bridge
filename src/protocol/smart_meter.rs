@@ -18,14 +18,6 @@ impl SmartMeterAdapter {
 
 #[async_trait::async_trait]
 impl DeviceProtocol for SmartMeterAdapter {
-    fn protocol_name(&self) -> &str {
-        "GridTokenX Smart Meter (REST/JSON)"
-    }
-
-    fn device_types(&self) -> Vec<DeviceType> {
-        vec![DeviceType::SmartMeter]
-    }
-
     fn parse(&self, raw: &RawPayload) -> Result<DeviceReading> {
         let payload: SmartMeterPayload = serde_json::from_value(raw.body.clone())?;
 
