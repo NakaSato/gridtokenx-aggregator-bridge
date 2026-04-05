@@ -10,6 +10,7 @@ use metrics::{counter, gauge, histogram};
 use std::time::Instant;
 
 /// Records IoT ingestion request metrics
+#[allow(dead_code)]
 pub fn record_ingestion_request(
     device_type: &str,
     success: bool,
@@ -57,6 +58,7 @@ pub fn record_battery_data(success: bool, duration_ms: f64) {
 }
 
 /// Records Redis stream processing metrics
+#[allow(dead_code)]
 pub fn record_redis_stream_processing(
     stream_name: &str,
     messages_processed: u64,
@@ -93,6 +95,7 @@ pub fn record_oracle_forwarding(success: bool, duration_ms: f64) {
 }
 
 /// Records blockchain submission metrics
+#[allow(dead_code)]
 pub fn record_blockchain_submission(
     operation: &str,
     success: bool,
@@ -115,6 +118,7 @@ pub fn record_blockchain_submission(
 }
 
 /// Records device connectivity metrics
+#[allow(dead_code)]
 pub fn record_device_connection(device_type: &str, connected: bool) {
     if connected {
         counter!("oracle_device_connections_total",
@@ -128,11 +132,13 @@ pub fn record_device_connection(device_type: &str, connected: bool) {
 }
 
 /// Records active device count
+#[allow(dead_code)]
 pub fn record_active_devices(device_type: &str, count: u64) {
     gauge!("oracle_active_devices", "device_type" => device_type.to_string()).set(count as f64);
 }
 
 /// Records data validation metrics
+#[allow(dead_code)]
 pub fn record_data_validation(valid: bool, reason: &str) {
     counter!("oracle_data_validations_total",
         "valid" => valid.to_string(),
@@ -147,6 +153,7 @@ pub fn record_data_validation(valid: bool, reason: &str) {
 }
 
 /// Records protocol adapter metrics
+#[allow(dead_code)]
 pub fn record_protocol_adapter(
     protocol: &str,
     operation: &str,
@@ -166,6 +173,7 @@ pub fn record_protocol_adapter(
 }
 
 /// Records gRPC client metrics for IAM
+#[allow(dead_code)]
 pub fn record_grpc_client_call(service: &str, method: &str, success: bool, duration_ms: f64) {
     counter!("oracle_grpc_client_calls_total",
         "service" => service.to_string(),
@@ -180,12 +188,14 @@ pub fn record_grpc_client_call(service: &str, method: &str, success: bool, durat
 }
 
 /// Records HTTP request metrics for Oracle Bridge
+#[allow(dead_code)]
 pub struct HttpMetricsTimer {
     start: Instant,
     method: String,
     path: String,
 }
 
+#[allow(dead_code)]
 impl HttpMetricsTimer {
     pub fn new(method: &str, path: &str) -> Self {
         let start = Instant::now();
@@ -240,6 +250,7 @@ impl HttpMetricsTimer {
 }
 
 /// Records API key authentication metrics
+#[allow(dead_code)]
 pub fn record_api_key_auth(success: bool, duration_ms: f64, source: &str) {
     counter!("oracle_api_key_authentications_total",
         "success" => success.to_string(),
@@ -258,6 +269,7 @@ pub fn record_api_key_auth(success: bool, duration_ms: f64, source: &str) {
 }
 
 /// Records energy reading metrics
+#[allow(dead_code)]
 pub fn record_energy_reading(
     reading_type: &str,
     value_kwh: f64,
@@ -272,4 +284,32 @@ pub fn record_energy_reading(
         "reading_type" => reading_type.to_string(),
         "device_id" => device_id.to_string()
     ).record(value_kwh);
+}
+
+// =============================================================================
+// Batch Forwarding Metrics
+// =============================================================================
+
+/// Records batch forwarding operations
+pub fn record_batch_forward(batch_size: usize, accepted: usize, rejected: usize, duration_ms: f64) {
+    counter!("oracle_batch_forwarded_total",
+        "success" => "true"
+    ).increment(accepted as u64);
+
+    counter!("oracle_batch_forwarded_total",
+        "success" => "false"
+    ).increment(rejected as u64);
+
+    counter!("oracle_batch_flushes_total").increment(1);
+
+    histogram!("oracle_batch_size").record(batch_size as f64);
+
+    histogram!("oracle_batch_forward_duration_ms").record(duration_ms);
+}
+
+/// Records batch forwarding failures
+pub fn record_batch_failure(reason: &str) {
+    counter!("oracle_batch_failures_total",
+        "reason" => reason.to_string()
+    ).increment(1);
 }

@@ -22,21 +22,48 @@ serde_json = { workspace = true }
 # Caching/Events
 redis = { workspace = true, features = ["tokio-comp", "connection-manager"] }
 
-# Blockchain
-solana-client = { workspace = true }
-solana-sdk = { workspace = true }
-solana-program = { workspace = true }
-anchor-client = { workspace = true }
-anchor-lang = { workspace = true }
-
 # Utils
 chrono = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v5"] }
 rust_decimal = { workspace = true, features = ["serde-float", "maths"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
+
+# OpenTelemetry (SigNoz integration)
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+tonic = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 dotenvy = { workspace = true }
 bs58 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "chrono"] }
 
+# HTTP Client for API Gateway communication
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "rustls-tls",
+  "gzip",
+] }
+
+# gRPC
+connectrpc = { workspace = true, features = ["server", "client"] }
+buffa = { version = "0.2.0", features = ["json"] }
+http-body = "1.0.0"
+http = "1.0.0"
+
+# Metrics
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+hex = "0.4.3"
+tokio-util = "0.7.18"
+rand.workspace = true
+rand_distr = "0.6.0"
+
+[build-dependencies]
+buffa-build = "0.2.0"
+connectrpc-build = "0.2.0"

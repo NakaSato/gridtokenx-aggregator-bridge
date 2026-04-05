@@ -8,19 +8,16 @@ use tracing::{info, warn};
 
 use crate::state::{AppState, identity::{ApiKeyRequest, ApiKeyResponse}};
 
+#[allow(dead_code)]
 pub async fn api_key_auth(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // 1. Extract API Key (Preferred: X-API-KEY, Legacy: Authorization Bearer)
-    let api_key = if let Some(auth_value) = req.headers().get("X-API-KEY") {
-        auth_value.to_str().ok().map(|s| s.to_string())
-    } else if let Some(auth_value) = req.headers().get("Authorization") {
-        auth_value.to_str().ok().and_then(|s| s.strip_prefix("Bearer ")).map(|s| s.trim().to_string())
-    } else {
-        None
-    };
+    // 1. Extract API Key (Header: X-API-KEY)
+    let api_key = req.headers().get("X-API-KEY")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let api_key = match api_key {
         Some(key) => key,

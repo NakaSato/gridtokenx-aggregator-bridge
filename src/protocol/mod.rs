@@ -1,23 +1,11 @@
-use async_trait::async_trait;
-use anyhow::Result;
-
-pub mod smart_meter;
-pub mod ev_charger;
-pub mod battery;
 pub mod stacks;
+pub mod binary_decoder;
 
-use crate::models::{DeviceReading, DeviceType};
+use crate::models::{DeviceType};
+pub use binary_decoder::DlmsBinaryFrame;
 
 /// Raw incoming payload before protocol-specific parsing.
 pub struct RawPayload {
     pub device_type: DeviceType,
     pub body: serde_json::Value,
-}
-
-/// Trait for protocol adapters that normalize device-specific
-/// payloads into the canonical `DeviceReading` format.
-#[async_trait]
-pub trait DeviceProtocol: Send + Sync {
-    /// Parse raw payload into a canonical `DeviceReading`.
-    fn parse(&self, raw: &RawPayload) -> Result<DeviceReading>;
 }

@@ -85,66 +85,8 @@ pub enum BatteryMode {
 }
 
 // =============================================================================
-// Ingest Request Models (per-device-type input payloads)
+// Private Network Ingestion (OCPP, SunSpec, DLMS, OpenADR)
 // =============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SmartMeterPayload {
-    #[serde(alias = "meter_serial", alias = "meter_id")]
-    pub device_id: String,
-    pub serial_number: Option<String>,
-    pub zone_id: Option<i32>,
-    pub timestamp: Option<DateTime<Utc>>,
-    pub energy_generated: f64,
-    pub energy_consumed: f64,
-    pub reading_value: Option<f64>,
-    #[serde(flatten, default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BatchSmartMeterPayload {
-    pub readings: Vec<SmartMeterPayload>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EvChargerPayload {
-    pub device_id: String,
-    pub serial_number: Option<String>,
-    pub zone_id: Option<i32>,
-    pub timestamp: Option<DateTime<Utc>>,
-    pub energy_delivered_kwh: f64,
-    pub session_id: String,
-    pub connector_id: u32,
-    pub status: Option<EvStatus>,
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BatteryPayload {
-    pub device_id: String,
-    pub serial_number: Option<String>,
-    pub zone_id: Option<i32>,
-    pub timestamp: Option<DateTime<Utc>>,
-    pub soc_percent: f64,
-    pub power_kw: f64,
-    pub temperature_c: Option<f64>,
-    pub mode: Option<BatteryMode>,
-    #[serde(default)]
-    pub metadata: HashMap<String, serde_json::Value>,
-}
-
-// =============================================================================
-// Generic Ingest Request (auto-detect)
-// =============================================================================
-
-#[derive(Debug, Deserialize)]
-pub struct GenericIngestPayload {
-    pub device_type: DeviceType,
-    #[serde(flatten)]
-    pub data: serde_json::Value,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct PrivateNetworkPayload {
@@ -152,6 +94,8 @@ pub struct PrivateNetworkPayload {
     pub device_id: String,
     pub payload: serde_json::Value,
 }
+
+
 
 // =============================================================================
 // API Response

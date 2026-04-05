@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Solana/Anchor build artifacts
+*.so
+*.keypair
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# SQLite databases (if used for local dev)
+*.db
+*.sqlite
+*.sqlite3
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp

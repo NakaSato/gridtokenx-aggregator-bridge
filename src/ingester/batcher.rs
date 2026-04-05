@@ -1,0 +1,230 @@
+use anyhow::{Context, Result};
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
+use tracing::{debug, error, info};
+
+use crate::infra::platform::{PlatformClient, TelemetryRequest};
+use crate::infra::platform::client::TelemetryBatchResponse;
+
+/// Batch size for forwarding to API Gateway
+pub const FORWARD_BATCH_SIZE: usize = 50;
+
+/// Maximum time to wait for batch to fill (milliseconds)
+pub const BATCH_TIMEOUT_MS: u64 = 100;
+
+/// Entry in the batch with Redis metadata for reliable ACK
+#[derive(Debug, Clone)]
+pub struct BatchEntry {
+    pub request: TelemetryRequest,
+    pub stream_name: String,
+    pub entry_id: String,
+}
+
+/// Commands sent to the BatchWorker
+pub enum BatchMessage {
+    /// Add a new reading to the batch
+    Add(Box<BatchEntry>),
+    /// Force a flush of the current batch
+    #[allow(dead_code)]
+    Flush,
+    /// Gracefully shutdown the worker, flushing remaining items
+    Shutdown(tokio::sync::oneshot::Sender<()>),
+}
+
+/// A cloneable handle to the BatchWorker
+#[derive(Clone)]
+pub struct BatchHandle {
+    tx: mpsc::Sender<BatchMessage>,
+}
+
+impl BatchHandle {
+    pub fn new(tx: mpsc::Sender<BatchMessage>) -> Self {
+        Self { tx }
+    }
+
+    /// Add a reading to the batch asynchronously (non-blocking)
+    pub async fn add(&self, req: TelemetryRequest, stream_name: String, entry_id: String) -> Result<()> {
+        self.tx.send(BatchMessage::Add(Box::new(BatchEntry {
+            request: req,
+            stream_name,
+            entry_id,
+        }))).await.map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
+        Ok(())
+    }
+
+    /// Request a flush from the worker
+    #[allow(dead_code)]
+    pub async fn flush(&self) -> Result<()> {
+        self.tx.send(BatchMessage::Flush).await
+            .map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
+        Ok(())
+    }
+
+    /// Signal shutdown and wait for completion
+    pub async fn shutdown(self) -> Result<()> {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        self.tx.send(BatchMessage::Shutdown(done_tx)).await
+            .map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
+        let _ = done_rx.await;
+        Ok(())
+    }
+}
+
+/// Worker that manages the batching and forwarding logic
+pub struct BatchWorker {
+    platform_client: PlatformClient,
+    connection_manager: ConnectionManager,
+    group_name: String,
+    batch: Vec<BatchEntry>,
+    batch_size: usize,
+    timeout: Duration,
+    receiver: mpsc::Receiver<BatchMessage>,
+}
+
+impl BatchWorker {
+    pub fn spawn(
+        platform_client: PlatformClient,
+        connection_manager: ConnectionManager,
+        group_name: String,
+        _metrics: Arc<crate::state::Metrics>,
+    ) -> BatchHandle {
+        let (tx, rx) = mpsc::channel(10000); // Large buffer for telemetry bursts
+        
+        let worker = Self {
+            platform_client,
+            connection_manager,
+            group_name,
+            batch: Vec::with_capacity(FORWARD_BATCH_SIZE),
+            batch_size: FORWARD_BATCH_SIZE,
+            timeout: Duration::from_millis(BATCH_TIMEOUT_MS),
+            receiver: rx,
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = worker.run().await {
+                error!("❌ Batch worker exited with error: {}", e);
+            }
+        });
+
+        BatchHandle::new(tx)
+    }
+
+    async fn run(mut self) -> Result<()> {
+        let mut interval = tokio::time::interval(self.timeout);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        info!("🚀 Batch worker started (size: {}, timeout: {:?})", self.batch_size, self.timeout);
+
+        loop {
+            tokio::select! {
+                msg = self.receiver.recv() => {
+                    match msg {
+                        Some(BatchMessage::Add(entry)) => {
+                            self.batch.push(*entry);
+                            if self.batch.len() >= self.batch_size {
+                                if let Err(e) = self.flush().await {
+                                    error!("❌ Automated batch flush failed: {}", e);
+                                }
+                            }
+                        }
+                        Some(BatchMessage::Flush) => {
+                            if let Err(e) = self.flush().await {
+                                error!("❌ Manual batch flush failed: {}", e);
+                            }
+                        }
+                        Some(BatchMessage::Shutdown(done_tx)) => {
+                            info!("🔄 Batch worker shutting down, flushing {} items", self.batch.len());
+                            let _ = self.flush().await;
+                            let _ = done_tx.send(());
+                            break;
+                        }
+                        None => break, // Channel closed
+                    }
+                }
+                _ = interval.tick() => {
+                    if !self.batch.is_empty() {
+                        debug!("⏰ Timeout reached, flushing {} items", self.batch.len());
+                        if let Err(e) = self.flush().await {
+                            error!("❌ Timeout flush failed: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+
+        let count = self.batch.len();
+        let start = Instant::now();
+        
+        // Clone requests for the RPC
+        let requests: Vec<TelemetryRequest> = self.batch.iter().map(|e| e.request.clone()).collect();
+
+        debug!("📤 Forwarding batch of {} telemetry readings to API Gateway...", count);
+
+        // Perform RPC outside of any external locks (worker owns self)
+        let result = self.platform_client.submit_telemetry_batch(requests).await;
+
+        match result {
+            Ok(response) => {
+                // Success! Remove from batch and ACK in Redis
+                let batch_entries = std::mem::replace(&mut self.batch, Vec::with_capacity(self.batch_size));
+                self.process_success(batch_entries, response, start.elapsed()).await?;
+            }
+            Err(e) => {
+                let sample_serials: Vec<String> = self.batch.iter().take(3).map(|e| e.request.meter_serial.clone()).collect();
+                error!(
+                    "❌ Batch forward failed: {}. Sample serials: {:?}. Keeping {} readings in buffer for retry.", 
+                    e, sample_serials, count
+                );
+                crate::metrics::record_batch_failure("grpc_error");
+                // We keep the items in self.batch for the next flush attempt
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_success(
+        &mut self, 
+        entries: Vec<BatchEntry>, 
+        response: TelemetryBatchResponse,
+        duration: Duration
+    ) -> Result<()> {
+        let count = entries.len();
+        let mut conn = self.connection_manager.clone();
+        
+        // Group by stream for efficient XACK
+        let mut stream_id_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for entry in &entries {
+            stream_id_map.entry(entry.stream_name.clone()).or_default().push(entry.entry_id.clone());
+        }
+
+        for (stream_name, ids) in stream_id_map {
+            let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+            let _: () = conn.xack(&stream_name, &self.group_name, &id_refs)
+                .await
+                .with_context(|| format!("Failed to ACK {} messages in Redis stream {}", ids.len(), stream_name))?;
+        }
+
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        crate::metrics::record_batch_forward(
+            count,
+            response.accepted_count as usize,
+            response.rejected_count as usize,
+            duration_ms
+        );
+
+        debug!("✅ Batch forwarded successfully: {} accepted, {}ms", response.accepted_count, duration_ms);
+        Ok(())
+    }
+}
