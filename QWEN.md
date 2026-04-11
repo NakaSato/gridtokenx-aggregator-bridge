@@ -89,7 +89,7 @@ src/
 |-----------|------|---------------|
 | `ZoneEventIngester` | Parallel zone-based stream processing | `NUM_ZONES = 10`, `ZONE_SEMAPHORE_SIZE = 50` |
 | `BatchForwarder` | Batches telemetry before gRPC submission | `FORWARD_BATCH_SIZE = 50`, `BATCH_TIMEOUT_MS = 100` |
-| `PlatformClient` | ConnectRPC client to API Gateway | Uses `OracleServiceClient` |
+| `PlatformClient` | ConnectRPC client to API Services | Uses `OracleServiceClient` |
 | `OracleSigner` | Path B attestation signing | Ed25519, Plonky2 ZK-proofs |
 
 ---
@@ -101,7 +101,7 @@ src/
 - Rust 1.88+ (edition 2021)
 - Protobuf compiler (`protobuf-compiler`)
 - Redis 7+ (for streaming)
-- Access to API Gateway (gridtokenx-api) and IAM Service (gridtokenx-iam-service)
+- Access to API Services (gridtokenx-api) and IAM Service (gridtokenx-iam-service)
 - **OrbStack** (required Docker runtime for GridTokenX development)
 
 ### Build Commands
@@ -114,7 +114,7 @@ cargo build
 cargo build --release
 
 # Run with environment
-cp .env.example .env  # Configure Redis, API Gateway, IAM URLs
+cp .env.example .env  # Configure Redis, API Services, IAM URLs
 cargo run
 
 # Run with logging
@@ -131,7 +131,7 @@ docker build -t gridtokenx-oracle-bridge .
 docker run -d \
   -p 4010:4010 \
   -e REDIS_URL=redis://redis:6379 \
-  -e API_GATEWAY_URL=http://api-gateway:4000 \
+  -e API_GATEWAY_URL=http://api-services:4000 \
   -e IAM_SERVICE_URL=http://iam:50051 \
   -e GRIDTOKENX_API_KEYS=key1,key2,key3 \
   gridtokenx-oracle-bridge
@@ -142,7 +142,7 @@ docker run -d \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Redis connection URL |
-| `API_GATEWAY_URL` | `http://127.0.0.1:4000` | API Gateway ConnectRPC endpoint |
+| `API_SERVICES_URL` | `http://127.0.0.1:4000` | API Services ConnectRPC endpoint |
 | `IAM_SERVICE_URL` | `http://127.0.0.1:50051` | IAM gRPC service for auth |
 | `IOT_GATEWAY_PORT` | `4010` | HTTP port for device ingestion |
 | `GRIDTOKENX_API_KEYS` | (empty) | Comma-separated API keys for device auth |

@@ -5,9 +5,10 @@ The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** Convergence Layer
 ## Features
 
 - **VPP Ingestion Service** - High-concurrency ingestion for normalized smart meter, EV, and BESS data streams.
+- **Secure Telemetry Ingestion (Path A Security)** - Cryptographically signed telemetry verification via Ed25519 (Base58).
 - **Real-time Orchestration** - Sub-100ms telemetry routing to VPP forecasting and MILP optimization engines.
 - **ZK-Aggregation (Path B)** - Cloud-side recursive ZK-Rollup (Plonky2) for PDPA-compliant aggregate proving.
-- **Service Mesh Ready** - Built for high-availability deployment with gRPC and mTLS identity support.
+- **Production Mode Enforcement** - Strict signature verification when `ENVIRONMENT=production`.
 - **Performance Driven** - Optimized Rust/Tokio implementation with Redis/Kafka streaming.
 
 ---
@@ -16,8 +17,22 @@ The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** Convergence Layer
 
 The Oracle Bridge is the **high-performance ingest layer**. It is decoupled from the hardware (Oracle of Edge Meter) and focuses on processing the inbound telemetry and attestation flows.
 
-1.  **Path A (Operational)**: Real-time telemetry synchronized with the VPP Platform for sub-second dispatch.
+1.  **Path A (Operational)**: Real-time, cryptographically signed telemetry synchronized with the VPP Platform.
 2.  **Path B (Settlement)**: Batched attestation processing and ZK-rollup generation for HyperEVM.
+
+---
+
+## ⚡ Quick Start: Security Verification
+
+The Oracle Bridge requires all telemetry to be signed by registered edge devices. You can verify the security pipeline using the automated E2E suite:
+
+```bash
+# Verify the secure telemetry link (gRPC + REST)
+./scripts/test-e2e.sh
+```
+
+> [!NOTE]
+> Device public keys must be registered in Redis under `gridtokenx:devices:{meter_id}:pubkey`. Use `./scripts/register-edge-key.sh` for manual registration.
 
 ---
 
@@ -25,9 +40,8 @@ The Oracle Bridge is the **high-performance ingest layer**. It is decoupled from
 
 - [implement.md](implement.md) - **Source of Truth**: Full technical system design (GridTokenX VPP).
 - [core.md](docs/core.md) - **Architecture Matrix**: SVGs and component matrices.
-- [DATA-FLOW.md](docs/DATA-FLOW.md) - **The Dual Path**: Operational vs. Settlement flows.
+- [INGESTION-API.md](docs/INGESTION-API.md) - **API Reference**: How to integrate Edge Gateways securely.
 - [ORACLE-BRIDGE.md](docs/ORACLE-BRIDGE.md) - **Path B Deep Dive**: Cryptographic Trust & ZK-Rollup Settlement.
-- [TELEMETRY.md](docs/TELEMETRY.md) - **Path A Deep Dive**: Real-time VPP Operations & Orchestration.
 
 ---
 

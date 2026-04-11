@@ -13,7 +13,9 @@ The Oracle Bridge is the primary orchestrator for real-time grid services, ensur
 
 ### 2.1 Industrial Low-Latency Ingestion
 - **Global Standard Compliance**: Exclusively uses **DLMS/COSEM (IEC 62056)** for all B2C and B2B telemetry, ensuring unified high-fidelity energy accounting.
-- **Zero-Copy Performance**: Utilizing `buffa::view::OwnedView` for Path A ingestion, enabling sub-millisecond Protobuf processing without memory allocations.
+- **Secure Telemetry Ingestion**: Every telemetry packet (Path A) is cryptographically signed using Ed25519 (Base58) by the source device.
+- **Canonical Format**: Signatures are generated over the `{meter_id}:{kwh}:{timestamp}` canonical string.
+- **Performance Driven**: Utilizing `rdkafka` and `redis` connection pooling for high-throughput ingestion with real-time verification.
 - **Dynamic Dispatch**: Routes incoming telemetry to the forecasting and MILP optimization engines in `<50ms`.
 
 ### 2.2 In-Memory Aggregation
@@ -48,8 +50,17 @@ The Oracle Bridge provides the final cryptographic artifacts required for on-cha
 The bridge exposes a high-performance gRPC surface for internal platform services and authorized edge gateways.
 
 ```protobuf
+// TelemetryRequest with integrated security
+message TelemetryRequest {
+  string reading_id = 1;
+  string meter_id = 2;
+  string meter_serial = 3;
+  // ... other fields ...
+  optional string signature = 16; // Ed25519 signature (Base58)
+}
+
 service OracleService {
-  // Professional Path A: High-frequency telemetry (Zero-Copy)
+  // Professional Path A: High-frequency telemetry (Verified)
   rpc SubmitTelemetry (TelemetryRequest) returns (TelemetryResponse);
   rpc SubmitTelemetryBatch (TelemetryBatchRequest) returns (TelemetryBatchResponse);
   
@@ -58,6 +69,14 @@ service OracleService {
   rpc SubmitAttestationBatch (AttestationBatchRequest) returns (AttestationBatchResponse);
 }
 ```
+
+---
+
+## 6. Environment & Security Policy
+The Oracle Bridge enforces different security levels based on the environment:
+
+- **Development**: Invalid/missing signatures result in warnings but data is accepted to facilitate local development.
+- **Production (`ENVIRONMENT=production`)**: Strict enforcement. Unsigned or invalid telemetry results in immediate `StatusCode.UNAUTHENTICATED` or `401 Unauthorized` responses.
 
 ---
 

@@ -60,41 +60,35 @@ impl Router {
         let zone_idx = self.get_zone_index(reading);
         let stream_name = format!("gridtokenx:events:zone_{}", zone_idx);
 
-        // Wrap in an event envelope
-        let event_type = self.event_type_name(reading);
-
-        let event_envelope = if reading.device_type == crate::models::DeviceType::SmartMeter {
-            let (gen, con, net) = match reading.metrics {
-                crate::models::DeviceMetrics::Energy { generated_kwh, consumed_kwh, net_kwh } =>
-                    (Some(generated_kwh), Some(consumed_kwh), net_kwh),
-                _ => (None, None, 0.0),
-            };
-
-            serde_json::json!({
-                "event_type": event_type,
-                "payload": {
-                    "reading_id": reading.reading_id,
-                    "meter_id": uuid::Uuid::nil(),
-                    "meter_serial": reading.serial_number,
-                    "user_id": uuid::Uuid::nil(),
-                    "wallet_address": reading.metadata.get("wallet_address").and_then(|v| v.as_str()).unwrap_or(""),
-                    "zone_id": reading.zone_id,
-                    "kwh": net,
-                    "energy_generated": gen,
-                    "energy_consumed": con,
-                    "voltage": reading.metadata.get("voltage").and_then(|v| v.as_f64()),
-                    "current": reading.metadata.get("current").and_then(|v| v.as_f64()),
-                    "battery_level": reading.metadata.get("battery_level").and_then(|v| v.as_f64()),
-                    "temperature": reading.metadata.get("temperature").and_then(|v| v.as_f64()),
-                    "timestamp": reading.timestamp,
-                }
-            })
-        } else {
-            serde_json::json!({
-                "event_type": event_type,
-                "payload": reading,
-            })
+        // Map DeviceMetrics to flattened payload for api-services Compatibility
+        let (generated, consumed, net) = match reading.metrics {
+            crate::models::DeviceMetrics::Energy { generated_kwh, consumed_kwh, net_kwh } => (Some(generated_kwh), Some(consumed_kwh), net_kwh),
+            _ => (None, None, 0.0),
         };
+
+        // Construct payload matching api-services::domain::events::MeterReadingPayload
+        let event_payload = serde_json::json!({
+            "reading_id": reading.reading_id,
+            "meter_id": reading.device_id,
+            "meter_serial": reading.serial_number,
+            "user_id": "00000000-0000-0000-0000-000000000000", // Placeholder for persistence worker
+            "wallet_address": reading.serial_number, 
+            "zone_id": reading.zone_id,
+            "kwh": net,
+            "energy_generated": generated,
+            "energy_consumed": consumed,
+            "voltage": reading.metadata.get("voltage_v"),
+            "current": reading.metadata.get("current_a"),
+            "battery_level": reading.metadata.get("battery_level_pct"),
+            "temperature": reading.metadata.get("temperature_c"),
+            "metadata": reading.metadata,
+            "timestamp": reading.timestamp,
+        });
+
+        let event_envelope = serde_json::json!({
+            "event_type": "MeterReadingCreated",
+            "payload": event_payload,
+        });
 
         let json = serde_json::to_string(&event_envelope)
             .context("Failed to serialize reading")?;
@@ -122,8 +116,8 @@ impl Router {
 
     fn event_type_name(&self, reading: &DeviceReading) -> &'static str {
         match reading.device_type {
-            crate::models::DeviceType::SmartMeter => "MeterReadingCreated",
-            crate::models::DeviceType::EvCharger => "EvChargingEvent",
+            crate::models::DeviceType::SmartMeter => "SmartMeterReading",
+            crate::models::DeviceType::EvCharger => "EvCharging",
             crate::models::DeviceType::Battery => "BatteryStateUpdate",
         }
     }

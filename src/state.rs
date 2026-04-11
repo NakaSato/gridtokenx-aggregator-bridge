@@ -65,4 +65,12 @@ pub struct AppState {
     // Edge-AI (Neural Inference Load Monitoring)
     pub nilm_engine: Arc<crate::nilm::NilmEngine>,
     pub gradient_accumulator: Arc<tokio::sync::Mutex<crate::nilm::LocalGradientAccumulator>>,
+    pub global_aggregator: Arc<tokio::sync::Mutex<crate::nilm::GlobalModelAggregator>>,
+    pub model_state_path: std::path::PathBuf,
+    
+    // Infrastructure
+    pub kafka_producer: Option<Arc<crate::infra::kafka::OracleKafkaProducer>>,
+    pub rabbitmq_producer: Option<Arc<crate::infra::rabbitmq::OracleRabbitMQProducer>>,
+    pub signature_verifier: Arc<crate::infra::crypto::SignatureVerifier>,
+    pub settlement_signer: Option<Arc<crate::infra::crypto::SettlementSigner>>,
 }

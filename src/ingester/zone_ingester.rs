@@ -46,7 +46,7 @@ pub struct ZoneEventIngester {
 impl ZoneEventIngester {
     pub async fn new(
         redis_url: &str,
-        api_gateway_url: &str,
+        api_services_url: &str,
         aggregator: Arc<Mutex<Aggregator>>,
         metrics: Arc<crate::state::Metrics>,
         num_zones: usize,
@@ -64,7 +64,7 @@ impl ZoneEventIngester {
         let consumer_name = format!("zone_consumer_{}", Uuid::new_v4());
 
         // Create batch forwarder with Redis connection for ACKing
-        let platform_client = PlatformClient::new(api_gateway_url)
+        let platform_client = PlatformClient::new(api_services_url)
             .await
             .context("Failed to initialize PlatformClient for zone ingester")?;
         let batch_handle = BatchWorker::spawn(
@@ -421,7 +421,7 @@ impl ZoneEventIngester {
         }
 
         // 2. Forward to API Gateway (batched)
-        self.forward_to_api_gateway(
+        self.forward_to_api_services(
             reading.reading_id,
             meter_id,
             reading.serial_number,
@@ -435,7 +435,7 @@ impl ZoneEventIngester {
     }
 
     /// Forward meter reading to API Gateway with batching
-    async fn forward_to_api_gateway(
+    async fn forward_to_api_services(
         &self, 
         reading_id: Uuid,
         meter_id: Uuid,

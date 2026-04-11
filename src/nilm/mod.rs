@@ -6,4 +6,5 @@ pub mod federated;
 pub use engine::NilmEngine;
 pub use models::{ApplianceProfile, FlexibilityScore};
 pub use federated::LocalGradientAccumulator;
+pub use federated::GlobalModelAggregator;
 

@@ -1,6 +1,6 @@
 use connectrpc::{Context, ConnectError};
 use buffa::view::OwnedView;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 use std::sync::Arc;
 use uuid::Uuid;
 use chrono::{Utc, TimeZone};
@@ -54,6 +54,35 @@ impl OracleService for OracleServiceImpl {
     ) -> Result<(TelemetryResponse, Context), ConnectError> {
         info!("📡 Unified B2C/B2B Industrial Ingestion (IEC 62056): meter={}", request.meter_id);
         
+        // --- Signature Verification ---
+        if let Some(signature) = request.signature.as_deref() {
+            // Reconstruct canonical signed payload: meter_id:kwh:timestamp
+            let sign_target = format!("{}:{}:{}", request.meter_id, request.kwh, request.timestamp);
+            match self.state.signature_verifier.verify_telemetry_signature(
+                &request.meter_id,
+                sign_target.as_bytes(),
+                signature
+            ).await {
+                Ok(true) => info!("✅ Telemetry signature verified for {}", request.meter_id),
+                Ok(false) => {
+                    error!("🚫 Invalid telemetry signature for {}", request.meter_id);
+                    return Err(ConnectError::permission_denied("Invalid telemetry signature"));
+                }
+                Err(e) => {
+                    error!("⚠️ Verification error for {}: {}", request.meter_id, e);
+                    // In production, we'd fail here. For mixed-mode dev, we might log and continue.
+                    if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
+                        return Err(ConnectError::unauthenticated(format!("Verification failed: {}", e)));
+                    }
+                }
+            }
+        } else {
+            tracing::warn!("⚠️ Received unsigned telemetry from meter={}", request.meter_id);
+            if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
+                return Err(ConnectError::invalid_argument("Signature required in production"));
+            }
+        }
+
         let mut generated_kwh = request.energy_generated.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let mut consumed_kwh = request.energy_consumed.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let mut timestamp = Utc.timestamp_opt(request.timestamp, 0).single().unwrap_or_else(Utc::now);
@@ -131,6 +160,29 @@ impl OracleService for OracleServiceImpl {
         let mut rejected_count = 0;
 
         for tel in &request.readings {
+            // --- Signature Verification for Batch Item ---
+            if let Some(signature) = tel.signature.as_deref() {
+                let sign_target = format!("{}:{}:{}", tel.meter_id, tel.kwh, tel.timestamp);
+                let is_verified = match self.state.signature_verifier.verify_telemetry_signature(
+                    &tel.meter_id,
+                    sign_target.as_bytes(),
+                    signature
+                ).await {
+                    Ok(true) => true,
+                    _ => false,
+                };
+
+                if !is_verified {
+                    warn!("🚫 Invalid signature in batch for meter={}", tel.meter_id);
+                    rejected_count += 1;
+                    continue; // Skip this reading
+                }
+            } else if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
+                warn!("⚠️ Missing signature in batch for meter={}", tel.meter_id);
+                rejected_count += 1;
+                continue;
+            }
+
             let mut generated_kwh = tel.energy_generated.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut consumed_kwh = tel.energy_consumed.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut timestamp = Utc.timestamp_opt(tel.timestamp, 0).single().unwrap_or_else(Utc::now);
@@ -194,6 +246,68 @@ impl OracleService for OracleServiceImpl {
             status: if rejected_count == 0 { "all_accepted" } else { "partially_accepted" }.to_string(),
             accepted_count,
             rejected_count,
+            ..Default::default()
+        }, ctx))
+    }
+
+    /// Federated Learning: Receive locally trained model gradients
+    async fn push_gradients(
+        &self,
+        ctx: Context,
+        request: OwnedView<proto::PushGradientsRequestView<'static>>,
+    ) -> Result<(proto::PushGradientsResponse, Context), ConnectError> {
+        info!("📥 FL: Received NILM gradients from meter: {} (base_version: {})", 
+              request.meter_id, request.base_version);
+        
+        let mut layers = HashMap::new();
+        for (layer_name, layer_data) in &request.layers {
+            layers.insert(layer_name.to_string(), layer_data.values.to_vec());
+        }
+
+        let domain_update = crate::nilm::federated::PushGradientsRequest {
+            meter_id: request.meter_id.to_string(),
+            base_version: request.base_version.to_string(),
+            layers,
+            sample_count: request.sample_count as usize,
+        };
+
+        let mut aggregator = self.state.global_aggregator.lock().await;
+        let accepted = aggregator.add_update(domain_update).map_err(|e| {
+            error!("❌ FL Aggregation failed: {}", e);
+            ConnectError::internal("Aggregation failed")
+        })?;
+
+        if accepted {
+            if let Err(e) = aggregator.save_to_file(&self.state.model_state_path) {
+                error!("❌ FL Persistence failed: {}", e);
+            }
+        }
+
+        Ok((proto::PushGradientsResponse {
+            status: if accepted { "aggregated" } else { "queued" }.to_string(),
+            accepted,
+            ..Default::default()
+        }, ctx))
+    }
+
+    /// Federated Learning: provide latest global model weights
+    async fn pull_global_model(
+        &self,
+        ctx: Context,
+        request: OwnedView<proto::PullGlobalModelRequestView<'static>>,
+    ) -> Result<(proto::PullGlobalModelResponse, Context), ConnectError> {
+        let aggregator = self.state.global_aggregator.lock().await;
+        
+        info!("📤 FL: Serving Global Model version {} to meter: {}", 
+              aggregator.current_version, request.meter_id);
+
+        // In production, this would load the actual .tflite / .rknn binary 
+        // from storage based on the aggregated weights.
+        Ok((proto::PullGlobalModelResponse {
+            version: aggregator.current_version.clone(),
+            model_payload: vec![0, 0, 0, 0, b'T', b'F', b'L', b'3'], // Placeholder
+            model_type: "MOE_1D_CNN_INT8".to_string(),
+            timestamp: Utc::now().timestamp(),
             ..Default::default()
         }, ctx))
     }

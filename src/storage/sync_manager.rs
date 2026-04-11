@@ -9,15 +9,15 @@ use serde_json::Value;
 /// SyncManager handles the replay of unsynced telemetry from the local buffer to the API Gateway.
 pub struct SyncManager {
     buffer: Arc<Mutex<CircularBuffer>>,
-    api_gateway_url: String,
+    api_services_url: String,
     client: Client,
 }
 
 impl SyncManager {
-    pub fn new(buffer: Arc<Mutex<CircularBuffer>>, api_gateway_url: &str) -> Self {
+    pub fn new(buffer: Arc<Mutex<CircularBuffer>>, api_services_url: &str) -> Self {
         Self {
             buffer,
-            api_gateway_url: api_gateway_url.to_string(),
+            api_services_url: api_services_url.to_string(),
             client: Client::new(),
         }
     }
@@ -58,7 +58,7 @@ impl SyncManager {
     }
 
     async fn send_to_gateway(&self, meter_id: &str, timestamp: chrono::DateTime<chrono::Utc>, payload: &Value) -> Result<()> {
-        let url = format!("{}/api/v1/telemetry/replay", self.api_gateway_url);
+        let url = format!("{}/api/v1/telemetry/replay", self.api_services_url);
         
         let response = self.client.post(&url)
             .json(&serde_json::json!({

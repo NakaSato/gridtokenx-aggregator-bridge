@@ -64,6 +64,13 @@ tokio-util = "0.7.18"
 rand.workspace = true
 rand_distr = "0.6.0"
 
+# Kafka
+rdkafka = { version = "0.37", features = ["zstd"] }
+
+# RabbitMQ
+lapin = "2.5"
+futures-util = "0.3"
+
 [build-dependencies]
 buffa-build = "0.2.0"
 connectrpc-build = "0.2.0"

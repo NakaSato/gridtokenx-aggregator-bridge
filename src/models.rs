@@ -95,6 +95,12 @@ pub struct PrivateNetworkPayload {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BatchPrivateNetworkPayload {
+    pub protocol: String,
+    pub readings: Vec<serde_json::Value>,
+}
+
 
 
 // =============================================================================

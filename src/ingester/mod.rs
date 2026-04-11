@@ -1,5 +1,6 @@
 pub mod zone_ingester;
 pub mod batcher;
+pub mod settlement_worker;
 
 
 use serde::{Deserialize, Serialize};

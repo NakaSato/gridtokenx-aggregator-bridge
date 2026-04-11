@@ -75,7 +75,7 @@ gridtokenx/{region}/{feeder}/{meter_id}/attestation    — signed oracle attesta
 gridtokenx/{region}/{feeder}/{meter_id}/fl_gradient    — federated learning updates (QoS 1)
 ```
 
-**Oracle role:** The smart meter is the primary hardware oracle for GridTokenX. Every 15 minutes, the Rust pipeline aggregates energy production/consumption data, the RKNN NPU computes a NILM summary hash, and the ATECC608B secure element signs the attestation record with Ed25519. This signed attestation is the atomic unit of truth that flows into the oracle bridge.
+**Oracle role:** The smart meter is the primary hardware oracle for GridTokenX. Every 15 seconds, the Rust pipeline prepares a telemetry packet, and the ATECC608B secure element signs it with Ed25519 (Base58) using the canonical format `{meter_id}:{kwh}:{timestamp_ms}`. This ensures every reading is cryptographically verified before reaching the VPP Platform.
 
 **Federated learning cycle (weekly):**
 
@@ -283,8 +283,9 @@ The oracle bridge is the trust boundary between the physical grid and the blockc
 1. Rust data acquisition pipeline samples V/I/PF at 1-second resolution
 2. RKNN NPU runs Sparse MoE NILM inference (<10ms per cycle)
 3. Inference outputs: per-appliance power, anomaly flags, flexibility scores
-4. Outputs published to MQTT for platform consumption (telemetry path)
-5. Simultaneously, a 15-minute energy summary is prepared for attestation (oracle path)
+4. Outputs are signed using Ed25519 (Base58) over the canonical format `{meter_id}:{kwh}:{timestamp_ms}`.
+5. Signed telemetry is published directly to the Oracle Bridge via gRPC or REST (Path A).
+6. Simultaneously, a 15-minute energy summary is prepared for attestation (Path B).
 
 **Data generated per 15-minute window:**
 
@@ -323,9 +324,9 @@ The oracle bridge is the trust boundary between the physical grid and the blockc
 
 ```
 {
-  "attestation": { ... },  // Protobuf-encoded energy data
-  "signature": "ed25519:<base64-encoded-64-byte-signature>",
-  "device_cert_fingerprint": "sha256:<cert-hash>",
+  "telemetry": { ... },  // Protobuf-encoded energy data
+  "signature": "3y9S...", // Ed25519 signature (Base58)
+  "device_id": "0x0001",
   "sequence_number": 48392,
   "firmware_hash": "sha256:<measured-boot-hash>"
 }
