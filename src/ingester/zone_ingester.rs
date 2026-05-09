@@ -41,6 +41,8 @@ pub struct ZoneEventIngester {
     batch_handle: BatchHandle,
     /// Number of zone partitions
     num_zones: usize,
+    /// Meter → User ID resolver
+    meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
 }
 
 impl ZoneEventIngester {
@@ -50,6 +52,7 @@ impl ZoneEventIngester {
         aggregator: Arc<Mutex<Aggregator>>,
         metrics: Arc<crate::state::Metrics>,
         num_zones: usize,
+        meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let connection_manager = Self::create_connection_manager(&client).await?;
@@ -87,6 +90,7 @@ impl ZoneEventIngester {
             consumer_name,
             batch_handle,
             num_zones,
+            meter_registry,
         })
     }
 
@@ -407,12 +411,25 @@ impl ZoneEventIngester {
         // Use a consistent UUID derived from the serial number for aggregation
         let meter_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, reading.serial_number.as_bytes());
 
+        // Resolve user_id from meter registry
+        let user_id = match self.meter_registry.resolve_user_id(&reading.serial_number).await {
+            Ok(Some(uid)) => uid,
+            Ok(None) => {
+                debug!("⚠️ No user mapping found for meter {}. Using nil UUID.", reading.serial_number);
+                Uuid::nil()
+            }
+            Err(e) => {
+                warn!("⚠️ Meter registry lookup failed for {}: {}. Using nil UUID.", reading.serial_number, e);
+                Uuid::nil()
+            }
+        };
+
         // 1. Update Aggregator (local stats)
         {
             let mut agg = self.aggregator.lock().await;
             agg.handle_reading(
                 meter_id,
-                Uuid::nil(), // User ID not available at this layer
+                user_id,
                 reading.serial_number.clone(),
                 energy_generated,
                 energy_consumed,

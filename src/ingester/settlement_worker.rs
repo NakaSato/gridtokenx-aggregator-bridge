@@ -73,35 +73,39 @@ impl SettlementWorker {
         Ok(())
     }
 
-    /// Prepares, signs, and submits a single billing bin to the API Gateway
+    /// Prepares, signs, and submits a single billing bin to the Trading Service
     async fn settle_bin(&self, client: &PlatformClient, bin: BillingBin) -> anyhow::Result<()> {
-        let mut payload = serde_json::json!({
-            "meter_id": bin.meter_id,
-            "meter_serial": bin.meter_serial,
+        let start_time = bin.start_time.timestamp();
+        let end_time = bin.end_time.timestamp();
+
+        // Build canonical message matching Trading Service verification:
+        // "{user_id}:{meter_serial}:{energy_generated_kwh}:{start_time}:{end_time}"
+        let canonical_message = format!(
+            "{}:{}:{}:{}:{}",
+            bin.user_id,
+            bin.meter_serial,
+            bin.energy_generated,
+            start_time,
+            end_time
+        );
+
+        let signature = if let Some(signer) = &self.signer {
+            signer.sign_canonical(&canonical_message)
+        } else {
+            warn!("⚠️ No settlement signer configured — sending unsigned settlement for {}", bin.meter_serial);
+            String::new()
+        };
+
+        let payload = serde_json::json!({
             "user_id": bin.user_id,
-            "start_time": bin.start_time,
-            "end_time": bin.end_time,
+            "meter_serial": bin.meter_serial,
             "energy_generated_kwh": bin.energy_generated,
-            "energy_consumed_kwh": bin.energy_consumed,
-            "reading_count": bin.reading_count,
+            "start_time": start_time,
+            "end_time": end_time,
+            "signature": signature,
         });
 
-        // 1. Sign the payload if a signer is available
-        if let Some(signer) = &self.signer {
-            match signer.sign_settlement(&payload) {
-                Ok(sig) => {
-                    payload["signature"] = serde_json::json!(sig);
-                }
-                Err(e) => {
-                    warn!("⚠️ Failed to sign settlement for {}: {}", bin.meter_serial, e);
-                    payload["signature"] = serde_json::json!("");
-                }
-            }
-        } else {
-            payload["signature"] = serde_json::json!("");
-        }
-
-        // 2. Submit via PlatformClient
+        // Submit via PlatformClient REST
         client.settle_generation_mint(&self.api_services_url, &payload).await?;
 
         Ok(())

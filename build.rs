@@ -2,8 +2,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let oracle_protos = &["proto/oracle.proto"];
     let oracle_includes = &["proto"];
 
-    let identity_protos = &["../gridtokenx-iam-service/proto/identity.proto"];
-    let identity_includes = &["../gridtokenx-iam-service/proto"];
+    let identity_protos = &["../gridtokenx-iam-service/crates/iam-protocol/proto/identity.proto"];
+    let identity_includes = &["../gridtokenx-iam-service/crates/iam-protocol/proto"];
 
     // 1. Generate ConnectRPC for Identity (Required for Authorization)
     connectrpc_build::Config::new()

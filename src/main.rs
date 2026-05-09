@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     // 1. Initialize
     dotenv().ok();
     // Initialize OpenTelemetry tracing (sets up global subscriber)
-    let telemetry_guard = telemetry::init_telemetry("gridtokenx-oracle-bridge");
+    let _telemetry_guard = telemetry::init_telemetry("gridtokenx-oracle-bridge");
 
     info!("🚀 Starting GridTokenX Oracle Bridge (Zone-Based Microgrid Mode)");
 
@@ -71,6 +71,11 @@ async fn main() -> Result<()> {
     // 4. Initialize Aggregator (local stats only, no blockchain submission)
     let aggregator = Arc::new(tokio::sync::Mutex::new(aggregator::Aggregator::new()));
 
+    // 4b. Initialize Meter Registry (meter_serial → user_id resolver)
+    let early_redis_client = redis::Client::open(redis_url.clone())?;
+    let early_redis_conn = redis::aio::ConnectionManager::new(early_redis_client).await?;
+    let meter_registry = Arc::new(crate::infra::meter_registry::MeterRegistry::new(early_redis_conn));
+
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
     let zone_ingester = match ingester::zone_ingester::ZoneEventIngester::new(
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
         aggregator.clone(),
         metrics.clone(),
         num_zones,
+        meter_registry.clone(),
     ).await {
         Ok(zi) => Some(Arc::new(zi)),
         Err(e) => {
@@ -169,7 +175,11 @@ async fn main() -> Result<()> {
     // 7c. Start Settlement Worker in background
     let settlement_agg = aggregator.clone();
     let settlement_shutdown = shutdown_token.clone();
-    let settlement_api_url = api_services_url.clone();
+    // Settlement goes directly to Trading Service (M2M, bypasses APISIX)
+    let settlement_api_url = std::env::var("SETTLEMENT_API_URL")
+        .or_else(|_| std::env::var("TRADING_HTTP_URL"))
+        .unwrap_or_else(|_| "http://trading-service:8093".to_string());
+    info!("💰 Settlement Worker target: {}", settlement_api_url);
     let settlement_signer_task = settlement_signer.clone();
     let settlement_handle = tokio::spawn(async move {
         let worker = crate::ingester::settlement_worker::SettlementWorker::new(
@@ -269,6 +279,7 @@ async fn main() -> Result<()> {
         rabbitmq_producer,
         signature_verifier,
         settlement_signer,
+        meter_registry,
     };
 
     // 8. Build IoT Gateway HTTP routes
@@ -282,7 +293,7 @@ async fn main() -> Result<()> {
         .route("/health", get(handlers::health))
         .route("/v1/private-network/ingest", post(handlers::ingest_private_network))
         .route("/v1/private-network/ingest/batch", post(handlers::ingest_private_network_batch))
-        .layer(axum::middleware::from_fn(middleware::otel_tracing::otel_tracing_middleware))
+        // .layer(axum::middleware::from_fn(middleware::otel_tracing::otel_tracing_middleware))
         .with_state(app_state.clone());
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", gateway_port))
@@ -368,6 +379,6 @@ async fn main() -> Result<()> {
     // Tasks are signaled via shutdown_token.cancel() above
 
     info!("👋 Shutdown complete. Cleaning up telemetry...");
-    telemetry::shutdown_telemetry(&telemetry_guard);
+    // telemetry::shutdown_telemetry(&telemetry_guard);
     server_result
 }

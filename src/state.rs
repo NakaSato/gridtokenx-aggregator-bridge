@@ -73,4 +73,5 @@ pub struct AppState {
     pub rabbitmq_producer: Option<Arc<crate::infra::rabbitmq::OracleRabbitMQProducer>>,
     pub signature_verifier: Arc<crate::infra::crypto::SignatureVerifier>,
     pub settlement_signer: Option<Arc<crate::infra::crypto::SettlementSigner>>,
+    pub meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
 }

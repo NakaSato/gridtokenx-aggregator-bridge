@@ -85,6 +85,19 @@ impl SettlementSigner {
         let signature = self.signing_key.sign(&payload);
         Ok(bs58::encode(signature.to_bytes()).into_string())
     }
+
+    /// Sign a canonical message string matching the Trading Service's verification format:
+    /// "{user_id}:{meter_serial}:{energy_generated_kwh}:{start_time}:{end_time}"
+    pub fn sign_canonical(&self, message: &str) -> String {
+        let signature = self.signing_key.sign(message.as_bytes());
+        bs58::encode(signature.to_bytes()).into_string()
+    }
+
+    /// Get the public key as a bs58-encoded string (for ORACLE_BRIDGE_PUBLIC_KEY config)
+    pub fn public_key_bs58(&self) -> String {
+        let verifying_key = self.signing_key.verifying_key();
+        bs58::encode(verifying_key.as_bytes()).into_string()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

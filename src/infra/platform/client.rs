@@ -92,9 +92,14 @@ impl PlatformClient {
         }
 
         let mut headers = reqwest::header::HeaderMap::new();
+        /*
+        use opentelemetry::global;
+        use opentelemetry::propagation::TextMapPropagator;
+        
         global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&opentelemetry::Context::current(), &mut HeaderInjector(&mut headers));
         });
+        */
         
         request_builder = request_builder.headers(headers);
 
