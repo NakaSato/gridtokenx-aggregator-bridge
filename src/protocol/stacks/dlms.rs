@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
 use super::ProtocolStack;
-use anyhow::{Result, Context};
+use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -9,8 +9,8 @@ use uuid::Uuid;
 /// Handles commercial and industrial smart meter protocol packets.
 pub struct DlmsStack;
 
-use std::collections::HashMap;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Common OBIS (Object Identification System) codes for IEC 62056.
 /// Format: A.B.C.D.E.F
@@ -29,14 +29,14 @@ mod obis {
     pub const ELEC_TOTAL_ACTIVE_POWER: &str = "1.1.1.7.0.255";
     pub const ELEC_FREQUENCY: &str = "1.1.14.7.0.255";
     pub const ELEC_POWER_FACTOR: &str = "1.1.13.7.0.255";
-    
+
     // Gas (Medium 7)
     pub const GAS_VOLUME_TOTAL: &str = "7.0.11.0.0.255";
     pub const GAS_TEMPERATURE: &str = "7.0.41.0.0.255";
-    
+
     // Water (Medium 8)
     pub const WATER_VOLUME_TOTAL: &str = "8.0.11.0.0.255";
-    
+
     // Demand Response / Abstract
     pub const DR_STATUS: &str = "0.0.96.10.0.255";
 }
@@ -63,13 +63,19 @@ impl DlmsStack {
                     generated_wh = val.as_f64().unwrap_or(0.0);
                     metadata.insert("obis_active_export".to_string(), val.clone());
                 }
-                
+
                 // Electricity - Reactive Energy
                 obis::ELEC_REACTIVE_IMPORT_TOTAL => {
-                    metadata.insert("reactive_energy_import_kvarh".to_string(), Value::from(val.as_f64().unwrap_or(0.0) / 1000.0));
+                    metadata.insert(
+                        "reactive_energy_import_kvarh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
                 }
                 obis::ELEC_REACTIVE_EXPORT_TOTAL => {
-                    metadata.insert("reactive_energy_export_kvarh".to_string(), Value::from(val.as_f64().unwrap_or(0.0) / 1000.0));
+                    metadata.insert(
+                        "reactive_energy_export_kvarh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
                 }
 
                 // Electricity - Grid Metrics
@@ -133,23 +139,33 @@ impl DlmsStack {
 
 #[async_trait]
 impl ProtocolStack for DlmsStack {
-    async fn handle_message(&self, device_id: &str, raw_data: &[u8]) -> Result<Option<DeviceReading>> {
+    async fn handle_message(
+        &self,
+        device_id: &str,
+        raw_data: &[u8],
+    ) -> Result<Option<DeviceReading>> {
         // Parse DLMS telemetry from dynamic JSON representation
         let payload: HashMap<String, Value> = serde_json::from_slice(raw_data)
             .context("Failed to parse dynamic DLMS telemetry data")?;
 
         let (generated_kwh, consumed_kwh, mut metadata) = self.map_payload(&payload);
-        
+
         // Add IEC 62056 compliance flag and COSEM modeling info
-        metadata.insert("protocol_standard".to_string(), Value::from("IEC 62056 (DLMS/COSEM)"));
-        metadata.insert("cosem_modeling".to_string(), Value::from("active_attribute_proxy"));
+        metadata.insert(
+            "protocol_standard".to_string(),
+            Value::from("IEC 62056 (DLMS/COSEM)"),
+        );
+        metadata.insert(
+            "cosem_modeling".to_string(),
+            Value::from("active_attribute_proxy"),
+        );
 
         Ok(Some(DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: device_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: device_id.to_string(),
-            zone_id: None,
+            zone_code: None,
             timestamp: Utc::now(),
             metrics: DeviceMetrics::Energy {
                 generated_kwh,
@@ -182,13 +198,24 @@ mod tests {
         let result = stack.handle_message("OBIS-MTR", &raw).await.unwrap();
         let reading = result.unwrap();
 
-        if let DeviceMetrics::Energy { generated_kwh, consumed_kwh, .. } = reading.metrics {
+        if let DeviceMetrics::Energy {
+            generated_kwh,
+            consumed_kwh,
+            ..
+        } = reading.metrics
+        {
             assert_eq!(generated_kwh, 5.0);
             assert_eq!(consumed_kwh, 10.0);
         }
         assert_eq!(reading.metadata.get("voltage_l3_v").unwrap(), &json!(232.5));
-        assert_eq!(reading.metadata.get("total_active_power_w").unwrap(), &json!(1500.0));
-        assert_eq!(reading.metadata.get("demand_response_status").unwrap(), &json!("load_shedding"));
+        assert_eq!(
+            reading.metadata.get("total_active_power_w").unwrap(),
+            &json!(1500.0)
+        );
+        assert_eq!(
+            reading.metadata.get("demand_response_status").unwrap(),
+            &json!("load_shedding")
+        );
     }
 
     #[tokio::test]

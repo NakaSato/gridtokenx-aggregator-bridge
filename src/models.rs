@@ -36,7 +36,7 @@ pub struct DeviceReading {
     pub device_id: String,
     pub device_type: DeviceType,
     pub serial_number: String,
-    pub zone_id: Option<i32>,
+    pub zone_code: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub metrics: DeviceMetrics,
     #[serde(default)]
@@ -100,8 +100,6 @@ pub struct BatchPrivateNetworkPayload {
     pub protocol: String,
     pub readings: Vec<serde_json::Value>,
 }
-
-
 
 // =============================================================================
 // API Response

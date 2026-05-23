@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use crate::aggregator::{Aggregator, BillingBin};
 use crate::infra::crypto::SettlementSigner;
 use crate::infra::platform::PlatformClient;
-use tracing::{info, error, warn};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 // removed unused Decimal import
 
 pub struct SettlementWorker {
@@ -15,7 +15,7 @@ pub struct SettlementWorker {
 
 impl SettlementWorker {
     pub fn new(
-        aggregator: Arc<Mutex<Aggregator>>, 
+        aggregator: Arc<Mutex<Aggregator>>,
         api_services_url: String,
         signer: Option<Arc<SettlementSigner>>,
     ) -> Self {
@@ -57,7 +57,10 @@ impl SettlementWorker {
             return Ok(());
         }
 
-        info!("🧾 Found {} completed billing bins ready for settlement", bins.len());
+        info!(
+            "🧾 Found {} completed billing bins ready for settlement",
+            bins.len()
+        );
 
         // We can reuse a single PlatformClient for these requests
         let platform_client = PlatformClient::new(&self.api_services_url).await?;
@@ -65,7 +68,7 @@ impl SettlementWorker {
         for bin in bins {
             if let Err(e) = self.settle_bin(&platform_client, bin).await {
                 error!("❌ Settlement failed for bin: {}", e);
-                // Implementation Note: In a production environment, failed settlements 
+                // Implementation Note: In a production environment, failed settlements
                 // should be pushed to a RabbitMQ Dead Letter Queue or Retry Queue.
             }
         }
@@ -82,17 +85,16 @@ impl SettlementWorker {
         // "{user_id}:{meter_serial}:{energy_generated_kwh}:{start_time}:{end_time}"
         let canonical_message = format!(
             "{}:{}:{}:{}:{}",
-            bin.user_id,
-            bin.meter_serial,
-            bin.energy_generated,
-            start_time,
-            end_time
+            bin.user_id, bin.meter_serial, bin.energy_generated, start_time, end_time
         );
 
         let signature = if let Some(signer) = &self.signer {
             signer.sign_canonical(&canonical_message)
         } else {
-            warn!("⚠️ No settlement signer configured — sending unsigned settlement for {}", bin.meter_serial);
+            warn!(
+                "⚠️ No settlement signer configured — sending unsigned settlement for {}",
+                bin.meter_serial
+            );
             String::new()
         };
 
@@ -106,7 +108,9 @@ impl SettlementWorker {
         });
 
         // Submit via PlatformClient REST
-        client.settle_generation_mint(&self.api_services_url, &payload).await?;
+        client
+            .settle_generation_mint(&self.api_services_url, &payload)
+            .await?;
 
         Ok(())
     }

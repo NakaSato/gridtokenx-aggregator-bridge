@@ -1,13 +1,13 @@
-use anyhow::{Result, anyhow};
-use redis::AsyncCommands;
+use anyhow::{anyhow, Result};
 use redis::aio::ConnectionManager;
-use tracing::{info, warn, debug};
-use uuid::Uuid;
+use redis::AsyncCommands;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Cached meter-to-user ID resolver.
-/// 
+///
 /// Resolves meter_serial → user_id using a two-tier cache:
 /// 1. Local in-memory HashMap (fastest)
 /// 2. Redis lookup at `gridtokenx:meters:{serial}:user_id` (shared across instances)
@@ -41,8 +41,10 @@ impl MeterRegistry {
         // 2. Check Redis
         let mut conn = self.redis.clone();
         let key = format!("gridtokenx:meters:{}:user_id", meter_serial);
-        
-        let user_id_str: Option<String> = conn.get(&key).await
+
+        let user_id_str: Option<String> = conn
+            .get(&key)
+            .await
             .map_err(|e| anyhow!("Redis lookup failed for {}: {}", key, e))?;
 
         if let Some(uid_str) = user_id_str {
@@ -67,14 +69,15 @@ impl MeterRegistry {
     pub async fn register_meter(&self, meter_serial: &str, user_id: Uuid) -> Result<()> {
         let mut conn = self.redis.clone();
         let key = format!("gridtokenx:meters:{}:user_id", meter_serial);
-        
-        conn.set::<_, _, ()>(&key, user_id.to_string()).await
+
+        conn.set::<_, _, ()>(&key, user_id.to_string())
+            .await
             .map_err(|e| anyhow!("Failed to register meter in Redis: {}", e))?;
 
         // Update local cache
         let mut cache = self.local_cache.write().await;
         cache.insert(meter_serial.to_string(), user_id);
-        
+
         info!("📝 Registered meter {} → user {}", meter_serial, user_id);
         Ok(())
     }

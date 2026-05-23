@@ -21,6 +21,7 @@ WORKDIR /app
 # Copy project subdirectories needed for the build
 COPY gridtokenx-oracle-bridge/ gridtokenx-oracle-bridge/
 COPY gridtokenx-blockchain-core/ gridtokenx-blockchain-core/
+COPY gridtokenx-iam-service/crates/iam-protocol/proto/ gridtokenx-iam-service/crates/iam-protocol/proto/
 
 WORKDIR /app/gridtokenx-oracle-bridge
 

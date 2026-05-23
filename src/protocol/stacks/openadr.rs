@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
 use super::ProtocolStack;
-use anyhow::{Result, Context};
+use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
@@ -31,21 +31,25 @@ impl OpenAdrStack {
 
 #[async_trait]
 impl ProtocolStack for OpenAdrStack {
-    async fn handle_message(&self, device_id: &str, raw_data: &[u8]) -> Result<Option<DeviceReading>> {
+    async fn handle_message(
+        &self,
+        device_id: &str,
+        raw_data: &[u8],
+    ) -> Result<Option<DeviceReading>> {
         // Parse OpenADR EiReport from JSON representation
-        let report: OpenAdrReport = serde_json::from_slice(raw_data)
-            .context("Failed to parse OpenADR report data")?;
-        
-        // OpenADR is often about controlling consumption, 
+        let report: OpenAdrReport =
+            serde_json::from_slice(raw_data).context("Failed to parse OpenADR report data")?;
+
+        // OpenADR is often about controlling consumption,
         // but here we report current available capacity for "lending" or response.
         // We map baseload to consumed_kwh (simplified over 1h context)
-        
+
         Ok(Some(DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: device_id.to_string(),
             device_type: DeviceType::SmartMeter, // Typically mapped to aggregate meter
             serial_number: device_id.to_string(),
-            zone_id: None,
+            zone_code: None,
             timestamp: Utc::now() - chrono::Duration::hours(12),
             metrics: DeviceMetrics::Energy {
                 generated_kwh: 0.0,
@@ -54,10 +58,22 @@ impl ProtocolStack for OpenAdrStack {
             },
             metadata: {
                 let mut map = std::collections::HashMap::new();
-                map.insert("openadr_status".to_string(), serde_json::json!(report.status));
-                map.insert("available_capacity_kw".to_string(), serde_json::json!(report.available_capacity_kw));
-                map.insert("openadr_request_id".to_string(), serde_json::json!(report.request_id));
-                map.insert("baseload_kw".to_string(), serde_json::json!(report.baseload_kw));
+                map.insert(
+                    "openadr_status".to_string(),
+                    serde_json::json!(report.status),
+                );
+                map.insert(
+                    "available_capacity_kw".to_string(),
+                    serde_json::json!(report.available_capacity_kw),
+                );
+                map.insert(
+                    "openadr_request_id".to_string(),
+                    serde_json::json!(report.request_id),
+                );
+                map.insert(
+                    "baseload_kw".to_string(),
+                    serde_json::json!(report.baseload_kw),
+                );
                 map
             },
         }))
@@ -79,11 +95,19 @@ mod tests {
             "status": "active"
         }"#;
 
-        let result = stack.handle_message("VEN-001", payload.as_bytes()).await.unwrap();
+        let result = stack
+            .handle_message("VEN-001", payload.as_bytes())
+            .await
+            .unwrap();
         let reading = result.unwrap();
 
         assert_eq!(reading.device_id, "VEN-001");
-        if let DeviceMetrics::Energy { generated_kwh, consumed_kwh, net_kwh } = reading.metrics {
+        if let DeviceMetrics::Energy {
+            generated_kwh,
+            consumed_kwh,
+            net_kwh,
+        } = reading.metrics
+        {
             assert_eq!(generated_kwh, 0.0);
             assert_eq!(consumed_kwh, 45.5);
             assert_eq!(net_kwh, -45.5);
@@ -91,8 +115,14 @@ mod tests {
             panic!("Wrong metric type");
         }
 
-        assert_eq!(reading.metadata.get("openadr_status").unwrap(), &serde_json::json!("active"));
-        assert_eq!(reading.metadata.get("available_capacity_kw").unwrap(), &serde_json::json!(4.5));
+        assert_eq!(
+            reading.metadata.get("openadr_status").unwrap(),
+            &serde_json::json!("active")
+        );
+        assert_eq!(
+            reading.metadata.get("available_capacity_kw").unwrap(),
+            &serde_json::json!(4.5)
+        );
     }
 
     #[tokio::test]

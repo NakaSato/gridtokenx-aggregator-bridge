@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::protocol::stacks::ocpp::OcppStack;
-use crate::protocol::stacks::sunspec::SunSpecStack;
 use crate::protocol::stacks::dlms::DlmsStack;
+use crate::protocol::stacks::ocpp::OcppStack;
 use crate::protocol::stacks::openadr::OpenAdrStack;
+use crate::protocol::stacks::sunspec::SunSpecStack;
 use crate::router::Router;
 
 pub mod identity {
@@ -13,8 +13,8 @@ pub mod identity {
 
 pub use identity::IdentityServiceClient;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use connectrpc::client::SharedHttp2Connection;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -43,8 +43,10 @@ impl Metrics {
         } else {
             self.failed_requests.fetch_add(1, Ordering::Relaxed);
         }
-        self.last_grpc_latency_us.store(latency_us, Ordering::Relaxed);
-        self.total_grpc_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.last_grpc_latency_us
+            .store(latency_us, Ordering::Relaxed);
+        self.total_grpc_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
     }
 }
 
@@ -62,12 +64,7 @@ pub struct AppState {
     pub api_keys: Vec<String>,
     pub identity_client: Option<Arc<IdentityServiceClient<SharedHttp2Connection>>>,
     pub metrics: Arc<Metrics>,
-    // Edge-AI (Neural Inference Load Monitoring)
-    pub nilm_engine: Arc<crate::nilm::NilmEngine>,
-    pub gradient_accumulator: Arc<tokio::sync::Mutex<crate::nilm::LocalGradientAccumulator>>,
-    pub global_aggregator: Arc<tokio::sync::Mutex<crate::nilm::GlobalModelAggregator>>,
-    pub model_state_path: std::path::PathBuf,
-    
+
     // Infrastructure
     pub kafka_producer: Option<Arc<crate::infra::kafka::OracleKafkaProducer>>,
     pub rabbitmq_producer: Option<Arc<crate::infra::rabbitmq::OracleRabbitMQProducer>>,

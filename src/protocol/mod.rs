@@ -1,7 +1,7 @@
-pub mod stacks;
 pub mod binary_decoder;
+pub mod stacks;
 
-use crate::models::{DeviceType};
+use crate::models::DeviceType;
 pub use binary_decoder::DlmsBinaryFrame;
 
 /// Raw incoming payload before protocol-specific parsing.

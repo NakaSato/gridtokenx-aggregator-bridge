@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
-use crate::infra::platform::{PlatformClient, TelemetryRequest};
 use crate::infra::platform::client::TelemetryBatchResponse;
+use crate::infra::platform::{PlatformClient, TelemetryRequest};
 
 /// Batch size for forwarding to API Gateway
 pub const FORWARD_BATCH_SIZE: usize = 50;
@@ -46,19 +46,29 @@ impl BatchHandle {
     }
 
     /// Add a reading to the batch asynchronously (non-blocking)
-    pub async fn add(&self, req: TelemetryRequest, stream_name: String, entry_id: String) -> Result<()> {
-        self.tx.send(BatchMessage::Add(Box::new(BatchEntry {
-            request: req,
-            stream_name,
-            entry_id,
-        }))).await.map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
+    pub async fn add(
+        &self,
+        req: TelemetryRequest,
+        stream_name: String,
+        entry_id: String,
+    ) -> Result<()> {
+        self.tx
+            .send(BatchMessage::Add(Box::new(BatchEntry {
+                request: req,
+                stream_name,
+                entry_id,
+            })))
+            .await
+            .map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
         Ok(())
     }
 
     /// Request a flush from the worker
     #[allow(dead_code)]
     pub async fn flush(&self) -> Result<()> {
-        self.tx.send(BatchMessage::Flush).await
+        self.tx
+            .send(BatchMessage::Flush)
+            .await
             .map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
         Ok(())
     }
@@ -66,7 +76,9 @@ impl BatchHandle {
     /// Signal shutdown and wait for completion
     pub async fn shutdown(self) -> Result<()> {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        self.tx.send(BatchMessage::Shutdown(done_tx)).await
+        self.tx
+            .send(BatchMessage::Shutdown(done_tx))
+            .await
             .map_err(|_| anyhow::anyhow!("Batch worker channel closed"))?;
         let _ = done_rx.await;
         Ok(())
@@ -92,7 +104,7 @@ impl BatchWorker {
         _metrics: Arc<crate::state::Metrics>,
     ) -> BatchHandle {
         let (tx, rx) = mpsc::channel(10000); // Large buffer for telemetry bursts
-        
+
         let worker = Self {
             platform_client,
             connection_manager,
@@ -116,7 +128,10 @@ impl BatchWorker {
         let mut interval = tokio::time::interval(self.timeout);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        info!("🚀 Batch worker started (size: {}, timeout: {:?})", self.batch_size, self.timeout);
+        info!(
+            "🚀 Batch worker started (size: {}, timeout: {:?})",
+            self.batch_size, self.timeout
+        );
 
         loop {
             tokio::select! {
@@ -165,11 +180,15 @@ impl BatchWorker {
 
         let count = self.batch.len();
         let start = Instant::now();
-        
-        // Clone requests for the RPC
-        let requests: Vec<TelemetryRequest> = self.batch.iter().map(|e| e.request.clone()).collect();
 
-        debug!("📤 Forwarding batch of {} telemetry readings to API Gateway...", count);
+        // Clone requests for the RPC
+        let requests: Vec<TelemetryRequest> =
+            self.batch.iter().map(|e| e.request.clone()).collect();
+
+        debug!(
+            "📤 Forwarding batch of {} telemetry readings to API Gateway...",
+            count
+        );
 
         // Perform RPC outside of any external locks (worker owns self)
         let result = self.platform_client.submit_telemetry_batch(requests).await;
@@ -177,11 +196,18 @@ impl BatchWorker {
         match result {
             Ok(response) => {
                 // Success! Remove from batch and ACK in Redis
-                let batch_entries = std::mem::replace(&mut self.batch, Vec::with_capacity(self.batch_size));
-                self.process_success(batch_entries, response, start.elapsed()).await?;
+                let batch_entries =
+                    std::mem::replace(&mut self.batch, Vec::with_capacity(self.batch_size));
+                self.process_success(batch_entries, response, start.elapsed())
+                    .await?;
             }
             Err(e) => {
-                let sample_serials: Vec<String> = self.batch.iter().take(3).map(|e| e.request.meter_serial.clone()).collect();
+                let sample_serials: Vec<String> = self
+                    .batch
+                    .iter()
+                    .take(3)
+                    .map(|e| e.request.meter_serial.clone())
+                    .collect();
                 error!(
                     "❌ Batch forward failed: {}. Sample serials: {:?}. Keeping {} readings in buffer for retry.", 
                     e, sample_serials, count
@@ -195,25 +221,36 @@ impl BatchWorker {
     }
 
     async fn process_success(
-        &mut self, 
-        entries: Vec<BatchEntry>, 
+        &mut self,
+        entries: Vec<BatchEntry>,
         response: TelemetryBatchResponse,
-        duration: Duration
+        duration: Duration,
     ) -> Result<()> {
         let count = entries.len();
         let mut conn = self.connection_manager.clone();
-        
+
         // Group by stream for efficient XACK
-        let mut stream_id_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut stream_id_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
         for entry in &entries {
-            stream_id_map.entry(entry.stream_name.clone()).or_default().push(entry.entry_id.clone());
+            stream_id_map
+                .entry(entry.stream_name.clone())
+                .or_default()
+                .push(entry.entry_id.clone());
         }
 
         for (stream_name, ids) in stream_id_map {
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-            let _: () = conn.xack(&stream_name, &self.group_name, &id_refs)
+            let _: () = conn
+                .xack(&stream_name, &self.group_name, &id_refs)
                 .await
-                .with_context(|| format!("Failed to ACK {} messages in Redis stream {}", ids.len(), stream_name))?;
+                .with_context(|| {
+                    format!(
+                        "Failed to ACK {} messages in Redis stream {}",
+                        ids.len(),
+                        stream_name
+                    )
+                })?;
         }
 
         let duration_ms = duration.as_secs_f64() * 1000.0;
@@ -221,10 +258,13 @@ impl BatchWorker {
             count,
             response.accepted_count as usize,
             response.rejected_count as usize,
-            duration_ms
+            duration_ms,
         );
 
-        debug!("✅ Batch forwarded successfully: {} accepted, {}ms", response.accepted_count, duration_ms);
+        debug!(
+            "✅ Batch forwarded successfully: {} accepted, {}ms",
+            response.accepted_count, duration_ms
+        );
         Ok(())
     }
 }

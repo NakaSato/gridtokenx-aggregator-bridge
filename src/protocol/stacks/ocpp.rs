@@ -1,10 +1,10 @@
-use async_trait::async_trait;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType, EvStatus};
 use super::ProtocolStack;
-use anyhow::{Result, Context};
+use crate::models::{DeviceMetrics, DeviceReading, DeviceType, EvStatus};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
-use uuid::Uuid;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// OCPP (Open Charge Point Protocol) Stack.
 /// Supports MeterValues and StatusNotification for EVSEs.
@@ -32,10 +32,14 @@ impl OcppStack {
 
 #[async_trait]
 impl ProtocolStack for OcppStack {
-    async fn handle_message(&self, device_id: &str, raw_data: &[u8]) -> Result<Option<DeviceReading>> {
+    async fn handle_message(
+        &self,
+        device_id: &str,
+        raw_data: &[u8],
+    ) -> Result<Option<DeviceReading>> {
         // Parse OCPP telemetry from JSON representation
-        let tel: OcppTelemetry = serde_json::from_slice(raw_data)
-            .context("Failed to parse OCPP telemetry data")?;
+        let tel: OcppTelemetry =
+            serde_json::from_slice(raw_data).context("Failed to parse OCPP telemetry data")?;
 
         let status = match tel.status.as_str() {
             "Available" => EvStatus::Available,
@@ -55,7 +59,7 @@ impl ProtocolStack for OcppStack {
             device_id: device_id.to_string(),
             device_type: DeviceType::EvCharger,
             serial_number: device_id.to_string(),
-            zone_id: None,
+            zone_code: None,
             timestamp: Utc::now() - chrono::Duration::hours(12),
             metrics: DeviceMetrics::EvSession {
                 energy_delivered_kwh: tel.energy_wh / 1000.0,
@@ -88,11 +92,20 @@ mod tests {
             "transaction_id": "TX-999"
         }"#;
 
-        let result = stack.handle_message("CP-001", payload.as_bytes()).await.unwrap();
+        let result = stack
+            .handle_message("CP-001", payload.as_bytes())
+            .await
+            .unwrap();
         let reading = result.unwrap();
 
         assert_eq!(reading.device_id, "CP-001");
-        if let DeviceMetrics::EvSession { energy_delivered_kwh, session_id, connector_id, status } = reading.metrics {
+        if let DeviceMetrics::EvSession {
+            energy_delivered_kwh,
+            session_id,
+            connector_id,
+            status,
+        } = reading.metrics
+        {
             assert_eq!(energy_delivered_kwh, 15.0);
             assert_eq!(session_id, "TX-999");
             assert_eq!(connector_id, 1);
@@ -113,16 +126,22 @@ mod tests {
         ];
 
         for (raw, expected) in statuses {
-            let payload = format!(r#"{{
+            let payload = format!(
+                r#"{{
                 "energy_wh": 0.0,
                 "power_w": 0.0,
                 "status": "{}",
                 "connector_id": 1
-            }}"#, raw);
+            }}"#,
+                raw
+            );
 
-            let result = stack.handle_message("CP-001", payload.as_bytes()).await.unwrap();
+            let result = stack
+                .handle_message("CP-001", payload.as_bytes())
+                .await
+                .unwrap();
             let reading = result.unwrap();
-            
+
             if let DeviceMetrics::EvSession { status, .. } = reading.metrics {
                 assert_eq!(status, expected, "Failed for raw status: {}", raw);
             }

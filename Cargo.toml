@@ -70,6 +70,8 @@ rdkafka = { version = "0.37", features = ["zstd"] }
 # RabbitMQ
 lapin = "2.5"
 futures-util = "0.3"
+async-nats = "0.37"
+gridtokenx-blockchain-core = { version = "0.1.0", path = "../gridtokenx-blockchain-core" }
 
 [build-dependencies]
 buffa-build = "0.2.0"

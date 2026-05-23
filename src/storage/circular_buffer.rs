@@ -1,9 +1,9 @@
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tracing::{info, error, debug};
-use chrono::{DateTime, Utc};
+use tracing::{debug, error, info};
 
 /// A local, resilient telemetry ring-buffer using SQLite.
 /// Ensures 24-hour data retention for offline operation.
@@ -18,11 +18,16 @@ impl CircularBuffer {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )?;
-        
-        info!("🗄️ Initializing SQLite Circular Buffer at: {}", path.display());
-        
+
+        info!(
+            "🗄️ Initializing SQLite Circular Buffer at: {}",
+            path.display()
+        );
+
         // Ensure table exists
         conn.execute(
             "CREATE TABLE IF NOT EXISTS telemetry (
@@ -36,8 +41,14 @@ impl CircularBuffer {
         )?;
 
         // Index for faster cleanup/sync
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry(timestamp)", [])?;
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_telemetry_synced ON telemetry(synced)", [])?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telemetry_ts ON telemetry(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telemetry_synced ON telemetry(synced)",
+            [],
+        )?;
 
         Ok(Self {
             conn,
@@ -47,9 +58,14 @@ impl CircularBuffer {
     }
 
     /// Push a new reading into the buffer.
-    pub fn push(&mut self, meter_id: &str, timestamp: DateTime<Utc>, payload: &Value) -> Result<()> {
+    pub fn push(
+        &mut self,
+        meter_id: &str,
+        timestamp: DateTime<Utc>,
+        payload: &Value,
+    ) -> Result<()> {
         let payload_str = serde_json::to_string(payload)?;
-        
+
         self.conn.execute(
             "INSERT INTO telemetry (meter_id, timestamp, payload) VALUES (?1, ?2, ?3)",
             params![meter_id, timestamp, payload_str],
@@ -61,7 +77,7 @@ impl CircularBuffer {
         if self.push_count % 100 == 0 {
             self.cleanup()?;
         }
-        
+
         Ok(())
     }
 
@@ -73,8 +89,11 @@ impl CircularBuffer {
 
         // Optimize: Use single UPDATE with IN clause for O(1) database interactions instead of O(N)
         let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let query = format!("UPDATE telemetry SET synced = 1 WHERE id IN ({})", placeholders);
-        
+        let query = format!(
+            "UPDATE telemetry SET synced = 1 WHERE id IN ({})",
+            placeholders
+        );
+
         self.conn.execute(&query, rusqlite::params_from_iter(ids))?;
         Ok(())
     }
@@ -82,14 +101,14 @@ impl CircularBuffer {
     /// Fetch unsynced records to replay to the API Gateway.
     pub fn get_unsynced(&self, limit: u32) -> Result<Vec<(i64, String, DateTime<Utc>, Value)>> {
         let mut stmt = self.conn.prepare("SELECT id, meter_id, timestamp, payload FROM telemetry WHERE synced = 0 ORDER BY id LIMIT ?")?;
-        
+
         let rows = stmt.query_map(params![limit], |row| {
             let id: i64 = row.get(0)?;
             let meter_id: String = row.get(1)?;
             let timestamp: DateTime<Utc> = row.get(2)?;
             let payload_str: String = row.get(3)?;
             let payload: Value = serde_json::from_str(&payload_str).unwrap_or_default();
-            
+
             Ok((id, meter_id, timestamp, payload))
         })?;
 
@@ -107,7 +126,7 @@ impl CircularBuffer {
             "DELETE FROM telemetry WHERE timestamp < ?1 AND synced = 1",
             params![cutoff],
         )?;
-        
+
         if deleted > 0 {
             debug!("🧹 Cleaned up {} old telemetry records", deleted);
         }

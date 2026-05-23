@@ -1,11 +1,11 @@
-use std::time::Duration;
 use anyhow::Result;
 use rdkafka::{
+    message::OwnedHeaders,
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
-    message::OwnedHeaders,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,19 +47,27 @@ impl OracleKafkaProducer {
     pub async fn publish_meter_reading(&self, reading: &MeterReadingEvent) -> Result<()> {
         let payload = serde_json::to_string(reading)?;
         let verified_str = reading.verified.to_string();
-        
+
         let record = FutureRecord::to(&self.topic)
             .key(&reading.meter_id)
             .payload(&payload)
-            .headers(OwnedHeaders::new()
-                .insert(rdkafka::message::Header { key: "signature", value: Some(&reading.signature) })
-                .insert(rdkafka::message::Header { key: "verified", value: Some(&verified_str) }));
+            .headers(
+                OwnedHeaders::new()
+                    .insert(rdkafka::message::Header {
+                        key: "signature",
+                        value: Some(&reading.signature),
+                    })
+                    .insert(rdkafka::message::Header {
+                        key: "verified",
+                        value: Some(&verified_str),
+                    }),
+            );
 
-        self.producer.send(
-            record,
-            Duration::from_secs(5),
-        ).await.map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
-        
+        self.producer
+            .send(record, Duration::from_secs(5))
+            .await
+            .map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
+
         Ok(())
     }
 }

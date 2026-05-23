@@ -1,10 +1,10 @@
-use async_trait::async_trait;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
 use super::ProtocolStack;
-use anyhow::{Result, Context};
+use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
-use uuid::Uuid;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// SunSpec (Modbus TCP) Protocol Stack.
 /// Maps IEEE 1547 inverter models to canonical battery/solar models.
@@ -36,11 +36,15 @@ impl SunSpecStack {
 
 #[async_trait]
 impl ProtocolStack for SunSpecStack {
-    async fn handle_message(&self, device_id: &str, raw_data: &[u8]) -> Result<Option<DeviceReading>> {
+    async fn handle_message(
+        &self,
+        device_id: &str,
+        raw_data: &[u8],
+    ) -> Result<Option<DeviceReading>> {
         // In this implementation, we expect a JSON represention of SunSpec registers
         // from Model 103 (Three Phase Inverter).
-        let model: SunSpecModel103 = serde_json::from_slice(raw_data)
-            .context("Failed to parse SunSpec Model 103 data")?;
+        let model: SunSpecModel103 =
+            serde_json::from_slice(raw_data).context("Failed to parse SunSpec Model 103 data")?;
 
         let power_kw = Self::apply_sf(model.watts, model.watts_sf) / 1000.0;
         let energy_kwh = Self::apply_sf(model.watt_hours, model.watt_hours_sf) / 1000.0;
@@ -57,7 +61,7 @@ impl ProtocolStack for SunSpecStack {
             device_id: device_id.to_string(),
             device_type: DeviceType::Battery, // Model 103 is generic, but often used for Storage in this system
             serial_number: device_id.to_string(),
-            zone_id: None, // Will be filled from request if provided
+            zone_code: None, // Will be filled from request if provided
             timestamp: Utc::now() - chrono::Duration::hours(12),
             metrics: DeviceMetrics::BatteryState {
                 soc_percent: 0.0, // Model 103 doesn't have SoC, would need Model 802
@@ -71,7 +75,7 @@ impl ProtocolStack for SunSpecStack {
                 map.insert("sunspec_status".to_string(), Value::from(model.status));
                 map
             },
-        })) 
+        }))
     }
 }
 
@@ -97,7 +101,10 @@ mod tests {
             "St": 2
         }"#;
 
-        let result = stack.handle_message("INV-001", payload.as_bytes()).await.unwrap();
+        let result = stack
+            .handle_message("INV-001", payload.as_bytes())
+            .await
+            .unwrap();
         let reading = result.unwrap();
 
         assert_eq!(reading.device_id, "INV-001");
@@ -108,7 +115,12 @@ mod tests {
             panic!("Wrong metric type");
         }
 
-        let energy_kwh = reading.metadata.get("total_energy_kwh").unwrap().as_f64().unwrap();
+        let energy_kwh = reading
+            .metadata
+            .get("total_energy_kwh")
+            .unwrap()
+            .as_f64()
+            .unwrap();
         assert_eq!(energy_kwh, 1.0); // (100000 * 10^-2) / 1000 = 1.0
     }
 
@@ -122,11 +134,17 @@ mod tests {
         ];
 
         for (st, expected_mode) in test_cases {
-            let payload = format!(r#"{{
+            let payload = format!(
+                r#"{{
                 "W": 0, "W_SF": 0, "WH": 0, "WH_SF": 0, "St": {}
-            }}"#, st);
+            }}"#,
+                st
+            );
 
-            let result = stack.handle_message("INV-001", payload.as_bytes()).await.unwrap();
+            let result = stack
+                .handle_message("INV-001", payload.as_bytes())
+                .await
+                .unwrap();
             let reading = result.unwrap();
             if let DeviceMetrics::BatteryState { mode, .. } = reading.metrics {
                 assert_eq!(mode, expected_mode);

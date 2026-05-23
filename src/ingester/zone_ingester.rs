@@ -5,26 +5,25 @@
 //! - Running parallel ingester workers per zone
 //! - Batching telemetry submissions to API Gateway
 
-use chrono::{DateTime, Utc};
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, Client};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 use rust_decimal::Decimal;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
-use std::hash::{Hash, Hasher};
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::aggregator::Aggregator;
-use crate::ingester::Event;
 use crate::infra::platform::{PlatformClient, TelemetryRequest};
-use crate::ingester::batcher::{BatchHandle, BatchWorker, FORWARD_BATCH_SIZE, BATCH_TIMEOUT_MS};
+use crate::ingester::batcher::{BatchHandle, BatchWorker, BATCH_TIMEOUT_MS, FORWARD_BATCH_SIZE};
+use crate::ingester::Event;
 use crate::utils::numeric::to_positive_decimal;
-
 
 /// Maximum concurrent processing per zone
 const ZONE_SEMAPHORE_SIZE: usize = 50;
@@ -71,15 +70,18 @@ impl ZoneEventIngester {
             .await
             .context("Failed to initialize PlatformClient for zone ingester")?;
         let batch_handle = BatchWorker::spawn(
-            platform_client, 
+            platform_client,
             connection_manager.clone(),
             group_name.clone(),
-            metrics.clone()
+            metrics.clone(),
         );
 
         info!("🔢 Zone partitions: {}", num_zones);
         info!("📊 Zone streams: {:?}", zone_streams);
-        info!("📦 Batch forwarding: {} readings or {}ms timeout", FORWARD_BATCH_SIZE, BATCH_TIMEOUT_MS);
+        info!(
+            "📦 Batch forwarding: {} readings or {}ms timeout",
+            FORWARD_BATCH_SIZE, BATCH_TIMEOUT_MS
+        );
 
         Ok(Self {
             connection_manager,
@@ -105,7 +107,10 @@ impl ZoneEventIngester {
                 }
                 Err(e) => {
                     if attempt <= 5 {
-                        warn!("⚠️ Redis connection attempt {} failed: {}. Retrying...", attempt, e);
+                        warn!(
+                            "⚠️ Redis connection attempt {} failed: {}. Retrying...",
+                            attempt, e
+                        );
                         sleep(Duration::from_secs(attempt)).await;
                     } else {
                         return Err(anyhow::anyhow!("Failed to connect to Redis: {}", e));
@@ -118,9 +123,13 @@ impl ZoneEventIngester {
 
     /// Determine which zone stream a reading should go to
     #[allow(dead_code)]
-    pub fn get_zone_index(&self, zone_id: Option<i32>, meter_serial: &str) -> usize {
-        match zone_id {
-            Some(zid) if zid >= 0 && (zid as usize) < self.num_zones => zid as usize,
+    pub fn get_zone_index(&self, zone_code: Option<String>, meter_serial: &str) -> usize {
+        match zone_code {
+            Some(zcode) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                zcode.hash(&mut hasher);
+                hasher.finish() as usize % self.num_zones
+            }
             _ => {
                 // Hash meter serial to zone for consistent partitioning
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -133,8 +142,14 @@ impl ZoneEventIngester {
     pub async fn run(self: Arc<Self>, token: CancellationToken) -> Result<()> {
         self.setup_consumer_groups().await?;
 
-        info!("👂 Zone-based ingester listening to {} streams", self.zone_streams.len());
-        info!("🚀 Spawning {} zone workers with concurrency {}", self.num_zones, ZONE_SEMAPHORE_SIZE);
+        info!(
+            "👂 Zone-based ingester listening to {} streams",
+            self.zone_streams.len()
+        );
+        info!(
+            "🚀 Spawning {} zone workers with concurrency {}",
+            self.num_zones, ZONE_SEMAPHORE_SIZE
+        );
 
         // Spawn worker for each zone
         let mut join_set = JoinSet::new();
@@ -158,7 +173,9 @@ impl ZoneEventIngester {
         let redelivery_ingester = self.clone();
         let redelivery_token = token.clone();
         join_set.spawn(async move {
-            redelivery_ingester.run_redelivery_loop(redelivery_token).await;
+            redelivery_ingester
+                .run_redelivery_loop(redelivery_token)
+                .await;
             Ok::<(), anyhow::Error>(())
         });
 
@@ -176,7 +193,7 @@ impl ZoneEventIngester {
         // 10. Crucial: Shut down the batch worker to trigger final flush
         info!("🔄 All zone workers stopped. Triggering final telemetry flush...");
         if let Err(e) = self.batch_handle.clone().shutdown().await {
-             error!("❌ Final telemetry flush failed: {}", e);
+            error!("❌ Final telemetry flush failed: {}", e);
         }
 
         Ok(())
@@ -188,10 +205,10 @@ impl ZoneEventIngester {
             _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {},
             _ = token.cancelled() => return,
         }
-        
+
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         info!("♻️ Zone redelivery loop started (threshold: 30s)");
-        
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -211,7 +228,7 @@ impl ZoneEventIngester {
 
     async fn reclaim_stale_messages(&self, stream: &str) -> Result<()> {
         let mut conn = self.connection_manager.clone();
-        
+
         // 1. Get pending messages via XPENDING range
         let pending_items: Vec<redis::Value> = redis::cmd("XPENDING")
             .arg(stream)
@@ -241,33 +258,47 @@ impl ZoneEventIngester {
 
         // 2. Claim stale messages
         let mut claim_cmd = redis::cmd("XCLAIM");
-        claim_cmd.arg(stream).arg(&self.group_name).arg(&self.consumer_name).arg(30000);
+        claim_cmd
+            .arg(stream)
+            .arg(&self.group_name)
+            .arg(&self.consumer_name)
+            .arg(30000);
         for id in &ids_to_claim {
             claim_cmd.arg(id);
         }
-        
+
         let claimed_values: Vec<redis::Value> = claim_cmd.query_async(&mut conn).await?;
 
         if !claimed_values.is_empty() {
-            info!("♻️ Reclaimed {} stale messages from stream {}", claimed_values.len(), stream);
+            info!(
+                "♻️ Reclaimed {} stale messages from stream {}",
+                claimed_values.len(),
+                stream
+            );
             for val in claimed_values {
                 if let redis::Value::Array(parts) = val {
                     if parts.len() >= 2 {
                         let entry_id: String = redis::from_redis_value(&parts[0])?;
-                        let fields: std::collections::BTreeMap<String, String> = redis::from_redis_value(&parts[1])?;
-                        
+                        let fields: std::collections::BTreeMap<String, String> =
+                            redis::from_redis_value(&parts[1])?;
+
                         if let Some(json) = fields.get("event") {
-                            match serde_json::from_str::<Event>(json).context("Failed to parse reclaimed event JSON") {
-                                Ok(Event::SmartMeterReading(reading)) |
-                                Ok(Event::EvCharging(reading)) |
-                                Ok(Event::BatteryStateUpdate(reading)) => {
-                                    if let Err(e) = self.handle_iot_reading(reading, stream, &entry_id).await {
+                            match serde_json::from_str::<Event>(json)
+                                .context("Failed to parse reclaimed event JSON")
+                            {
+                                Ok(Event::SmartMeterReading(reading))
+                                | Ok(Event::EvCharging(reading))
+                                | Ok(Event::BatteryStateUpdate(reading)) => {
+                                    if let Err(e) =
+                                        self.handle_iot_reading(reading, stream, &entry_id).await
+                                    {
                                         error!("❌ Failed to handle reclaimed IoT reading: {}", e);
                                     }
                                 }
                                 Ok(_) => {
                                     let mut conn = self.connection_manager.clone();
-                                    let _: redis::RedisResult<()> = conn.xack(stream, &self.group_name, &[&entry_id]).await;
+                                    let _: redis::RedisResult<()> =
+                                        conn.xack(stream, &self.group_name, &[&entry_id]).await;
                                 }
                                 Err(e) => {
                                     error!("❌ Reclaim error: {}", e);
@@ -278,7 +309,7 @@ impl ZoneEventIngester {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -286,7 +317,9 @@ impl ZoneEventIngester {
         let mut conn = self.connection_manager.clone();
 
         for stream in &self.zone_streams {
-            let result: redis::RedisResult<()> = conn.xgroup_create_mkstream(stream, &self.group_name, "$").await;
+            let result: redis::RedisResult<()> = conn
+                .xgroup_create_mkstream(stream, &self.group_name, "$")
+                .await;
             if let Err(e) = result {
                 let err_str = e.to_string();
                 if !err_str.contains("BUSYGROUP") {
@@ -300,7 +333,11 @@ impl ZoneEventIngester {
         Ok(())
     }
 
-    async fn process_zone_stream(self: Arc<Self>, stream_name: &str, zone_idx: usize) -> Result<()> {
+    async fn process_zone_stream(
+        self: Arc<Self>,
+        stream_name: &str,
+        zone_idx: usize,
+    ) -> Result<()> {
         let mut conn = self.connection_manager.clone();
         let semaphore = Arc::new(Semaphore::new(ZONE_SEMAPHORE_SIZE));
         let mut pending_count = 0;
@@ -329,21 +366,44 @@ impl ZoneEventIngester {
                             tokio::spawn(async move {
                                 // Process entry
                                 if let Some(event_value) = entry.map.get("event") {
-                                    if let Ok(json) = redis::from_redis_value::<String>(event_value) {
-                                        match serde_json::from_str::<Event>(&json)
-                                            .with_context(|| format!("Failed to parse event JSON for entry {}", entry_id)) {
-                                            Ok(Event::SmartMeterReading(reading)) |
-                                            Ok(Event::EvCharging(reading)) |
-                                            Ok(Event::BatteryStateUpdate(reading)) => {
+                                    if let Ok(json) = redis::from_redis_value::<String>(event_value)
+                                    {
+                                        match serde_json::from_str::<Event>(&json).with_context(
+                                            || {
+                                                format!(
+                                                    "Failed to parse event JSON for entry {}",
+                                                    entry_id
+                                                )
+                                            },
+                                        ) {
+                                            Ok(Event::SmartMeterReading(reading))
+                                            | Ok(Event::EvCharging(reading))
+                                            | Ok(Event::BatteryStateUpdate(reading)) => {
                                                 let serial = reading.serial_number.clone();
-                                                if let Err(e) = ingester.handle_iot_reading(reading, &stream_name, &entry_id).await {
-                                                    error!("❌ Error handling IoT reading [{}]: {}", serial, e);
+                                                if let Err(e) = ingester
+                                                    .handle_iot_reading(
+                                                        reading,
+                                                        &stream_name,
+                                                        &entry_id,
+                                                    )
+                                                    .await
+                                                {
+                                                    error!(
+                                                        "❌ Error handling IoT reading [{}]: {}",
+                                                        serial, e
+                                                    );
                                                 }
                                             }
                                             Ok(_) => {
                                                 // Unknown event, ACK it so it doesn't block
                                                 let mut conn = ingester.connection_manager.clone();
-                                                let _: redis::RedisResult<()> = conn.xack(&stream_name, &ingester.group_name, &[&entry_id]).await;
+                                                let _: redis::RedisResult<()> = conn
+                                                    .xack(
+                                                        &stream_name,
+                                                        &ingester.group_name,
+                                                        &[&entry_id],
+                                                    )
+                                                    .await;
                                             }
                                             Err(e) => {
                                                 error!("❌ Event processing error: {}", e);
@@ -369,57 +429,79 @@ impl ZoneEventIngester {
 
             // Log progress every 1000 messages
             if pending_count >= 1000 {
-                info!("📊 Zone {} processed {} messages (total: {})", zone_idx, pending_count, total_processed);
+                info!(
+                    "📊 Zone {} processed {} messages (total: {})",
+                    zone_idx, pending_count, total_processed
+                );
                 pending_count = 0;
             }
         }
     }
 
-
-
-    async fn handle_iot_reading(&self, reading: crate::models::DeviceReading, stream_name: &str, entry_id: &str) -> Result<()> {
+    async fn handle_iot_reading(
+        &self,
+        reading: crate::models::DeviceReading,
+        stream_name: &str,
+        entry_id: &str,
+    ) -> Result<()> {
         use crate::models::DeviceMetrics;
 
-        let (energy_generated, energy_consumed) = match reading.metrics {
-            DeviceMetrics::Energy { generated_kwh, consumed_kwh, .. } => {
-                (
-                    to_positive_decimal(generated_kwh, "energy_generated").unwrap_or(Decimal::ZERO), 
-                    to_positive_decimal(consumed_kwh, "energy_consumed").unwrap_or(Decimal::ZERO)
-                )
+        let (energy_generated, energy_consumed, net_kwh) = match reading.metrics {
+            DeviceMetrics::Energy {
+                generated_kwh,
+                consumed_kwh,
+                net_kwh,
+            } => (
+                to_positive_decimal(generated_kwh, "energy_generated").unwrap_or(Decimal::ZERO),
+                to_positive_decimal(consumed_kwh, "energy_consumed").unwrap_or(Decimal::ZERO),
+                Decimal::from_f64_retain(net_kwh).unwrap_or(Decimal::ZERO),
+            ),
+            DeviceMetrics::EvSession {
+                energy_delivered_kwh,
+                ..
+            } => {
+                let consumed = to_positive_decimal(energy_delivered_kwh, "ev_energy_delivered")
+                    .unwrap_or(Decimal::ZERO);
+                (Decimal::ZERO, consumed, -consumed)
             }
-            DeviceMetrics::EvSession { energy_delivered_kwh, .. } => {
-                (
-                    Decimal::ZERO, 
-                    to_positive_decimal(energy_delivered_kwh, "ev_energy_delivered").unwrap_or(Decimal::ZERO)
-                )
-            }
-            DeviceMetrics::BatteryState { power_kw, mode, .. } => {
-                match mode {
-                    crate::models::BatteryMode::Charging => (
-                        Decimal::ZERO, 
-                        to_positive_decimal(power_kw.abs(), "battery_power_charging").unwrap_or(Decimal::ZERO)
-                    ),
-                    crate::models::BatteryMode::Discharging => (
-                        to_positive_decimal(power_kw.abs(), "battery_power_discharging").unwrap_or(Decimal::ZERO), 
-                        Decimal::ZERO
-                    ),
-                    crate::models::BatteryMode::Idle => (Decimal::ZERO, Decimal::ZERO),
+            DeviceMetrics::BatteryState { power_kw, mode, .. } => match mode {
+                crate::models::BatteryMode::Charging => {
+                    let consumed = to_positive_decimal(power_kw.abs(), "battery_power_charging")
+                        .unwrap_or(Decimal::ZERO);
+                    (Decimal::ZERO, consumed, -consumed)
                 }
-            }
+                crate::models::BatteryMode::Discharging => {
+                    let generated =
+                        to_positive_decimal(power_kw.abs(), "battery_power_discharging")
+                            .unwrap_or(Decimal::ZERO);
+                    (generated, Decimal::ZERO, generated)
+                }
+                crate::models::BatteryMode::Idle => (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            },
         };
 
         // Use a consistent UUID derived from the serial number for aggregation
         let meter_id = Uuid::new_v5(&Uuid::NAMESPACE_OID, reading.serial_number.as_bytes());
 
         // Resolve user_id from meter registry
-        let user_id = match self.meter_registry.resolve_user_id(&reading.serial_number).await {
+        let user_id = match self
+            .meter_registry
+            .resolve_user_id(&reading.serial_number)
+            .await
+        {
             Ok(Some(uid)) => uid,
             Ok(None) => {
-                debug!("⚠️ No user mapping found for meter {}. Using nil UUID.", reading.serial_number);
+                debug!(
+                    "⚠️ No user mapping found for meter {}. Using nil UUID.",
+                    reading.serial_number
+                );
                 Uuid::nil()
             }
             Err(e) => {
-                warn!("⚠️ Meter registry lookup failed for {}: {}. Using nil UUID.", reading.serial_number, e);
+                warn!(
+                    "⚠️ Meter registry lookup failed for {}: {}. Using nil UUID.",
+                    reading.serial_number, e
+                );
                 Uuid::nil()
             }
         };
@@ -442,27 +524,26 @@ impl ZoneEventIngester {
             reading.reading_id,
             meter_id,
             reading.serial_number,
-            reading.zone_id,
-            energy_generated,
-            energy_consumed,
+            reading.zone_code.clone(),
+            net_kwh,
             reading.timestamp,
             stream_name,
             entry_id,
-        ).await
+        )
+        .await
     }
 
     /// Forward meter reading to API Gateway with batching
     async fn forward_to_api_services(
-        &self, 
+        &self,
         reading_id: Uuid,
         meter_id: Uuid,
         meter_serial: String,
-        zone_id: Option<i32>,
-        energy_generated: Decimal,
-        energy_consumed: Decimal,
+        zone_code: Option<String>,
+        net_kwh: Decimal,
         timestamp: DateTime<Utc>,
-        stream_name: &str, 
-        entry_id: &str
+        stream_name: &str,
+        entry_id: &str,
     ) -> Result<()> {
         let req = TelemetryRequest {
             reading_id: reading_id.to_string(),
@@ -470,10 +551,10 @@ impl ZoneEventIngester {
             meter_serial,
             user_id: Uuid::nil().to_string(),
             wallet_address: String::new(),
-            zone_id,
-            kwh: Decimal::ZERO.to_string(),
-            energy_generated: Some(energy_generated.to_string()),
-            energy_consumed: Some(energy_consumed.to_string()),
+            zone_code: zone_code.clone(),
+            kwh: net_kwh.to_string(),
+            energy_generated: None,
+            energy_consumed: None,
             voltage: None,
             current: None,
             battery_level: None,
@@ -483,10 +564,11 @@ impl ZoneEventIngester {
         };
 
         // Add to batch forwarder (non-blocking channel send)
-        self.batch_handle.add(req, stream_name.to_string(), entry_id.to_string()).await
+        self.batch_handle
+            .add(req, stream_name.to_string(), entry_id.to_string())
+            .await
             .context("Failed to send reading to batch worker")?;
 
         Ok(())
     }
 }
-

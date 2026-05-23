@@ -1,10 +1,10 @@
-use anyhow::Result;
 use crate::storage::CircularBuffer;
+use anyhow::Result;
+use reqwest::Client;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
-use reqwest::Client;
-use serde_json::Value;
 
 /// SyncManager handles the replay of unsynced telemetry from the local buffer to the API Gateway.
 pub struct SyncManager {
@@ -25,7 +25,7 @@ impl SyncManager {
     /// Run the sync loop to periodically check for unsynced data and replay it.
     pub async fn run(&self) -> Result<()> {
         info!("🔄 Starting Sync Manager replay loop...");
-        
+
         loop {
             let unsynced = {
                 let buffer = self.buffer.lock().await;
@@ -37,8 +37,11 @@ impl SyncManager {
                 continue;
             }
 
-            info!("📤 Syncing {} unsynced telemetry records...", unsynced.len());
-            
+            info!(
+                "📤 Syncing {} unsynced telemetry records...",
+                unsynced.len()
+            );
+
             let mut synced_ids = Vec::new();
             for (id, meter_id, ts, payload) in unsynced {
                 match self.send_to_gateway(&meter_id, ts, &payload).await {
@@ -57,10 +60,17 @@ impl SyncManager {
         }
     }
 
-    async fn send_to_gateway(&self, meter_id: &str, timestamp: chrono::DateTime<chrono::Utc>, payload: &Value) -> Result<()> {
+    async fn send_to_gateway(
+        &self,
+        meter_id: &str,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        payload: &Value,
+    ) -> Result<()> {
         let url = format!("{}/api/v1/telemetry/replay", self.api_services_url);
-        
-        let response = self.client.post(&url)
+
+        let response = self
+            .client
+            .post(&url)
             .json(&serde_json::json!({
                 "meter_id": meter_id,
                 "timestamp": timestamp,
@@ -70,7 +80,10 @@ impl SyncManager {
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Gateway returned unexpected status: {}", response.status()));
+            return Err(anyhow::anyhow!(
+                "Gateway returned unexpected status: {}",
+                response.status()
+            ));
         }
 
         Ok(())

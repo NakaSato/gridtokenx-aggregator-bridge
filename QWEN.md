@@ -69,11 +69,6 @@ src/
 │       ├── client.rs          # ConnectRPC client (OracleServiceClient)
 │       └── mod.rs
 │
-├── nilm/                      # Non-Intrusive Load Monitoring (edge ML)
-│   ├── engine.rs
-│   ├── models.rs
-│   └── mod.rs
-│
 ├── storage/                   # SQLite circular buffer (offline resilience)
 │   ├── circular_buffer.rs
 │   ├── sync_manager.rs

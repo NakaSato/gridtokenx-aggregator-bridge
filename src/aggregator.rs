@@ -1,8 +1,8 @@
-use chrono::{DateTime, Utc, Timelike};
+use chrono::{DateTime, Timelike, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use uuid::Uuid;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 /// Duration of a billing window in minutes
 const WINDOW_MINUTES: u32 = 15;
@@ -44,19 +44,25 @@ impl Aggregator {
         let start_time = self.get_window_start(timestamp);
         let end_time = start_time + chrono::Duration::minutes(WINDOW_MINUTES as i64);
 
-        let bin = self.active_bins.entry((meter_id, start_time)).or_insert_with(|| {
-            debug!("🆕 Creating new billing bin for {} starting at {}", meter_serial, start_time);
-            BillingBin {
-                meter_id,
-                user_id,
-                meter_serial,
-                start_time,
-                end_time,
-                energy_generated: Decimal::ZERO,
-                energy_consumed: Decimal::ZERO,
-                reading_count: 0,
-            }
-        });
+        let bin = self
+            .active_bins
+            .entry((meter_id, start_time))
+            .or_insert_with(|| {
+                debug!(
+                    "🆕 Creating new billing bin for {} starting at {}",
+                    meter_serial, start_time
+                );
+                BillingBin {
+                    meter_id,
+                    user_id,
+                    meter_serial,
+                    start_time,
+                    end_time,
+                    energy_generated: Decimal::ZERO,
+                    energy_consumed: Decimal::ZERO,
+                    reading_count: 0,
+                }
+            });
 
         bin.energy_generated += generated;
         bin.energy_consumed += consumed;

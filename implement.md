@@ -37,16 +37,6 @@ The smart meter is the universal oracle node — it measures its own consumption
 - **Storage:** 32 GB eMMC (SQLite circular buffer, model files, firmware)
 - **Connectivity:** NB-IoT/LTE module (primary), Wi-Fi 802.11ac (fallback), RS-485 for Modbus peripherals
 
-**ML inference pipeline:**
-
-- **Architecture:** Sparse Mixture-of-Experts (MoE) with shared 1D-CNN trunk
-- **Experts:** 8 total, top-2 activated per inference via noisy top-K gating
-- **Specialization:** Each expert targets a load category — HVAC, water heater, EV charger, lighting, refrigeration, cooking, laundry, electronics, industrial motor, miscellaneous
-- **Parameters:** ~50M total, ~12M active per forward pass
-- **Quantization:** INT8 via RKNN-Toolkit2 for NPU deployment
-- **Latency:** <10ms per disaggregation cycle
-- **Dual output heads:** power regression (per-appliance wattage) and appliance state classification (on/off/transitioning)
-
 **Data acquisition (Rust pipeline):**
 
 - **Sampling rate:** 1 second (voltage, current, power factor, active/reactive power, harmonics up to 15th order)
@@ -55,37 +45,16 @@ The smart meter is the universal oracle node — it measures its own consumption
 - **Reconnection protocol:** Last-known-sequence sync on connectivity restoration
 - **Data format:** Protocol Buffers (Protobuf) — ~40 bytes per aggregated sample, bandwidth-optimized for NB-IoT
 
-**ML output (published every 15 seconds):**
-
-| Output                 | Description                                                                         | Consumer                           |
-| ---------------------- | ----------------------------------------------------------------------------------- | ---------------------------------- |
-| Appliance power vector | Per-appliance active power (W) for 10 classes                                       | VPP forecasting engine             |
-| Anomaly flags          | Phase imbalance >5%, THD >8%, voltage sag/swell ±10%, meter tamper, equipment fault | Platform anomaly service           |
-| Flexibility scores     | Per-appliance 0–1 score based on thermal inertia, user behavior, charging curves    | VPP optimizer (dispatch targeting) |
-| Aggregate consumption  | Total household kW/kWh (15-second resolution)                                       | MEA/PEA billing settlement         |
-
 **MQTT topic hierarchy:**
 
 ```
 gridtokenx/{region}/{feeder}/{meter_id}/telemetry     — 15-sec aggregated data (QoS 1)
 gridtokenx/{region}/{feeder}/{meter_id}/anomaly        — real-time anomaly alerts (QoS 1)
-gridtokenx/{region}/{feeder}/{meter_id}/flexibility    — per-appliance flex scores (QoS 1)
 gridtokenx/{region}/{feeder}/{meter_id}/dispatch       — incoming dispatch commands (QoS 2)
 gridtokenx/{region}/{feeder}/{meter_id}/attestation    — signed oracle attestations (QoS 2)
-gridtokenx/{region}/{feeder}/{meter_id}/fl_gradient    — federated learning updates (QoS 1)
 ```
 
 **Oracle role:** The smart meter is the primary hardware oracle for GridTokenX. Every 15 seconds, the Rust pipeline prepares a telemetry packet, and the ATECC608B secure element signs it with Ed25519 (Base58) using the canonical format `{meter_id}:{kwh}:{timestamp_ms}`. This ensures every reading is cryptographically verified before reaching the VPP Platform.
-
-**Federated learning cycle (weekly):**
-
-1. Local training on 7 days × 86,400 samples at 1-second resolution
-2. Gradient computation for Sparse MoE model parameters
-3. Differential privacy noise injection (ε=1.0, δ=10⁻⁵)
-4. Compressed gradient upload (~500 KB) via dedicated MQTT control channel
-5. Central aggregator applies robust gradient filtering (trimmed mean, outlier exclusion)
-6. Updated global model quantized to INT8 RKNN format
-7. OTA model push with A/B testing on 5% of fleet before full rollout
 
 ### 2.2 BESS and solar PV inverters
 
@@ -185,12 +154,6 @@ gridtokenx/{region}/{feeder}/{meter_id}/fl_gradient    — federated learning up
 - Read: zone temperature, setpoint, fan speed, compressor state
 - Write: setpoint adjustment, operating mode (occupied/unoccupied/standby)
 
-**Tertiary fallback: NILM-inferred state**
-
-- When no direct communication protocol is available, the co-located smart meter's NILM disaggregation infers load operating state
-- Enables passive flexibility estimation without requiring load-specific hardware
-- Dispatch commands are issued indirectly (e.g., "reduce household consumption by 1.5 kW" with NILM providing real-time verification)
-
 **Flexibility model (thermal inertia-based):**
 
 | Load type      | Flexibility action       | Duration      | Recovery           |
@@ -201,16 +164,7 @@ gridtokenx/{region}/{feeder}/{meter_id}/fl_gradient    — federated learning up
 | Pool pump      | Shift runtime window     | 4–8 hours     | No recovery needed |
 | Refrigerator   | Defer defrost cycle      | 1–2 hours     | Auto-recovery      |
 
-**Dispatch advantage of NILM-aware targeting:**
-
-Traditional VPP platforms send blanket DR signals ("reduce 2 kW") without knowledge of what loads are running. Edge NILM disaggregation enables targeted dispatch:
-
-- Smart meter identifies: HVAC 1.5 kW running, EV charger 4.5 kW active, refrigerator 0.3 kW steady
-- VPP sends targeted command: "curtail EV charging to 2 kW for 30 minutes" instead of generic shed
-- Result: required 2.5 kW reduction achieved while preserving thermal comfort and food safety
-- Impact: higher DR participation rates (less prosumer inconvenience) and improved dispatch precision (actual delivered flexibility matches committed flexibility)
-
-**Oracle role:** Demand reduction events are metered by the smart meter's NILM pipeline. The oracle bridge generates DR performance attestations — signed proof that a specific load was curtailed for a specific duration, verified by before/after NILM disaggregation. These attestations enable GridTokenX settlement of DR incentive payments.
+**Oracle role:** Demand reduction events are metered by the smart meter. The oracle bridge generates DR performance attestations — signed proof that a specific load was curtailed for a specific duration. These attestations enable GridTokenX settlement of DR incentive payments.
 
 ---
 
@@ -241,14 +195,12 @@ Traditional VPP platforms send blanket DR signals ("reduce 2 kW") without knowle
 | Topic                      | Purpose                                              | Retention                        |
 | -------------------------- | ---------------------------------------------------- | -------------------------------- |
 | `telemetry.raw`            | Raw 15-second meter data                             | 7 days (then tier to S3/Parquet) |
-| `telemetry.processed`      | NILM-enriched data with appliance breakdown          | 30 days                          |
 | `dispatch.commands`        | Optimizer → DER dispatch instructions                | 24 hours                         |
 | `dispatch.acknowledgments` | DER → platform dispatch confirmation                 | 24 hours                         |
 | `market.signals`           | EGAT DR events, TOU tariff updates                   | 90 days                          |
 | `settlement.events`        | On-chain settlement confirmations from oracle bridge | Permanent                        |
 | `anomaly.alerts`           | Edge-detected and platform-correlated anomalies      | 30 days                          |
 | `attestation.signed`       | Signed meter attestations for oracle bridge          | Until ZK-proved                  |
-| `fl.gradients`             | Federated learning gradient updates                  | 7 days                           |
 
 - **Tiered storage:** Kafka data older than 7 days moves to Apache Parquet on S3-compatible object storage (MinIO for on-premise or AWS S3), queryable via DuckDB for analytics
 - **Kafka Connect sinks:** TimescaleDB (time-series), ML feature store (Feast), PostgreSQL (DER registry updates)
@@ -281,11 +233,9 @@ The oracle bridge is the trust boundary between the physical grid and the blockc
 **Process flow:**
 
 1. Rust data acquisition pipeline samples V/I/PF at 1-second resolution
-2. RKNN NPU runs Sparse MoE NILM inference (<10ms per cycle)
-3. Inference outputs: per-appliance power, anomaly flags, flexibility scores
-4. Outputs are signed using Ed25519 (Base58) over the canonical format `{meter_id}:{kwh}:{timestamp_ms}`.
-5. Signed telemetry is published directly to the Oracle Bridge via gRPC or REST (Path A).
-6. Simultaneously, a 15-minute energy summary is prepared for attestation (Path B).
+2. Outputs are signed using Ed25519 (Base58) over the canonical format `{meter_id}:{kwh}:{timestamp_ms}`.
+3. Signed telemetry is published directly to the Oracle Bridge via gRPC or REST (Path A).
+4. Simultaneously, a 15-minute energy summary is prepared for attestation (Path B).
 
 **Data generated per 15-minute window:**
 
@@ -298,7 +248,6 @@ The oracle bridge is the trust boundary between the physical grid and the blockc
   "total_production_wh": 890,
   "net_export_wh": 0,
   "net_import_wh": 360,
-  "nilm_summary_hash": "sha256:a3f8...",
   "anomaly_count": 0,
   "avg_power_factor": 0.95,
   "max_demand_w": 3200,
@@ -455,9 +404,8 @@ The full lifecycle of a single energy measurement from physical grid to blockcha
 1. Physical measurement (0ms)
    └─ CT/PT sensors sample V/I/PF at 1-second resolution
 
-2. Edge inference (10ms)
-   └─ RKNN NPU runs Sparse MoE NILM disaggregation
-   └─ Outputs: appliance power, anomaly flags, flexibility scores
+2. Edge data preparation (10ms)
+   └─ Outputs: anomaly flags
 
 3. Dual-path publication (50ms)
    ├─ PATH A (Telemetry): MQTT QoS 1 → EMQX → Kafka → TimescaleDB
@@ -514,8 +462,8 @@ The full lifecycle of a single energy measurement from physical grid to blockcha
 ### 6.3 PDPA compliance architecture
 
 - **Data residency:** Kubernetes cluster runs in Thai data centers (True IDC, CAT Telecom)
-- **Consent management:** Dedicated consent service with granular permissions — meter data collection (required), DR participation (optional), P2P trading (optional), federated learning contribution (optional)
-- **Data minimization:** Appliance-level NILM data remains on-device or in prosumer's encrypted personal data store; only aggregated fleet data flows to utility partners
+- **Consent management:** Dedicated consent service with granular permissions — meter data collection (required), DR participation (optional), P2P trading (optional)
+- **Data minimization:** Meter data remains on-device or in prosumer's encrypted personal data store; only aggregated fleet data flows to utility partners
 - **Right to deletion:** Prosumer can revoke consent → meter stops publishing attestations → historical on-chain data is pseudonymous (DID-based, not PII-linked)
 - **Cross-border restriction:** No meter data transmitted outside Thailand; ZK proofs on HyperEVM contain only aggregated statistical summaries
 
@@ -639,9 +587,7 @@ Target 500,000+ endpoints spanning MEA + PEA national. Full grid services portfo
 | Decomposed optimization (Tesla pattern)   | Scales linearly with sites — no central MILP re-solve needed as fleet grows                  |
 | ZK-rollup for oracle bridge               | PDPA compliance by construction; individual data never on-chain; quantum-resistant           |
 | Dual data paths (telemetry + attestation) | Decouples real-time VPP operations (<1s) from financial settlement (15-min)                  |
-| NILM-aware targeted dispatch              | Higher DR participation, better dispatch precision, prosumer comfort preserved               |
 | HyperEVM for settlement                   | Sub-second finality, institutional-grade CLOB via HIP-3, EVM compatibility                   |
-| Federated learning for model updates      | Fleet-wide NILM improvement without centralizing raw energy data                             |
 | OpenADR 3.0 for EGAT integration          | Industry standard for utility DR programs; program-based lifecycle matches ERC framework     |
 | Protocol-agnostic communication layer     | Supports Thailand's heterogeneous AMI landscape (Modbus, SunSpec, OCPP, CTA-2045, IEC 61850) |
 
