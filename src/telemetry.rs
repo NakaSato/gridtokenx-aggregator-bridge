@@ -1,3 +1,5 @@
+//! Logging initialization for Oracle Bridge.
+
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Debug)]
