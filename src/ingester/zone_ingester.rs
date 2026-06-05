@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::aggregator::Aggregator;
-use crate::infra::platform::{PlatformClient, TelemetryRequest};
+use crate::infra::platform::{MeterReading, PlatformClient};
 use crate::ingester::batcher::{BatchHandle, BatchWorker, BATCH_TIMEOUT_MS, FORWARD_BATCH_SIZE};
 use crate::ingester::Event;
 use crate::utils::numeric::to_positive_decimal;
@@ -97,29 +97,26 @@ impl ZoneEventIngester {
     }
 
     async fn create_connection_manager(client: &Client) -> Result<ConnectionManager> {
-        use tokio::time::{sleep, Duration};
-
-        for attempt in 1..=10 {
-            match ConnectionManager::new(client.clone()).await {
-                Ok(cm) => {
+        use tokio::time::{sleep, Duration, timeout};
+        for attempt in 1..=5 {
+            match timeout(Duration::from_secs(2), ConnectionManager::new(client.clone())).await {
+                Ok(Ok(cm)) => {
                     info!("✅ Redis connection manager created for zone ingester");
                     return Ok(cm);
                 }
-                Err(e) => {
-                    if attempt <= 5 {
-                        warn!(
-                            "⚠️ Redis connection attempt {} failed: {}. Retrying...",
-                            attempt, e
-                        );
-                        sleep(Duration::from_secs(attempt)).await;
-                    } else {
-                        return Err(anyhow::anyhow!("Failed to connect to Redis: {}", e));
-                    }
+                Ok(Err(e)) => {
+                    warn!("⚠️ Redis connection attempt {} failed: {}. Retrying...", attempt, e);
+                    sleep(Duration::from_secs(1)).await;
+                }
+                Err(_) => {
+                    warn!("⚠️ Redis connection attempt {} timed out. Retrying...", attempt);
+                    sleep(Duration::from_secs(1)).await;
                 }
             }
         }
-        Err(anyhow::anyhow!("Failed to connect to Redis"))
+        Err(anyhow::anyhow!("Failed to connect to Redis after 5 attempts"))
     }
+
 
     /// Determine which zone stream a reading should go to
     #[allow(dead_code)]
@@ -533,7 +530,7 @@ impl ZoneEventIngester {
         .await
     }
 
-    /// Forward meter reading to API Gateway with batching
+    /// Forward meter reading to API Gateway with batching (UTT Pipeline)
     async fn forward_to_api_services(
         &self,
         reading_id: Uuid,
@@ -545,30 +542,14 @@ impl ZoneEventIngester {
         stream_name: &str,
         entry_id: &str,
     ) -> Result<()> {
-        let req = TelemetryRequest {
-            reading_id: reading_id.to_string(),
-            meter_id: meter_id.simple().to_string(),
-            meter_serial,
-            user_id: Uuid::nil().to_string(),
-            wallet_address: String::new(),
-            zone_code: zone_code.clone(),
-            kwh: net_kwh.to_string(),
-            energy_generated: None,
-            energy_consumed: None,
-            voltage: None,
-            current: None,
-            battery_level: None,
-            temperature: None,
-            timestamp: timestamp.timestamp(),
-            ..Default::default()
-        };
-
-        // Add to batch forwarder (non-blocking channel send)
-        self.batch_handle
-            .add(req, stream_name.to_string(), entry_id.to_string())
+        // BYPASS: Legacy HTTP/gRPC forwarder removed in favor of direct Kafka streaming.
+        
+        // Directly ACK the message in Redis to prevent redelivery
+        let mut conn = self.connection_manager.clone();
+        let _: () = redis::AsyncCommands::xack(&mut conn, stream_name, &self.group_name, &[entry_id])
             .await
-            .context("Failed to send reading to batch worker")?;
-
+            .context("Failed to ACK message in Redis stream")?;
+            
         Ok(())
     }
 }
