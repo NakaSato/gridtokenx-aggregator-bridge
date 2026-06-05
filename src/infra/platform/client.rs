@@ -9,7 +9,8 @@ pub mod proto {
 }
 
 pub use proto::gridtokenx::oracle::v1::{
-    OracleServiceClient, TelemetryBatchRequest, TelemetryBatchResponse, TelemetryRequest,
+    IngestResponse, MeterReading, MeterReadingBatchRequest, MeterReadingBatchResponse,
+    OracleServiceClient,
 };
 
 #[derive(Clone)]
@@ -29,46 +30,44 @@ impl PlatformClient {
         Ok(Self { client })
     }
 
-    /// Submit a batch of telemetry readings (High performance)
-    pub async fn submit_telemetry_batch(
+    /// Submit a batch of verified meter readings (UTT Path A/B)
+    pub async fn submit_meter_reading_batch(
         &self,
-        requests: Vec<TelemetryRequest>,
-    ) -> Result<TelemetryBatchResponse> {
+        requests: Vec<MeterReading>,
+    ) -> Result<MeterReadingBatchResponse> {
         let count = requests.len();
         info!(
-            "📤 [ConnectRPC] Submitting batch of {} telemetry readings to platform",
+            "📤 [UTT] Submitting batch of {} verified readings to platform",
             count
         );
 
-        let batch_req = TelemetryBatchRequest {
+        let batch_req = MeterReadingBatchRequest {
             readings: requests,
             ..Default::default()
         };
 
-        match self.client.submit_telemetry_batch(batch_req).await {
+        match self.client.ingest_batch(batch_req).await {
             Ok(res) => {
                 let view = res.view();
                 info!(
-                    "✅ Batch telemetry ingested. Accepted: {}, Rejected: {}",
+                    "✅ Unified ingestion successful. Accepted: {}, Rejected: {}",
                     view.accepted_count, view.rejected_count
                 );
 
-                // Return a fresh TelemetryBatchResponse based on the view
-                Ok(TelemetryBatchResponse {
+                Ok(MeterReadingBatchResponse {
                     accepted_count: view.accepted_count,
                     rejected_count: view.rejected_count,
                     ..Default::default()
                 })
             }
             Err(e) => {
-                error!("❌ Batch telemetry submission failed: {}", e);
+                error!("❌ Unified ingestion failed: {}", e);
                 Err(anyhow::anyhow!("RPC error: {}", e))
             }
         }
     }
 
     /// Execute Generation Mint for a verified billing bin via REST API
-    /// (Currently using REST for settlement as it involves complex on-chain coordinator)
     pub async fn settle_generation_mint(
         &self,
         base_url: &str,
@@ -93,58 +92,53 @@ impl PlatformClient {
                 .unwrap_or("?")
         );
 
-        // 1. Inject distributed tracing context (traceparent)
-        let mut request_builder = client.post(&url).json(payload);
-
-        use opentelemetry::global;
-        use opentelemetry::propagation::TextMapPropagator;
-
-        struct HeaderInjector<'a>(&'a mut reqwest::header::HeaderMap);
-        impl<'a> opentelemetry::propagation::Injector for HeaderInjector<'a> {
-            fn set(&mut self, key: &str, value: String) {
-                if let Ok(name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-                    if let Ok(val) = reqwest::header::HeaderValue::from_str(&value) {
-                        self.0.insert(name, val);
-                    }
-                }
-            }
-        }
-
-        let mut headers = reqwest::header::HeaderMap::new();
-        /*
-        use opentelemetry::global;
-        use opentelemetry::propagation::TextMapPropagator;
-
-        global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&opentelemetry::Context::current(), &mut HeaderInjector(&mut headers));
-        });
-        */
-
-        request_builder = request_builder.headers(headers);
-
-        // 2. Send Request
+        let request_builder = client.post(&url).json(payload);
         let response = request_builder.send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "❌ Settlement failed with status {}: {}",
-                status, error_text
-            );
+            let error_text = response.text().await.unwrap_or_default();
+            error!("❌ Settlement failed with status {}: {}", status, error_text);
             return Err(anyhow::anyhow!("Settlement failed: {}", error_text));
         }
 
+        info!("✅ Settlement successful for {}", payload.get("meter_serial").and_then(|v| v.as_str()).unwrap_or(""));
+        Ok(())
+    }
+
+    /// Execute Batched Generation Mint for verified billing bins via REST API
+    pub async fn settle_generation_mint_batch(
+        &self,
+        base_url: &str,
+        payloads: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/v1/settlement/generation-mint/batch", base_url);
+
         info!(
-            "✅ Settlement successful for {}",
-            payload
-                .get("meter_serial")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            "💰 [REST] Submitting batched settlement for {} records",
+            payloads.len()
         );
+
+        let batch_payload = serde_json::json!({
+            "requests": payloads
+        });
+
+        let request_builder = client.post(&url).json(&batch_payload);
+        let response = request_builder.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            error!("❌ Batched settlement failed with status {}: {}", status, error_text);
+            return Err(anyhow::anyhow!("Batched settlement failed: {}", error_text));
+        }
+
+        info!("✅ Batched settlement successful");
         Ok(())
     }
 }
