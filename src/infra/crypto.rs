@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 pub struct SignatureVerifier {
-    redis: ConnectionManager,
+    redis: Option<ConnectionManager>,
 }
 
 impl SignatureVerifier {
-    pub fn new(redis: ConnectionManager) -> Self {
+    pub fn new(redis: Option<ConnectionManager>) -> Self {
         Self { redis }
     }
 
@@ -20,9 +20,12 @@ impl SignatureVerifier {
         payload: &[u8],
         signature_base58: &str,
     ) -> Result<bool> {
+        let mut conn = match &self.redis {
+            Some(conn) => conn.clone(),
+            None => return Ok(false),
+        };
         // 1. Lookup device public key from registry (Redis)
         // Key format: gridtokenx:devices:{meter_id}:pubkey
-        let mut conn = self.redis.clone();
         let key = format!("gridtokenx:devices:{}:pubkey", meter_id);
 
         let public_key_hex: Option<String> = conn
@@ -97,6 +100,62 @@ impl SignatureVerifier {
         }
 
         Ok(is_valid)
+    }
+
+    /// Batch version of signature verification using MGET for performance.
+    pub async fn verify_telemetry_signature_batch(
+        &self,
+        meter_ids: &[String],
+        payloads: &[Vec<u8>],
+        signatures: &[[u8; 64]],
+    ) -> Result<Vec<bool>> {
+        if meter_ids.len() != payloads.len() || meter_ids.len() != signatures.len() {
+            return Err(anyhow!("Mismatched batch lengths"));
+        }
+
+        let mut conn = match &self.redis {
+            Some(conn) => conn.clone(),
+            None => return Ok(vec![false; meter_ids.len()]),
+        };
+        let keys: Vec<String> = meter_ids
+            .iter()
+            .map(|id| format!("gridtokenx:devices:{}:pubkey", id))
+            .collect();
+
+        // Fetch all public keys in one round-trip
+        let public_keys_hex: Vec<Option<String>> = conn
+            .mget(&keys)
+            .await
+            .map_err(|e| anyhow!("Redis MGET failed: {}", e))?;
+
+        let mut results = Vec::with_capacity(meter_ids.len());
+
+        for i in 0..meter_ids.len() {
+            let res = if let Some(hex_str) = &public_keys_hex[i] {
+                let public_key_bytes = if hex_str.len() == 64 {
+                    hex::decode(hex_str.trim()).unwrap_or_default()
+                } else {
+                    hex_str.as_bytes().to_vec()
+                };
+
+                if public_key_bytes.len() != 32 {
+                    false
+                } else {
+                    let vk_res = VerifyingKey::from_bytes(&public_key_bytes.try_into().unwrap());
+                    if let Ok(verifying_key) = vk_res {
+                        let signature = Signature::from_bytes(&signatures[i]);
+                        verifying_key.verify(&payloads[i], &signature).is_ok()
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            results.push(res);
+        }
+
+        Ok(results)
     }
 }
 
