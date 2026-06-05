@@ -1,97 +1,67 @@
 # GridTokenX Oracle Bridge: VPP Operation & Trust Layer
 
 ## 1. Overview
-The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** service that orchestrates **VPP Operations** and ensures the cryptographic integrity of energy data. It acts as the high-throughput ingestion entry point for the GridTokenX VPP, handling real-time telemetry (Path A) and ZK-attestation aggregation (Path B).
+The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** service that orchestrates **VPP Operations** and ensures the cryptographic integrity of energy data. It serves as the high-throughput ingestion entry point for the GridTokenX ecosystem, implementing the **Unified Trusted Telemetry (UTT)** architecture.
 
 > [!IMPORTANT]
-> **Service Boundary**: This repository contains the **Platform-side Bridge Service**. It is decoupled from the physical **Oracle of Edge Meter** hardware. This service consumes cryptographically signed data via the **DLMS/COSEM (IEC 62056)** global standard and bridges it to the VPP Optimization engine and HyperEVM.
+> **Architectural Shift**: Starting from v4, the bridge has consolidated the real-time grid operations (Path A) and blockchain settlement (Path B) into a **single, high-integrity ingestion pipeline**. This reduces architectural complexity and ensures that every piece of data in the system is hardware-verified.
 
 ---
 
-## 2. VPP Operations (Path A — Real-Time)
-The Oracle Bridge is the primary orchestrator for real-time grid services, ensuring sub-second data availability for the VPP Platform.
+## 2. Unified Trusted Telemetry (UTT)
+The Oracle Bridge enforces a "Trust-on-Entry" model, where a single gRPC call provides all data necessary for both immediate grid control and eventual on-chain finality.
 
-### 2.1 Industrial Low-Latency Ingestion
-- **Global Standard Compliance**: Exclusively uses **DLMS/COSEM (IEC 62056)** for all B2C and B2B telemetry, ensuring unified high-fidelity energy accounting.
-- **Secure Telemetry Ingestion**: Every telemetry packet (Path A) is cryptographically signed using Ed25519 (Base58) by the source device.
-- **Canonical Format**: Signatures are generated over the `{meter_id}:{kwh}:{timestamp}` canonical string.
-- **Performance Driven**: Utilizing `rdkafka` and `redis` connection pooling for high-throughput ingestion with real-time verification.
-- **Dynamic Dispatch**: Routes incoming telemetry to the forecasting and MILP optimization engines in `<50ms`.
+### 2.1 Industrial Ingestion (UTT-H)
+- **Unified Path**: Replaces split telemetry and attestation flows with a single `Ingest` RPC.
+- **Hardware-Enforced Security**: Every reading is signed by the source device's Ed25519 key pair following the **UTT-H** (High Integrity) standard.
+- **Hardened Anti-Replay**: Signatures are generated over a canonical string including millisecond precision and a monotonic sequence number.
+- **Performance**: Capable of processing **33,000+ readings/sec** with end-to-end latency of **<50ms**.
 
-### 2.2 In-Memory Aggregation
-- **VPP Metrics**: Computes real-time feeder-level and zone-level load aggregates.
-- **Prometheus Integration**: Exposes granular operational metrics per asset class (BESS SoC, PV Yield, EV Load).
-
----
-
-## 3. Trust & Aggregation (Path B — Settlement)
-The service performs the heavy computational lifting for recursive ZK-Rollups, enabling PDPA-compliant settlement.
-
-### 3.1 ZK-Rollup Aggregator (Stage 3)
-Instead of processing individual transactions on-chain, the bridge performs off-chain aggregation:
-- **Batching**: Groups 15-minute attestation windows into zone-level batches.
-- **Verification**: Validates the Ed25519 hardware signatures of all incoming attestations against the GridTokenX device registry.
-- **ZK-Proving**: Generates a **Plonky2** recursive proof that certifies the aggregate production/consumption of the batch is valid and hardware-verified.
-
-### 3.2 Privacy Boundary
-Raw household-level data enters the bridge but is **never stored**. Only the ZK-proof and the Merkle Root are persisted, ensuring that prosumer privacy is structurally protected under PDPA.
+### 2.2 Secure Binary Protocol (v4)
+- **Privacy-by-Design**: High-fidelity metrics are encrypted using **AES-256-GCM** (Authenticated Encryption), ensuring full PDPA compliance.
+- **Integrity**: Multi-layer protection using **CRC-32** checksums and GCM authentication tags.
+- **Extensibility**: Uses **TLV** (Tag-Length-Value) encoding to allow future-proof expansion of meter metrics without firmware-backend misalignment.
 
 ---
 
-## 4. Downstream Settlement Integration (HyperEVM)
-The Oracle Bridge provides the final cryptographic artifacts required for on-chain finality.
+## 3. Operational Logic
 
-- **Proof Relaying**: Submits the generated ZK-proofs to the `Plonky2Verifier.sol` contract on HyperEVM.
-- **Settlement Triggers**: Verified batches automatically trigger P2P order clearance and I-REC minting on the settlement layer.
+### Path A: Real-Time VPP Optimization
+Validated telemetry is immediately fanned out to:
+- **Kafka**: For forecasting and load balancing.
+- **NATS**: For sub-second grid dispatch and direct blockchain minting triggers.
+- **Redis**: For real-time monitoring and hot-state storage.
+
+### Path B: On-Chain Settlement (Safe Sink)
+The bridge automatically manages the settlement lifecycle:
+- **Aggregation**: Data is accumulated in 15-minute billing windows (Bins).
+- **Automated Settlement**: Upon window closure, the bridge signs the aggregate or triggers the **Plonky2 ZK-prover**.
+- **Finality**: Signed artifacts are pushed to HyperEVM for P2P order clearance and I-REC minting.
 
 ---
 
-## 5. Service APIs (gRPC + Protobuf)
-The bridge exposes a high-performance gRPC surface for internal platform services and authorized edge gateways.
+## 4. Core RPC Interface (v4)
+The bridge exposes a high-performance gRPC surface for edge gateways.
 
 ```protobuf
-// TelemetryRequest with integrated security
-message TelemetryRequest {
-  string reading_id = 1;
-  string meter_id = 2;
-  string meter_serial = 3;
-  // ... other fields ...
-  optional string signature = 16; // Ed25519 signature (Base58)
-}
-
 service OracleService {
-  // Professional Path A: High-frequency telemetry (Verified)
-  rpc SubmitTelemetry (TelemetryRequest) returns (TelemetryResponse);
-  rpc SubmitTelemetryBatch (TelemetryBatchRequest) returns (TelemetryBatchResponse);
+  // Unified Ingestion (UTT)
+  rpc Ingest (MeterReading) returns (IngestResponse);
   
-  // Professional Path B: Settlement Attestations (IEC 62056)
-  rpc SubmitAttestation (AttestationRequest) returns (AttestationResponse);
-  rpc SubmitAttestationBatch (AttestationBatchRequest) returns (AttestationBatchResponse);
+  // High-Throughput Batch Ingestion
+  rpc IngestBatch (MeterReadingBatchRequest) returns (MeterReadingBatchResponse);
 }
 ```
 
 ---
 
-## 6. Environment & Security Policy
-The Oracle Bridge enforces different security levels based on the environment:
-
-- **Development**: Invalid/missing signatures result in warnings but data is accepted to facilitate local development.
-- **Production (`ENVIRONMENT=production`)**: Strict enforcement. Unsigned or invalid telemetry results in immediate `StatusCode.UNAUTHENTICATED` or `401 Unauthorized` responses.
-
----
-
-## 6. Performance Targets
-| Metric | Target |
-| :--- | :--- |
-| **Ingestion Processing** | `<50ms` |
-| **ZK Batch Proving** | `20-30s` per 5k attestations |
-| **Telemetry Throughput** | 33,000 msg/sec |
-| **VPP Loopback** | `<2s` end-to-end |
+## 5. Security Policy
+- **Development**: Invalid/missing signatures result in warnings to facilitate rapid prototyping.
+- **Production (`ENVIRONMENT=production`)**: Strict enforcement of **UTT-H** signing and **v4 Secure** encryption. Malformed or unauthorized telemetry results in immediate rejection.
 
 ---
 
 ## Related Documentation
-- [implement.md](../implement.md) - Full System Architecture
-- [TELEMETRY.md](TELEMETRY.md) - Real-Time VPP Operations (Path A)
-- [DATA-FLOW.md](DATA-FLOW.md) - Operational vs. Settlement Data Paths
-- [core.md](core.md) - Architecture Diagrams & Integration Matrix
+- [INGESTION-API.md](INGESTION-API.md) - Field-level gRPC reference.
+- [INGESTION-PROTOCOL-V4.md](INGESTION-PROTOCOL-V4.md) - Binary v4 (Secure) specification.
+- [core.md](core.md) - Architecture Diagrams & Integration Matrix.
