@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package gridtokenx.dispatch;
+
+service DispatchController {
+  // Executes a flexible dispatch command to a Load Aggregator
+  rpc ExecuteFlexDispatch(FlexCommand) returns (DispatchResponse) {}
+}
+
+message FlexCommand {
+  string cluster_id = 1;
+  DispatchType dispatch_type = 2;
+  double capacity_kw = 3; // Amount of power to flex (up or down)
+  int64 timestamp = 4;
+}
+
+enum DispatchType {
+  FLEX_UP = 0;   // Discharge BESS / Reduce charging
+  FLEX_DOWN = 1; // Charge BESS / Increase charging
+}
+
+message DispatchResponse {
+  bool success = 1;
+  string message = 2;
+  int32 error_code = 3;
+}
