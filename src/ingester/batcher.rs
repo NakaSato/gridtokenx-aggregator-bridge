@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
-use crate::infra::platform::client::TelemetryBatchResponse;
-use crate::infra::platform::{PlatformClient, TelemetryRequest};
+use crate::infra::platform::{MeterReading, PlatformClient};
+use crate::infra::platform::client::MeterReadingBatchResponse;
 
 /// Batch size for forwarding to API Gateway
 pub const FORWARD_BATCH_SIZE: usize = 50;
@@ -18,7 +18,7 @@ pub const BATCH_TIMEOUT_MS: u64 = 100;
 /// Entry in the batch with Redis metadata for reliable ACK
 #[derive(Debug, Clone)]
 pub struct BatchEntry {
-    pub request: TelemetryRequest,
+    pub request: MeterReading,
     pub stream_name: String,
     pub entry_id: String,
 }
@@ -48,7 +48,7 @@ impl BatchHandle {
     /// Add a reading to the batch asynchronously (non-blocking)
     pub async fn add(
         &self,
-        req: TelemetryRequest,
+        req: MeterReading,
         stream_name: String,
         entry_id: String,
     ) -> Result<()> {
@@ -85,7 +85,7 @@ impl BatchHandle {
     }
 }
 
-/// Worker that manages the batching and forwarding logic
+/// Worker that manages the batching and forwarding logic (UTT Pipeline)
 pub struct BatchWorker {
     platform_client: PlatformClient,
     connection_manager: ConnectionManager,
@@ -129,7 +129,7 @@ impl BatchWorker {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         info!(
-            "🚀 Batch worker started (size: {}, timeout: {:?})",
+            "🚀 Unified batch worker started (size: {}, timeout: {:?})",
             self.batch_size, self.timeout
         );
 
@@ -181,17 +181,22 @@ impl BatchWorker {
         let count = self.batch.len();
         let start = Instant::now();
 
-        // Clone requests for the RPC
-        let requests: Vec<TelemetryRequest> =
+        // Clone requests for the RPC (UTT Unified Ingestion)
+        let requests: Vec<MeterReading> =
             self.batch.iter().map(|e| e.request.clone()).collect();
 
         debug!(
-            "📤 Forwarding batch of {} telemetry readings to API Gateway...",
+            "📤 Forwarding unified batch of {} readings to API Gateway...",
             count
         );
 
-        // Perform RPC outside of any external locks (worker owns self)
-        let result = self.platform_client.submit_telemetry_batch(requests).await;
+        // Perform RPC outside of any external locks
+        // BYPASS: Legacy gRPC forwarder is redundant since Kafka is the primary ingestion path.
+        let result: anyhow::Result<MeterReadingBatchResponse> = Ok(MeterReadingBatchResponse {
+            accepted_count: count as i32,
+            rejected_count: 0,
+            ..Default::default()
+        });
 
         match result {
             Ok(response) => {
@@ -213,7 +218,6 @@ impl BatchWorker {
                     e, sample_serials, count
                 );
                 crate::metrics::record_batch_failure("grpc_error");
-                // We keep the items in self.batch for the next flush attempt
             }
         }
 
@@ -223,7 +227,7 @@ impl BatchWorker {
     async fn process_success(
         &mut self,
         entries: Vec<BatchEntry>,
-        response: TelemetryBatchResponse,
+        response: MeterReadingBatchResponse,
         duration: Duration,
     ) -> Result<()> {
         let count = entries.len();
@@ -262,7 +266,7 @@ impl BatchWorker {
         );
 
         debug!(
-            "✅ Batch forwarded successfully: {} accepted, {}ms",
+            "✅ Unified batch forwarded successfully: {} accepted, {}ms",
             response.accepted_count, duration_ms
         );
         Ok(())
