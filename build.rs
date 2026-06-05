@@ -19,5 +19,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .include_file("_oracle_include.rs")
         .compile()?;
 
+    // 3. Generate ConnectRPC for Dispatch
+    connectrpc_build::Config::new()
+        .files(&["proto/dispatch.proto"])
+        .includes(&["proto"])
+        .include_file("_dispatch_include.rs")
+        .compile()?;
+
     Ok(())
 }
