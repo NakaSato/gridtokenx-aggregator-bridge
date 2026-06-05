@@ -1,12 +1,13 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use rdkafka::{
-    message::OwnedHeaders,
+    consumer::{StreamConsumer, Consumer},
+    message::{OwnedHeaders, Message},
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, error, warn};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeterReadingEvent {
@@ -21,6 +22,13 @@ pub struct MeterReadingEvent {
     pub signature: String,
     pub verified: bool,
     pub confidence_score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridStatusEvent {
+    pub frequency: f64,
+    pub load_kw: f64,
+    pub timestamp: i64,
 }
 
 pub struct OracleKafkaProducer {
@@ -69,5 +77,31 @@ impl OracleKafkaProducer {
             .map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
 
         Ok(())
+    }
+}
+
+pub struct OracleKafkaConsumer {
+    consumer: StreamConsumer,
+}
+
+impl OracleKafkaConsumer {
+    pub fn new(bootstrap_servers: &str, group_id: &str, topic: &str) -> Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("group.id", group_id)
+            .set("auto.offset.reset", "latest")
+            .create()?;
+
+        consumer.subscribe(&[topic])?;
+        info!("✅ Kafka Consumer initialized for topic: {}", topic);
+
+        Ok(Self { consumer })
+    }
+
+    pub async fn consume_grid_status(&self) -> Result<GridStatusEvent> {
+        let message = self.consumer.recv().await?;
+        let payload = message.payload().ok_or_else(|| anyhow!("Empty payload"))?;
+        let event: GridStatusEvent = serde_json::from_slice(payload)?;
+        Ok(event)
     }
 }
