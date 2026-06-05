@@ -45,30 +45,7 @@ impl Router {
 
     /// Determine zone index for a reading
     fn get_zone_index(&self, reading: &DeviceReading) -> usize {
-        match &reading.zone_code {
-            Some(zcode) => {
-                // Try to parse numerical suffix from zone code (e.g. "ZONE5" -> 5)
-                let suffix: String = zcode.chars().skip_while(|c| !c.is_ascii_digit()).collect();
-                if !suffix.is_empty() {
-                    if let Ok(idx) = suffix.parse::<usize>() {
-                        if idx < self.num_zones {
-                            return idx;
-                        }
-                    }
-                }
-
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                zcode.hash(&mut hasher);
-                hasher.finish() as usize % self.num_zones
-            }
-            _ => {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                reading.serial_number.hash(&mut hasher);
-                hasher.finish() as usize % self.num_zones
-            }
-        }
+        calculate_zone_index(self.num_zones, reading)
     }
 
     /// Publish a normalized reading to a zone-partitioned stream.
@@ -109,8 +86,8 @@ impl Router {
         });
 
         let event_envelope = serde_json::json!({
-            "event_type": "MeterReadingCreated",
-            "payload": event_payload,
+            "event_type": self.event_type_name(reading),
+            "payload": reading,
         });
 
         let json = serde_json::to_string(&event_envelope).context("Failed to serialize reading")?;
@@ -124,6 +101,19 @@ impl Router {
             )
             .await
             .context("Failed to publish to Redis Stream")?;
+
+        // Also publish to unified stream for general consumers (e.g. trading-service)
+        let unified_stream = reading.device_type.target_stream();
+        if unified_stream != stream_name {
+            let _: Result<String, _> = conn
+                .xadd_maxlen(
+                    unified_stream,
+                    StreamMaxlen::Approx(self.max_stream_len),
+                    "*",
+                    &[("event", &json)],
+                )
+                .await;
+        }
 
         info!(
             "📤 Disseminated {:?} {} → {} (ID: {})",
@@ -166,6 +156,34 @@ impl Router {
     }
 }
 
+/// Determine zone index for a reading based on zone_code or serial_number hashing
+fn calculate_zone_index(num_zones: usize, reading: &DeviceReading) -> usize {
+    match &reading.zone_code {
+        Some(zcode) => {
+            // Try to parse numerical suffix from zone code (e.g. "ZONE5" -> 5)
+            let suffix: String = zcode.chars().skip_while(|c| !c.is_ascii_digit()).collect();
+            if !suffix.is_empty() {
+                if let Ok(idx) = suffix.parse::<usize>() {
+                    if idx < num_zones {
+                        return idx;
+                    }
+                }
+            }
+
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            zcode.hash(&mut hasher);
+            hasher.finish() as usize % num_zones
+        }
+        _ => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            reading.serial_number.hash(&mut hasher);
+            hasher.finish() as usize % num_zones
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,18 +193,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_hashing_consistency() {
-        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:7010".to_string());
-        let router_10 = Router {
-            connection_manager: redis::aio::ConnectionManager::new(
-                redis::Client::open(redis_url).unwrap(),
-            )
-            .await
-            .unwrap(),
-            max_stream_len: 1000,
-            num_zones: 10,
-            nats_client: None,
-        };
-
         let reading = DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: "DEV-123".to_string(),
@@ -202,17 +208,10 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
 
-        let idx_10 = router_10.get_zone_index(&reading);
+        let idx_10 = calculate_zone_index(10, &reading);
         assert!(idx_10 < 10);
 
-        let router_20 = Router {
-            connection_manager: router_10.connection_manager.clone(),
-            max_stream_len: 1000,
-            num_zones: 20,
-            nats_client: None,
-        };
-
-        let idx_20 = router_20.get_zone_index(&reading);
+        let idx_20 = calculate_zone_index(20, &reading);
         assert!(idx_20 < 20);
 
         // Note: Hashing results might differ between 10 and 20, which is expected.
@@ -221,18 +220,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_explicit_zone_id() {
-        let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:7010".to_string());
-        let router = Router {
-            connection_manager: redis::aio::ConnectionManager::new(
-                redis::Client::open(redis_url).unwrap(),
-            )
-            .await
-            .unwrap(),
-            max_stream_len: 1000,
-            num_zones: 10,
-            nats_client: None,
-        };
-
         let reading = DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: "DEV-123".to_string(),
@@ -248,13 +235,13 @@ mod tests {
             metadata: std::collections::HashMap::new(),
         };
 
-        assert_eq!(router.get_zone_index(&reading), 5);
+        assert_eq!(calculate_zone_index(10, &reading), 5);
 
         // If zone_id is out of bounds, it should fallback to hashing
         let reading_out_of_bounds = DeviceReading {
             zone_code: Some("ZONE15".to_string()),
             ..reading
         };
-        assert!(router.get_zone_index(&reading_out_of_bounds) < 10);
+        assert!(calculate_zone_index(10, &reading_out_of_bounds) < 10);
     }
 }
