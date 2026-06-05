@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use axum::{
@@ -10,6 +11,7 @@ use tracing::{error, info, warn};
 
 mod aggregator;
 mod auth;
+mod dispatch;
 mod grpc;
 mod handlers;
 mod infra;
@@ -18,11 +20,13 @@ mod metrics;
 mod middleware;
 mod models;
 mod protocol;
+mod standards;
 mod router;
 mod state;
-mod storage;
 mod telemetry;
 mod utils;
+mod zk;
+
 
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +36,24 @@ use protocol::stacks::ocpp::OcppStack;
 use protocol::stacks::openadr::OpenAdrStack;
 use protocol::stacks::sunspec::SunSpecStack;
 use state::AppState;
+
+fn expand_env(s: &str) -> String {
+    let mut result = s.to_string();
+    while let Some(start) = result.find("${") {
+        if let Some(rest) = result.get(start + 2..) {
+            if let Some(end_offset) = rest.find('}') {
+                let end = start + 2 + end_offset;
+                let var_name = &result[start + 2..end];
+                let value = std::env::var(var_name).unwrap_or_else(|_| "".to_string());
+                result.replace_range(start..end + 1, &value);
+                continue;
+            }
+        }
+        break;
+    }
+    result
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Initialize
@@ -42,18 +64,22 @@ async fn main() -> Result<()> {
     info!("🚀 Starting GridTokenX Oracle Bridge (Zone-Based Microgrid Mode)");
 
     // 2. Configuration
-    let redis_url =
-        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    let api_services_url =
-        std::env::var("API_SERVICES_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".to_string());
-    let api_services_grpc_url =
-        std::env::var("API_SERVICES_GRPC_URL").unwrap_or_else(|_| api_services_url.clone());
+    let redis_url = expand_env(
+        &std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+    );
+    let api_services_url = expand_env(
+        &std::env::var("API_SERVICES_URL").unwrap_or_else(|_| "http://127.0.0.1:4000".to_string()),
+    );
+    let api_services_grpc_url = expand_env(
+        &std::env::var("API_SERVICES_GRPC_URL").unwrap_or_else(|_| api_services_url.clone()),
+    );
     let gateway_port: u16 = std::env::var("IOT_GATEWAY_PORT")
         .unwrap_or_else(|_| "4010".to_string())
         .parse()
         .unwrap_or(4010);
-    let iam_service_url =
-        std::env::var("IAM_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let iam_service_url = expand_env(
+        &std::env::var("IAM_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string()),
+    );
     let num_zones: usize = std::env::var("IOT_NUM_ZONES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -74,9 +100,21 @@ async fn main() -> Result<()> {
 
     // 4b. Initialize Meter Registry (meter_serial → user_id resolver)
     let early_redis_client = redis::Client::open(redis_url.clone())?;
-    let early_redis_conn = redis::aio::ConnectionManager::new(early_redis_client).await?;
+    let early_redis_conn_result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        redis::aio::ConnectionManager::new(early_redis_client)
+    ).await;
+
+    let early_redis_conn = match early_redis_conn_result {
+        Ok(Ok(conn)) => Some(conn),
+        _ => {
+            warn!("⚠️ Redis connection timed out or failed. Running in degraded mode without Redis.");
+            None
+        }
+    };
+
     let meter_registry = Arc::new(crate::infra::meter_registry::MeterRegistry::new(
-        early_redis_conn,
+        early_redis_conn.clone(),
     ));
 
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
@@ -159,6 +197,43 @@ async fn main() -> Result<()> {
         None
     };
 
+    // 8. Initialize Dispatch Engine
+    let aggregator = Arc::new(Mutex::new(aggregator::Aggregator::default()));
+    let grpc_client = crate::dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?;
+    let mut dispatch_engine = crate::dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
+    
+    // Kafka Consumer for Dispatch
+    let kafka_consumer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
+        let topic = std::env::var("KAFKA_TOPIC_GRID_STATUS")
+            .unwrap_or_else(|_| "gridtokenx.oracle.grid_status".to_string());
+        match crate::infra::kafka::OracleKafkaConsumer::new(&brokers, "oracle-bridge-group", &topic) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                error!("❌ Kafka consumer init failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Spawn Kafka Dispatch Listener
+    if let Some(consumer) = kafka_consumer {
+        tokio::spawn(async move {
+            info!("📡 Dispatch Engine Kafka listener started");
+            loop {
+                match consumer.consume_grid_status().await {
+                    Ok(event) => {
+                        if let Err(e) = dispatch_engine.evaluate_and_dispatch(event.frequency).await {
+                            error!("❌ Dispatch Engine error: {}", e);
+                        }
+                    }
+                    Err(e) => error!("❌ Kafka consume error: {}", e),
+                }
+            }
+        });
+    }
+
     // RabbitMQ Producer
     let rabbitmq_producer = if let Ok(url) = std::env::var("RABBITMQ_URL") {
         match crate::infra::rabbitmq::OracleRabbitMQProducer::new(&url).await {
@@ -177,10 +252,8 @@ async fn main() -> Result<()> {
     };
 
     // Crypto: Signature Verifier
-    let redis_client = redis::Client::open(redis_url.clone())?;
-    let redis_conn_manager = redis::aio::ConnectionManager::new(redis_client).await?;
     let signature_verifier = Arc::new(crate::infra::crypto::SignatureVerifier::new(
-        redis_conn_manager,
+        early_redis_conn.clone(),
     ));
 
     // Crypto: Settlement Signer
@@ -202,22 +275,22 @@ async fn main() -> Result<()> {
         info!("ℹ️ Settlement signer disabled (ORACLE_BRIDGE_SIGNING_KEY not set)");
         None
     };
-    // 7c. Start Settlement Worker in background
+    // 7c. Start UTT Settlement Engine (Path B)
     let settlement_agg = aggregator.clone();
     let settlement_shutdown = shutdown_token.clone();
-    // Settlement goes directly to Trading Service (M2M, bypasses APISIX)
     let settlement_api_url = std::env::var("SETTLEMENT_API_URL")
         .or_else(|_| std::env::var("TRADING_HTTP_URL"))
         .unwrap_or_else(|_| "http://trading-service:8093".to_string());
-    info!("💰 Settlement Worker target: {}", settlement_api_url);
+    
+    info!("💰 UTT Path B Settlement target: {}", settlement_api_url);
     let settlement_signer_task = settlement_signer.clone();
-    let settlement_handle = tokio::spawn(async move {
-        let worker = crate::ingester::settlement_worker::SettlementWorker::new(
+    let _settlement_handle = tokio::spawn(async move {
+        let engine = crate::ingester::settlement_engine::SettlementEngine::new(
             settlement_agg,
             settlement_api_url,
             settlement_signer_task,
         );
-        worker.run(settlement_shutdown).await;
+        engine.run(settlement_shutdown).await;
     });
 
     // 7. Initialize IAM gRPC Client (optional - auth falls back to static API keys)
@@ -286,6 +359,14 @@ async fn main() -> Result<()> {
         .route(
             "/v1/private-network/ingest/batch",
             post(handlers::ingest_private_network_batch),
+        )
+        .route(
+            "/v1/ingest/telemetry",
+            post(handlers::ingest_legacy_batch),
+        )
+        .route(
+            "/v1/ingest/telemetry/batch",
+            post(handlers::ingest_legacy_batch),
         )
         // .layer(axum::middleware::from_fn(middleware::otel_tracing::otel_tracing_middleware))
         .with_state(app_state.clone());
