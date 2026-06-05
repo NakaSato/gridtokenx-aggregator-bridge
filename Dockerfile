@@ -5,7 +5,7 @@
 FROM rust:1.89-bookworm AS builder
 
 # Install build dependencies with cache mount
-RUN --mount=type=cache,target=/var/lib/apt/lists <<EOT
+RUN <<EOT
     apt-get update
     apt-get install -y --no-install-recommends \
         build-essential \
@@ -24,7 +24,7 @@ WORKDIR /app
 # Copy project subdirectories needed for the build
 COPY gridtokenx-oracle-bridge/ gridtokenx-oracle-bridge/
 COPY gridtokenx-blockchain-core/ gridtokenx-blockchain-core/
-COPY gridtokenx-iam-service/crates/iam-protocol/proto/ gridtokenx-iam-service/crates/iam-protocol/proto/
+COPY gridtokenx-iam-service/ gridtokenx-iam-service/
 
 WORKDIR /app/gridtokenx-oracle-bridge
 
@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS runtime
 
 # Install runtime dependencies
-RUN --mount=type=cache,target=/var/lib/apt/lists <<EOT
+RUN <<EOT
     apt-get update
     apt-get install -y --no-install-recommends \
         ca-certificates \
