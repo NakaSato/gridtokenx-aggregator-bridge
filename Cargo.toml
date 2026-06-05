@@ -57,6 +57,11 @@ hex = "0.4.3"
 tokio-util = "0.7.18"
 rand = "0.8"
 rand_distr = "0.6.0"
+crc32fast = "1.4"
+aes-gcm = "0.10"
+aead = "0.5"
+# plonky2 = "0.1" # Requires Nightly (specialization)
+jemallocator = "0.5"
 
 # Kafka
 rdkafka = { version = "0.37", features = ["zstd"] }
@@ -66,6 +71,11 @@ lapin = "2.5"
 futures-util = "0.3"
 async-nats = "0.37"
 gridtokenx-blockchain-core = { version = "0.1.0", path = "../gridtokenx-blockchain-core" }
+
+# OpenTelemetry
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.27"
 
 [build-dependencies]
 buffa-build = "0.2.0"
