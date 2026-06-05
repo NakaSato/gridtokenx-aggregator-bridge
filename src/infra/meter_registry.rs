@@ -15,12 +15,12 @@ use uuid::Uuid;
 /// If neither has the mapping, returns None and the settlement worker
 /// will skip that bin (prosumer must register their meter first).
 pub struct MeterRegistry {
-    redis: ConnectionManager,
+    redis: Option<ConnectionManager>,
     local_cache: RwLock<HashMap<String, Uuid>>,
 }
 
 impl MeterRegistry {
-    pub fn new(redis: ConnectionManager) -> Self {
+    pub fn new(redis: Option<ConnectionManager>) -> Self {
         Self {
             redis,
             local_cache: RwLock::new(HashMap::new()),
@@ -39,7 +39,10 @@ impl MeterRegistry {
         }
 
         // 2. Check Redis
-        let mut conn = self.redis.clone();
+        let mut conn = match &self.redis {
+            Some(conn) => conn.clone(),
+            None => return Ok(Some(Uuid::nil())),
+        };
         let key = format!("gridtokenx:meters:{}:user_id", meter_serial);
 
         let user_id_str: Option<String> = conn
@@ -67,12 +70,14 @@ impl MeterRegistry {
 
     /// Register a meter → user mapping (called during meter registration flow)
     pub async fn register_meter(&self, meter_serial: &str, user_id: Uuid) -> Result<()> {
-        let mut conn = self.redis.clone();
-        let key = format!("gridtokenx:meters:{}:user_id", meter_serial);
+        if let Some(conn) = &self.redis {
+            let mut conn = conn.clone();
+            let key = format!("gridtokenx:meters:{}:user_id", meter_serial);
 
-        conn.set::<_, _, ()>(&key, user_id.to_string())
-            .await
-            .map_err(|e| anyhow!("Failed to register meter in Redis: {}", e))?;
+            conn.set::<_, _, ()>(&key, user_id.to_string())
+                .await
+                .map_err(|e| anyhow!("Failed to register meter in Redis: {}", e))?;
+        }
 
         // Update local cache
         let mut cache = self.local_cache.write().await;
