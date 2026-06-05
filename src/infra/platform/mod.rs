@@ -1,3 +1,3 @@
 pub mod client;
 
-pub use client::{PlatformClient, TelemetryRequest};
+pub use client::{MeterReading, PlatformClient};
