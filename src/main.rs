@@ -18,8 +18,12 @@ mod infra;
 mod ingester;
 mod metrics;
 mod middleware;
-mod models;
-mod protocol;
+/// Domain types now live in the `oracle-core` crate; re-exported here so existing
+/// `crate::models::*` paths keep resolving during the workspace split.
+pub use oracle_core::models;
+/// Protocol stacks now live in the `oracle-stacks` crate; aliased so existing
+/// `crate::protocol::*` paths keep resolving during the workspace split.
+pub use oracle_stacks as protocol;
 mod standards;
 mod router;
 mod state;

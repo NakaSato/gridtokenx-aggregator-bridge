@@ -3,7 +3,7 @@ pub mod ocpp;
 pub mod openadr;
 pub mod sunspec;
 
-use crate::models::DeviceReading;
+use oracle_core::models::DeviceReading;
 use anyhow::Result;
 use async_trait::async_trait;
 

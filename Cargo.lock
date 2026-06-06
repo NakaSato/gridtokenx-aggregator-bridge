@@ -2481,6 +2481,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "oracle-core",
+ "oracle-stacks",
  "rand 0.8.6",
  "rand_distr",
  "rdkafka",
@@ -3676,6 +3678,34 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "oracle-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "oracle-stacks"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crc32fast",
+ "oracle-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

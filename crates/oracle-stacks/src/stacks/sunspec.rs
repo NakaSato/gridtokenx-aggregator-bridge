@@ -1,5 +1,5 @@
 use super::ProtocolStack;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
+use oracle_core::models::{DeviceMetrics, DeviceReading, DeviceType};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -51,9 +51,9 @@ impl ProtocolStack for SunSpecStack {
 
         // Map SunSpec Status to BatteryMode/DeviceType context
         let mode = match model.status {
-            2 => crate::models::BatteryMode::Discharging, // 2 = Producing
-            4 => crate::models::BatteryMode::Charging,    // 4 = Charging (for Storage)
-            _ => crate::models::BatteryMode::Idle,
+            2 => oracle_core::models::BatteryMode::Discharging, // 2 = Producing
+            4 => oracle_core::models::BatteryMode::Charging,    // 4 = Charging (for Storage)
+            _ => oracle_core::models::BatteryMode::Idle,
         };
 
         Ok(Some(DeviceReading {
@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(reading.device_id, "INV-001");
         if let DeviceMetrics::BatteryState { power_kw, mode, .. } = reading.metrics {
             assert_eq!(power_kw, 0.5); // (5000 * 10^-1) / 1000 = 0.5
-            assert_eq!(mode, crate::models::BatteryMode::Discharging);
+            assert_eq!(mode, oracle_core::models::BatteryMode::Discharging);
         } else {
             panic!("Wrong metric type");
         }
@@ -128,9 +128,9 @@ mod tests {
     async fn test_sunspec_mode_mapping() {
         let stack = SunSpecStack::new();
         let test_cases = vec![
-            (2, crate::models::BatteryMode::Discharging),
-            (4, crate::models::BatteryMode::Charging),
-            (1, crate::models::BatteryMode::Idle),
+            (2, oracle_core::models::BatteryMode::Discharging),
+            (4, oracle_core::models::BatteryMode::Charging),
+            (1, oracle_core::models::BatteryMode::Idle),
         ];
 
         for (st, expected_mode) in test_cases {

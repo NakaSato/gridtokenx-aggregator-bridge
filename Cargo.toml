@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "gridtokenx-oracle-bridge"
 version = "0.1.0"
@@ -71,6 +74,8 @@ lapin = "2.5"
 futures-util = "0.3"
 async-nats = "0.37"
 gridtokenx-blockchain-core = { version = "0.1.0", path = "../gridtokenx-blockchain-core" }
+oracle-core = { path = "crates/oracle-core" }
+oracle-stacks = { path = "crates/oracle-stacks" }
 
 # OpenTelemetry
 opentelemetry = { version = "0.27", features = ["trace"] }

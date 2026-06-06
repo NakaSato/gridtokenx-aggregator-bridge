@@ -1,5 +1,5 @@
 use super::ProtocolStack;
-use crate::models::{DeviceMetrics, DeviceReading, DeviceType};
+use oracle_core::models::{DeviceMetrics, DeviceReading, DeviceType};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
