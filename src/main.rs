@@ -14,7 +14,9 @@ mod auth;
 mod dispatch;
 mod grpc;
 mod handlers;
-mod infra;
+/// External adapters now live in the `oracle-persistence` crate; re-exported here so
+/// existing `crate::infra::*` paths keep resolving during the workspace split.
+pub use oracle_persistence::infra;
 mod ingester;
 mod metrics;
 mod middleware;

@@ -2480,6 +2480,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "oracle-core",
+ "oracle-persistence",
  "oracle-protocol",
  "oracle-stacks",
  "rand 0.8.6",
@@ -3688,6 +3689,30 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "oracle-persistence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bs58",
+ "chrono",
+ "connectrpc",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "http",
+ "lapin",
+ "oracle-protocol",
+ "rdkafka",
+ "redis",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
