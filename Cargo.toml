@@ -8,83 +8,32 @@ edition = "2021"
 description = "GridTokenX Oracle Bridge + IoT Gateway - Unified ingestion and on-chain synchronization"
 
 [dependencies]
-# Async Runtime
+# Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "parking_lot"] }
-futures = "0.3"
-async-trait = "0.1"
+tokio-util = "0.7.18"
 
-# Web Framework (IoT Gateway)
+# Web framework (HTTP gateway entrypoint)
 axum = { version = "0.8.7", features = ["macros"] }
-tower = "0.5"
-tower-http = { version = "0.6.7", features = ["cors", "trace"] }
 
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Caching/Events
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
-
-# Utils
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
-rust_decimal = { version = "1.36.0", features = ["serde-float", "maths"] }
-anyhow = "1.0"
-thiserror = "2.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# Security utils
-dotenvy = "0.15"
-bs58 = "0.5"
-ed25519-dalek = "2.1"
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
-
-# HTTP Client for API Gateway communication
-reqwest = { version = "0.12", default-features = false, features = [
-  "json",
-  "rustls-tls",
-  "gzip",
-] }
-
-# gRPC
+# gRPC server/client wiring
 connectrpc = { version = "0.2.1", features = ["server", "client"] }
-buffa = { version = "0.2.0", features = ["json"] }
-http-body = "1.0.0"
 http = "1.0.0"
 
-# Metrics
+# Cache / messaging clients used at startup
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+async-nats = "0.37"
+
+# Metrics exporter
 metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
-hex = "0.4.3"
-tokio-util = "0.7.18"
-rand = "0.8"
-rand_distr = "0.6.0"
-crc32fast = "1.4"
-aes-gcm = "0.10"
-aead = "0.5"
-# plonky2 = "0.1" # Requires Nightly (specialization)
-jemallocator = "0.5"
 
-# Kafka
-rdkafka = { version = "0.37", features = ["zstd"] }
+# Utils
+anyhow = "1.0"
+dotenvy = "0.15"
+tracing = "0.1"
 
-# RabbitMQ
-lapin = "2.5"
-futures-util = "0.3"
-async-nats = "0.37"
-gridtokenx-blockchain-core = { version = "0.1.0", path = "../gridtokenx-blockchain-core" }
-oracle-core = { path = "crates/oracle-core" }
-oracle-stacks = { path = "crates/oracle-stacks" }
-oracle-protocol = { path = "crates/oracle-protocol" }
-oracle-persistence = { path = "crates/oracle-persistence" }
-oracle-logic = { path = "crates/oracle-logic" }
+# Application layer (re-exports logic/persistence/protocol/stacks/core)
 oracle-api = { path = "crates/oracle-api" }
-
-# OpenTelemetry
-opentelemetry = { version = "0.27", features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.27"
 
 [profile.release]
 opt-level = 3
