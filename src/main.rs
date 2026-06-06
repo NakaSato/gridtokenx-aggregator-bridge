@@ -9,27 +9,12 @@ use axum::{
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 
-/// Domain services now live in the `oracle-logic` crate; re-exported here so existing
-/// `crate::{aggregator,dispatch,router,standards,zk,metrics}::*` paths keep resolving.
-pub use oracle_logic::{aggregator, dispatch, metrics, router, standards, zk};
-mod auth;
-mod grpc;
-mod handlers;
-/// External adapters now live in the `oracle-persistence` crate; re-exported here so
-/// existing `crate::infra::*` paths keep resolving during the workspace split.
-pub use oracle_persistence::infra;
-mod ingester;
-mod middleware;
-/// Domain types now live in the `oracle-core` crate; re-exported here so existing
-/// `crate::models::*` paths keep resolving during the workspace split.
-pub use oracle_core::models;
-/// Protocol stacks now live in the `oracle-stacks` crate; aliased so existing
-/// `crate::protocol::*` paths keep resolving during the workspace split.
-pub use oracle_stacks as protocol;
-mod state;
-mod telemetry;
-mod utils;
-
+// The entire application now lives in the `oracle-api` crate (which itself layers over
+// oracle-logic / oracle-persistence / oracle-protocol / oracle-stacks / oracle-core).
+// This binary is a thin entrypoint that wires the components and runs the servers.
+use oracle_api::{
+    aggregator, dispatch, grpc, handlers, infra, ingester, protocol, router, state, telemetry,
+};
 
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -116,7 +101,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let meter_registry = Arc::new(crate::infra::meter_registry::MeterRegistry::new(
+    let meter_registry = Arc::new(infra::meter_registry::MeterRegistry::new(
         early_redis_conn.clone(),
     ));
 
@@ -185,7 +170,7 @@ async fn main() -> Result<()> {
     let kafka_producer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
         let topic = std::env::var("KAFKA_TOPIC_METER_READINGS")
             .unwrap_or_else(|_| "meter.readings".to_string());
-        match crate::infra::kafka::OracleKafkaProducer::new(&brokers, &topic) {
+        match infra::kafka::OracleKafkaProducer::new(&brokers, &topic) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 warn!(
@@ -202,14 +187,14 @@ async fn main() -> Result<()> {
 
     // 8. Initialize Dispatch Engine
     let aggregator = Arc::new(Mutex::new(aggregator::Aggregator::default()));
-    let grpc_client = crate::dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?;
-    let mut dispatch_engine = crate::dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
+    let grpc_client = dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?;
+    let mut dispatch_engine = dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
     
     // Kafka Consumer for Dispatch
     let kafka_consumer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
         let topic = std::env::var("KAFKA_TOPIC_GRID_STATUS")
             .unwrap_or_else(|_| "gridtokenx.oracle.grid_status".to_string());
-        match crate::infra::kafka::OracleKafkaConsumer::new(&brokers, "oracle-bridge-group", &topic) {
+        match infra::kafka::OracleKafkaConsumer::new(&brokers, "oracle-bridge-group", &topic) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 error!("❌ Kafka consumer init failed: {}", e);
@@ -239,7 +224,7 @@ async fn main() -> Result<()> {
 
     // RabbitMQ Producer
     let rabbitmq_producer = if let Ok(url) = std::env::var("RABBITMQ_URL") {
-        match crate::infra::rabbitmq::OracleRabbitMQProducer::new(&url).await {
+        match infra::rabbitmq::OracleRabbitMQProducer::new(&url).await {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 warn!(
@@ -255,14 +240,14 @@ async fn main() -> Result<()> {
     };
 
     // Crypto: Signature Verifier
-    let signature_verifier = Arc::new(crate::infra::crypto::SignatureVerifier::new(
+    let signature_verifier = Arc::new(infra::crypto::SignatureVerifier::new(
         early_redis_conn.clone(),
     ));
 
     // Crypto: Settlement Signer
     let settlement_signer = if let Ok(key_path) = std::env::var("ORACLE_BRIDGE_SIGNING_KEY") {
         match std::fs::read(&key_path) {
-            Ok(bytes) => match crate::infra::crypto::SettlementSigner::new(&bytes) {
+            Ok(bytes) => match infra::crypto::SettlementSigner::new(&bytes) {
                 Ok(s) => Some(Arc::new(s)),
                 Err(e) => {
                     warn!("⚠️ Failed to initialize settlement signer: {}. Settlements will use placeholders.", e);
@@ -288,7 +273,7 @@ async fn main() -> Result<()> {
     info!("💰 UTT Path B Settlement target: {}", settlement_api_url);
     let settlement_signer_task = settlement_signer.clone();
     let _settlement_handle = tokio::spawn(async move {
-        let engine = crate::ingester::settlement_engine::SettlementEngine::new(
+        let engine = ingester::settlement_engine::SettlementEngine::new(
             settlement_agg,
             settlement_api_url,
             settlement_signer_task,
@@ -313,7 +298,7 @@ async fn main() -> Result<()> {
             .ok()?
             .shared(1024);
         let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
-        let client = crate::state::IdentityServiceClient::new(conn, config);
+        let client = state::IdentityServiceClient::new(conn, config);
         info!("✅ IAM gRPC client connected to {}", iam_service_url);
         Some(Arc::new(client))
     }
@@ -406,7 +391,7 @@ async fn main() -> Result<()> {
     );
 
     // Initialize gRPC service with platform-standard registration
-    let oracle_grpc = Arc::new(crate::grpc::OracleServiceImpl::new(app_state.clone()));
+    let oracle_grpc = Arc::new(grpc::OracleServiceImpl::new(app_state.clone()));
     let grpc_router = oracle_grpc.register_service(connectrpc::Router::new());
     let grpc_server = connectrpc::Server::new(grpc_router);
 

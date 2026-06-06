@@ -1,0 +1,47 @@
+[package]
+name = "oracle-api"
+version = "0.1.0"
+edition = "2021"
+description = "GridTokenX Oracle Bridge - API/app layer (HTTP + ConnectRPC transport, ingestion, auth, telemetry, AppState)"
+
+[dependencies]
+oracle-core = { path = "../oracle-core" }
+oracle-stacks = { path = "../oracle-stacks" }
+oracle-protocol = { path = "../oracle-protocol" }
+oracle-persistence = { path = "../oracle-persistence" }
+oracle-logic = { path = "../oracle-logic" }
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "parking_lot"] }
+tokio-util = "0.7.18"
+
+# Web framework
+axum = { version = "0.8.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6.7", features = ["cors", "trace"] }
+
+# gRPC / proto runtime
+connectrpc = { version = "0.2.1", features = ["server", "client"] }
+buffa = { version = "0.2.0", features = ["json"] }
+http = "1.0.0"
+http-body = "1.0.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cache / messaging
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+
+# Utils
+anyhow = "1.0"
+thiserror = "2.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+rust_decimal = { version = "1.36.0", features = ["serde-float", "maths"] }
+hex = "0.4.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.24"

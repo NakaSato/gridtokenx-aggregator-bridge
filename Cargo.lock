@@ -2479,6 +2479,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "oracle-api",
  "oracle-core",
  "oracle-logic",
  "oracle-persistence",
@@ -3679,6 +3680,38 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+]
+
+[[package]]
+name = "oracle-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "buffa",
+ "chrono",
+ "connectrpc",
+ "hex",
+ "http",
+ "http-body",
+ "metrics",
+ "oracle-core",
+ "oracle-logic",
+ "oracle-persistence",
+ "oracle-protocol",
+ "oracle-stacks",
+ "redis",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
