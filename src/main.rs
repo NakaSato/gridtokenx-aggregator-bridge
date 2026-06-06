@@ -390,7 +390,9 @@ async fn main() -> Result<()> {
     );
 
     // 9. Run HTTP and gRPC Servers concurrently (Industrial Standard)
-    let grpc_port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "50051".to_string());
+    // Default to the canonical Oracle Bridge gRPC port (:5030 per the README port
+    // table / Envoy mesh route); override with GRPC_PORT.
+    let grpc_port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "5030".to_string());
     let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{}", grpc_port)
         .parse()
         .context("Failed to parse gRPC address")?;
