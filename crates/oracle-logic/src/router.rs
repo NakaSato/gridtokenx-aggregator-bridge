@@ -4,7 +4,7 @@ use redis::streams::StreamMaxlen;
 use redis::AsyncCommands;
 use tracing::info;
 
-use crate::models::DeviceReading;
+use oracle_core::models::DeviceReading;
 
 /// Default maximum number of entries per Redis stream.
 const DEFAULT_MAX_STREAM_LEN: usize = 100_000;
@@ -58,7 +58,7 @@ impl Router {
 
         // Map DeviceMetrics to flattened payload for api-services Compatibility
         let (generated, consumed, net) = match reading.metrics {
-            crate::models::DeviceMetrics::Energy {
+            oracle_core::models::DeviceMetrics::Energy {
                 generated_kwh,
                 consumed_kwh,
                 net_kwh,
@@ -122,7 +122,7 @@ impl Router {
 
         // Option A: Forward telemetry directly to NATS for chain-bridge ingestion
         if let Some(nats) = &self.nats_client {
-            if reading.device_type == crate::models::DeviceType::SmartMeter {
+            if reading.device_type == oracle_core::models::DeviceType::SmartMeter {
                 let nats_payload = MeterReadingMessage {
                     device_id: reading.device_id.clone(),
                     wallet_address: reading.serial_number.clone(), // using serial_number as wallet/device correlation
@@ -149,9 +149,9 @@ impl Router {
 
     fn event_type_name(&self, reading: &DeviceReading) -> &'static str {
         match reading.device_type {
-            crate::models::DeviceType::SmartMeter => "SmartMeterReading",
-            crate::models::DeviceType::EvCharger => "EvCharging",
-            crate::models::DeviceType::Battery => "BatteryStateUpdate",
+            oracle_core::models::DeviceType::SmartMeter => "SmartMeterReading",
+            oracle_core::models::DeviceType::EvCharger => "EvCharging",
+            oracle_core::models::DeviceType::Battery => "BatteryStateUpdate",
         }
     }
 }
@@ -187,7 +187,7 @@ fn calculate_zone_index(num_zones: usize, reading: &DeviceReading) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{DeviceMetrics, DeviceType};
+    use oracle_core::models::{DeviceMetrics, DeviceType};
     use chrono::Utc;
     use uuid::Uuid;
 

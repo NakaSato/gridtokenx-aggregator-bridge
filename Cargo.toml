@@ -78,6 +78,7 @@ oracle-core = { path = "crates/oracle-core" }
 oracle-stacks = { path = "crates/oracle-stacks" }
 oracle-protocol = { path = "crates/oracle-protocol" }
 oracle-persistence = { path = "crates/oracle-persistence" }
+oracle-logic = { path = "crates/oracle-logic" }
 
 # OpenTelemetry
 opentelemetry = { version = "0.27", features = ["trace"] }

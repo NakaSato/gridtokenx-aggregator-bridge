@@ -2480,6 +2480,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "oracle-core",
+ "oracle-logic",
  "oracle-persistence",
  "oracle-protocol",
  "oracle-stacks",
@@ -3689,6 +3690,33 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "oracle-logic"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "buffa",
+ "chrono",
+ "connectrpc",
+ "gridtokenx-blockchain-core",
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus 0.17.2",
+ "oracle-core",
+ "oracle-protocol",
+ "oracle-stacks",
+ "redis",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

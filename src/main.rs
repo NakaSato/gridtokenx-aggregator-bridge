@@ -9,16 +9,16 @@ use axum::{
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 
-mod aggregator;
+/// Domain services now live in the `oracle-logic` crate; re-exported here so existing
+/// `crate::{aggregator,dispatch,router,standards,zk,metrics}::*` paths keep resolving.
+pub use oracle_logic::{aggregator, dispatch, metrics, router, standards, zk};
 mod auth;
-mod dispatch;
 mod grpc;
 mod handlers;
 /// External adapters now live in the `oracle-persistence` crate; re-exported here so
 /// existing `crate::infra::*` paths keep resolving during the workspace split.
 pub use oracle_persistence::infra;
 mod ingester;
-mod metrics;
 mod middleware;
 /// Domain types now live in the `oracle-core` crate; re-exported here so existing
 /// `crate::models::*` paths keep resolving during the workspace split.
@@ -26,12 +26,9 @@ pub use oracle_core::models;
 /// Protocol stacks now live in the `oracle-stacks` crate; aliased so existing
 /// `crate::protocol::*` paths keep resolving during the workspace split.
 pub use oracle_stacks as protocol;
-mod standards;
-mod router;
 mod state;
 mod telemetry;
 mod utils;
-mod zk;
 
 
 use tokio::signal;
