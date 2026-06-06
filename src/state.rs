@@ -6,10 +6,9 @@ use crate::protocol::stacks::openadr::OpenAdrStack;
 use crate::protocol::stacks::sunspec::SunSpecStack;
 use crate::router::Router;
 
-pub mod identity {
-    include!(concat!(env!("OUT_DIR"), "/_identity_include.rs"));
-    pub use identity::*;
-}
+// Generated identity ConnectRPC code now lives in the oracle-protocol crate.
+// Re-exported here so existing `crate::state::identity::*` paths keep resolving.
+pub use oracle_protocol::identity;
 
 pub use identity::IdentityServiceClient;
 

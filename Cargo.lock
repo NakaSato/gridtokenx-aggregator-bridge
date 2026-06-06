@@ -2461,10 +2461,8 @@ dependencies = [
  "axum 0.8.9",
  "bs58",
  "buffa",
- "buffa-build",
  "chrono",
  "connectrpc",
- "connectrpc-build",
  "crc32fast",
  "dotenvy",
  "ed25519-dalek 2.2.0",
@@ -2482,6 +2480,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "oracle-core",
+ "oracle-protocol",
  "oracle-stacks",
  "rand 0.8.6",
  "rand_distr",
@@ -3690,6 +3689,21 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "oracle-protocol"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "buffa-build",
+ "connectrpc",
+ "connectrpc-build",
+ "futures",
+ "http",
+ "http-body",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

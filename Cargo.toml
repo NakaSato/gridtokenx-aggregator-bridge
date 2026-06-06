@@ -76,15 +76,12 @@ async-nats = "0.37"
 gridtokenx-blockchain-core = { version = "0.1.0", path = "../gridtokenx-blockchain-core" }
 oracle-core = { path = "crates/oracle-core" }
 oracle-stacks = { path = "crates/oracle-stacks" }
+oracle-protocol = { path = "crates/oracle-protocol" }
 
 # OpenTelemetry
 opentelemetry = { version = "0.27", features = ["trace"] }
 opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.27"
-
-[build-dependencies]
-buffa-build = "0.2.0"
-connectrpc-build = "0.2.0"
 
 [profile.release]
 opt-level = 3

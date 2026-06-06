@@ -3,12 +3,8 @@ use connectrpc::client::{ClientConfig, Http2Connection, SharedHttp2Connection};
 use connectrpc::Protocol;
 use tracing::{error, info};
 
-// Include the generated ConnectRPC code
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/_oracle_include.rs"));
-}
-
-pub use proto::gridtokenx::oracle::v1::{
+// Generated ConnectRPC code now lives in the oracle-protocol crate.
+pub use oracle_protocol::oracle::{
     IngestResponse, MeterReading, MeterReadingBatchRequest, MeterReadingBatchResponse,
     OracleServiceClient,
 };

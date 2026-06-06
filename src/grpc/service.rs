@@ -12,11 +12,8 @@ use crate::protocol::DlmsBinaryFrame;
 use crate::state::AppState;
 use serde_json::json;
 
-/// Generated code from proto using industrial standard (Buffa / ConnectRPC)
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/_oracle_include.rs"));
-    pub use gridtokenx::oracle::v1::*;
-}
+/// Generated code from proto (Buffa / ConnectRPC), now in the oracle-protocol crate.
+pub use oracle_protocol::oracle as proto;
 
 use proto::{
     BulkRawRequestView, BulkRawResponse, IngestResponse, MeterReadingBatchRequestView,

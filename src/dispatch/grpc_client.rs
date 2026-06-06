@@ -4,12 +4,8 @@ use http::Uri;
 use async_trait::async_trait;
 use crate::dispatch::DispatchAdapter;
 
-pub mod generated {
-    include!(concat!(env!("OUT_DIR"), "/_dispatch_include.rs"));
-}
-
-// Access generated code via the generated module
-pub use generated::gridtokenx::dispatch::{FlexCommand, DispatchType, DispatchControllerClient};
+// Generated code now lives in the oracle-protocol crate.
+pub use oracle_protocol::dispatch::{FlexCommand, DispatchType, DispatchControllerClient};
 use buffa::EnumValue;
 
 pub struct DispatchClient {
