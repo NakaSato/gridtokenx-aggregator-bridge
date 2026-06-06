@@ -20,9 +20,6 @@ use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
 use protocol::stacks::dlms::DlmsStack;
-use protocol::stacks::ocpp::OcppStack;
-use protocol::stacks::openadr::OpenAdrStack;
-use protocol::stacks::sunspec::SunSpecStack;
 use state::AppState;
 
 fn expand_env(s: &str) -> String {
@@ -315,17 +312,13 @@ async fn main() -> Result<()> {
 
     let app_state = AppState {
         router: iot_router,
-        ocpp_stack: Arc::new(OcppStack::new()),
-        sunspec_stack: Arc::new(SunSpecStack::new()),
         dlms_stack: Arc::new(DlmsStack::new()),
-        openadr_stack: Arc::new(OpenAdrStack::new()),
         api_keys,
         identity_client,
         metrics,
         kafka_producer,
         rabbitmq_producer,
         signature_verifier,
-        settlement_signer,
         meter_registry,
     };
 
