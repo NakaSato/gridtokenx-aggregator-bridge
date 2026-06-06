@@ -10,6 +10,7 @@ oracle-stacks = { path = "../oracle-stacks" }
 oracle-protocol = { path = "../oracle-protocol" }
 oracle-persistence = { path = "../oracle-persistence" }
 oracle-logic = { path = "../oracle-logic" }
+gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "parking_lot"] }

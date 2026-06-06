@@ -1,23 +1,7 @@
-//! Logging initialization for Oracle Bridge.
+//! Telemetry for the Oracle Bridge.
+//!
+//! Thin re-export of the shared [`gridtokenx_telemetry`] crate so existing
+//! `telemetry::init_telemetry(...)` / `telemetry::shutdown_telemetry(...)` call
+//! sites keep resolving after the per-service copies were unified.
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-#[derive(Debug)]
-pub struct TelemetryGuard {}
-
-impl TelemetryGuard {
-    pub fn shutdown(&self) {}
-}
-
-pub fn init_telemetry(_service_name_default: &'static str) -> TelemetryGuard {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
-    TelemetryGuard {}
-}
-
-pub fn shutdown_telemetry(_guard: &TelemetryGuard) {}
+pub use gridtokenx_telemetry::{init_telemetry, shutdown_telemetry, TelemetryGuard};

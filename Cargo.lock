@@ -2469,6 +2469,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gridtokenx-telemetry"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3562,6 +3570,7 @@ dependencies = [
  "buffa",
  "chrono",
  "connectrpc",
+ "gridtokenx-telemetry",
  "hex",
  "http",
  "http-body",
