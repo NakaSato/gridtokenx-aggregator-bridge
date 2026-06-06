@@ -26,6 +26,15 @@ pub async fn health() -> impl IntoResponse {
 // =============================================================================
 
 // Helper function to verify signature on REST ingestion paths
+/// Whether telemetry signature enforcement is disabled (dev/test escape hatch).
+///
+/// Default (env unset) is fail-CLOSED: telemetry with an invalid or unverifiable
+/// Ed25519 signature is rejected. Set `ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true`
+/// only in trusted dev/test environments to accept unverified readings.
+pub fn signature_enforcement_disabled() -> bool {
+    std::env::var("ORACLE_ALLOW_UNVERIFIED_TELEMETRY").unwrap_or_default() == "true"
+}
+
 async fn verify_rest_signature(
     state: &AppState,
     device_id: &str,
@@ -135,44 +144,58 @@ pub async fn ingest_private_network(
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0);
 
-    match verify_rest_signature(
-        &state,
-        &payload.device_id,
-        &payload.payload,
-        signature,
-        &kwh,
-        timestamp_ms,
-    )
-    .await
-    {
-        Ok(true) => info!(
-            "✅ Telemetry signature verified (REST) for {}",
-            payload.device_id
-        ),
-        Ok(false) => {
-            warn!(
-                "🚫 Invalid telemetry signature (REST) for {}",
-                payload.device_id
-            );
-            if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "Invalid Ed25519 signature" })),
-                )
-                    .into_response();
+    // The `simulator` protocol is an explicit unsigned dev ingest path (mirrors
+    // the batch handler's simulator bypass); everything else must carry a valid
+    // signature. Fail-CLOSED by default: reject invalid/unverifiable telemetry
+    // unless ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true.
+    let is_simulator = payload.protocol.eq_ignore_ascii_case("simulator");
+    let sig_verified = if is_simulator {
+        true
+    } else {
+        match verify_rest_signature(
+            &state,
+            &payload.device_id,
+            &payload.payload,
+            signature,
+            &kwh,
+            timestamp_ms,
+        )
+        .await
+        {
+            Ok(true) => {
+                info!(
+                    "✅ Telemetry signature verified (REST) for {}",
+                    payload.device_id
+                );
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    "🚫 Invalid telemetry signature (REST) for {}",
+                    payload.device_id
+                );
+                if !signature_enforcement_disabled() {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({ "error": "Invalid Ed25519 signature" })),
+                    )
+                        .into_response();
+                }
+                false
+            }
+            Err(e) => {
+                warn!("⚠️ Verification error for {}: {}", payload.device_id, e);
+                if !signature_enforcement_disabled() {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": format!("Verification failed: {}", e) })),
+                    )
+                        .into_response();
+                }
+                false
             }
         }
-        Err(e) => {
-            warn!("⚠️ Verification error for {}: {}", payload.device_id, e);
-            if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": format!("Verification failed: {}", e) })),
-                )
-                    .into_response();
-            }
-        }
-    }
+    };
 
     // Dynamic routing to specialized protocol stacks
     let protocol = payload.protocol.to_lowercase();
@@ -202,7 +225,7 @@ pub async fn ingest_private_network(
             },
             metadata: payload.payload.as_object().cloned().unwrap_or_default().into_iter().collect(),
         };
-        return disseminate_reading(&state, reading).await;
+        return disseminate_reading(&state, reading, sig_verified).await;
     }
 
     let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> =
@@ -215,7 +238,7 @@ pub async fn ingest_private_network(
     let raw_data = serde_json::to_vec(&payload.payload).unwrap_or_default();
 
     match stack.handle_message(&payload.device_id, &raw_data).await {
-        Ok(Some(reading)) => disseminate_reading(&state, reading).await,
+        Ok(Some(reading)) => disseminate_reading(&state, reading, sig_verified).await,
         Ok(None) => (
             StatusCode::OK,
             Json(json!({ "status": "processed", "message": "Message handled by stack, no reading generated" })),
@@ -364,9 +387,9 @@ pub async fn ingest_private_network_batch(
             }
         };
 
-        if !is_verified && std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
+        if !is_verified && !signature_enforcement_disabled() {
             warn!("🚫 Invalid signature in batch for device {}", device_id);
-            continue; // Skip invalid reading
+            continue; // Skip invalid reading (fail-closed by default)
         }
 
         // Special handling for simulator/json protocol to avoid DLMS stack failure
@@ -432,6 +455,7 @@ pub async fn ingest_private_network_batch(
 pub async fn disseminate_reading(
     state: &AppState,
     reading: DeviceReading,
+    is_verified: bool,
 ) -> axum::response::Response {
     let response = IngestResponse {
         status: "accepted",
@@ -483,8 +507,8 @@ pub async fn disseminate_reading(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
-                        verified: true,
-                        confidence_score: 1.0,
+                        verified: is_verified,
+                        confidence_score: if is_verified { 1.0 } else { 0.0 },
                     };
 
                     if let Err(e) = kafka_producer.publish_meter_reading(&event).await {

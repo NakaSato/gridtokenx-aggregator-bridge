@@ -91,6 +91,10 @@ impl OracleService for OracleServiceImpl {
         // 2. Batch Signature Verification
         let skip_verify = std::env::var("SKIP_SIG_VERIFY").unwrap_or_default() == "true";
         let verification_results = if skip_verify {
+            warn!(
+                "⚠️ SKIP_SIG_VERIFY=true — bypassing Ed25519 verification for {} bulk frame(s); telemetry accepted UNVERIFIED (dev only)",
+                meter_ids.len()
+            );
             vec![true; meter_ids.len()]
         } else {
             self.state.signature_verifier
@@ -138,7 +142,8 @@ impl OracleService for OracleServiceImpl {
                 metadata,
             };
 
-            let _ = disseminate_reading(&self.state, reading).await;
+            // Reached only after the per-frame verification gate above passed.
+            let _ = disseminate_reading(&self.state, reading, true).await;
             processed_count += 1;
         }
 
@@ -164,7 +169,9 @@ impl OracleService for OracleServiceImpl {
         );
 
         // --- UTT-H hardened anti-replay verification ---
-        if let Some(signature) = request.signature.as_deref() {
+        // Fail-CLOSED by default: signed-but-invalid is always rejected; unsigned
+        // is rejected unless ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true.
+        let sig_verified = if let Some(signature) = request.signature.as_deref() {
             // Reconstruct canonical target with sequence/ms support (UTT-H Protocol)
             // Note: In a real deployment, sequence would be tracked in Redis to prevent reuse.
             let sign_target = format!("{}:{}:{}", request.meter_id, request.kwh, request.timestamp);
@@ -196,12 +203,14 @@ impl OracleService for OracleServiceImpl {
                 error!("🚫 UTT-H Integrity check failed for meter {}", request.meter_id);
                 return Err(ConnectError::permission_denied("UTT-H Signature Verification Failed"));
             }
+            true
         } else {
             warn!("⚠️ Received unsigned telemetry from meter={}", request.meter_id);
-            if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
-                return Err(ConnectError::invalid_argument("Signature required in production"));
+            if !crate::handlers::signature_enforcement_disabled() {
+                return Err(ConnectError::invalid_argument("Signature required"));
             }
-        }
+            false
+        };
 
         let mut generated_kwh = request
             .energy_generated
@@ -261,7 +270,7 @@ impl OracleService for OracleServiceImpl {
         };
 
         // Dissemination: Triggers both Path A (VPP/Kafka) and Path B (Aggregation/Settlement)
-        let res = disseminate_reading(&self.state, reading).await;
+        let res = disseminate_reading(&self.state, reading, sig_verified).await;
 
         if res.status().is_success() {
             Ok((
@@ -289,8 +298,10 @@ impl OracleService for OracleServiceImpl {
         let mut rejected_count = 0;
 
         for tel in &request.readings {
-            // Signature verification (required for UTT)
-            if let Some(signature) = tel.signature.as_deref() {
+            // Signature verification (required for UTT). Fail-CLOSED by default:
+            // signed-but-invalid and unsigned are both rejected unless
+            // ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true.
+            let sig_verified = if let Some(signature) = tel.signature.as_deref() {
                 let sign_target = format!("{}:{}:{}", tel.meter_id, tel.kwh, tel.timestamp);
                 let is_verified = match self
                     .state
@@ -307,10 +318,13 @@ impl OracleService for OracleServiceImpl {
                     rejected_count += 1;
                     continue;
                 }
-            } else if std::env::var("ENVIRONMENT").unwrap_or_default() == "production" {
+                true
+            } else if !crate::handlers::signature_enforcement_disabled() {
                 rejected_count += 1;
                 continue;
-            }
+            } else {
+                false
+            };
 
             let mut generated_kwh = tel.energy_generated.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut consumed_kwh = tel.energy_consumed.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
@@ -341,7 +355,7 @@ impl OracleService for OracleServiceImpl {
                 metadata,
             };
 
-            let res = disseminate_reading(&self.state, reading).await;
+            let res = disseminate_reading(&self.state, reading, sig_verified).await;
             if res.status().is_success() {
                 receipt_ids.push(Uuid::new_v4().to_string());
                 accepted_count += 1;
