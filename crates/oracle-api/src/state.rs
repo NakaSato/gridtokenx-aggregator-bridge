@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
 use crate::protocol::stacks::dlms::DlmsStack;
-use crate::protocol::stacks::ocpp::OcppStack;
-use crate::protocol::stacks::openadr::OpenAdrStack;
-use crate::protocol::stacks::sunspec::SunSpecStack;
 use crate::router::Router;
 
 // Generated identity ConnectRPC code now lives in the oracle-protocol crate.
@@ -54,11 +51,9 @@ impl Metrics {
 pub struct AppState {
     pub router: Arc<Router>,
 
-    // Private Network Protocol Stacks
-    pub ocpp_stack: Arc<OcppStack>,
-    pub sunspec_stack: Arc<SunSpecStack>,
+    // Private Network Protocol Stacks (only DLMS wired into the dispatch match today;
+    // OCPP/SunSpec/OpenADR live in oracle-stacks, re-add fields here when wired)
     pub dlms_stack: Arc<DlmsStack>,
-    pub openadr_stack: Arc<OpenAdrStack>,
 
     pub api_keys: Vec<String>,
     pub identity_client: Option<Arc<IdentityServiceClient<SharedHttp2Connection>>>,
@@ -68,6 +63,5 @@ pub struct AppState {
     pub kafka_producer: Option<Arc<crate::infra::kafka::OracleKafkaProducer>>,
     pub rabbitmq_producer: Option<Arc<crate::infra::rabbitmq::OracleRabbitMQProducer>>,
     pub signature_verifier: Arc<crate::infra::crypto::SignatureVerifier>,
-    pub settlement_signer: Option<Arc<crate::infra::crypto::SettlementSigner>>,
     pub meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
 }
