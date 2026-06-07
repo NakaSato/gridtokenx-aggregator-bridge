@@ -38,10 +38,7 @@ The Oracle Bridge requires all telemetry to be signed by registered edge devices
 
 ## 📂 Documentation Index
 
-- [implement.md](implement.md) - **Source of Truth**: Full technical system design (GridTokenX VPP).
-- [core.md](docs/core.md) - **Architecture Matrix**: SVGs and component matrices.
-- [INGESTION-API.md](docs/INGESTION-API.md) - **API Reference**: How to integrate Edge Gateways securely.
-- [ORACLE-BRIDGE.md](docs/ORACLE-BRIDGE.md) - **Path B Deep Dive**: Cryptographic Trust & ZK-Rollup Settlement.
+- [ARCHITECTURE.md](ARCHITECTURE.md) - **Source of Truth**: Full technical system design — components, telemetry verification, aggregation, and settlement dissemination.
 
 ---
 
