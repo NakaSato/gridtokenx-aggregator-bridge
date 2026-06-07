@@ -25,6 +25,7 @@ WORKDIR /app
 COPY gridtokenx-oracle-bridge/ gridtokenx-oracle-bridge/
 COPY gridtokenx-blockchain-core/ gridtokenx-blockchain-core/
 COPY gridtokenx-iam-service/ gridtokenx-iam-service/
+COPY gridtokenx-telemetry/ gridtokenx-telemetry/
 
 WORKDIR /app/gridtokenx-oracle-bridge
 
