@@ -3,15 +3,117 @@ use ed25519_dalek::{SecretKey, Signature, Signer, SigningKey, Verifier, Verifyin
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Verifies Ed25519 telemetry signatures against device public keys stored in
+/// Redis (`gridtokenx:devices:{meter_id}:pubkey`).
+///
+/// The Redis connection is established lazily and **rebuilt automatically** if
+/// the Redis server restarts, so signed telemetry keeps verifying without a
+/// bridge restart. When Redis is genuinely unreachable, verification returns a
+/// loud `Err` (fail-closed but observable) instead of silently reporting an
+/// invalid signature — a silent `Ok(false)` is indistinguishable from a forged
+/// signature and previously masked a dead connection for hours.
 pub struct SignatureVerifier {
-    redis: Option<ConnectionManager>,
+    /// Source URL used to (re)build the connection manager after a failure.
+    redis_url: Option<String>,
+    /// Cached reconnecting manager; `None` until first use or after invalidation.
+    conn: Arc<Mutex<Option<ConnectionManager>>>,
 }
 
 impl SignatureVerifier {
-    pub fn new(redis: Option<ConnectionManager>) -> Self {
-        Self { redis }
+    /// Construct from a Redis URL. The connection is established on first use
+    /// and transparently rebuilt if it drops (e.g. Redis restart).
+    pub fn new(redis_url: Option<String>) -> Self {
+        Self {
+            redis_url,
+            conn: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct from an already-established connection manager. The manager
+    /// auto-reconnects, but without a URL it cannot be fully rebuilt after a
+    /// hard failure — prefer [`SignatureVerifier::new`].
+    pub fn from_manager(conn: Option<ConnectionManager>) -> Self {
+        Self {
+            redis_url: None,
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    /// Return a live connection manager clone, building it from `redis_url` on
+    /// first use or after [`invalidate`](Self::invalidate). Errors loudly when
+    /// Redis is unavailable rather than treating it as a bad signature.
+    async fn conn(&self) -> Result<ConnectionManager> {
+        {
+            let guard = self.conn.lock().await;
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        let url = self.redis_url.as_ref().ok_or_else(|| {
+            anyhow!("SignatureVerifier has no live Redis connection or URL; cannot verify telemetry signatures")
+        })?;
+        let client = redis::Client::open(url.clone())
+            .map_err(|e| anyhow!("Failed to open Redis client {}: {}", url, e))?;
+        let mgr = ConnectionManager::new(client)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to Redis {}: {}", url, e))?;
+        let mut guard = self.conn.lock().await;
+        *guard = Some(mgr.clone());
+        Ok(mgr)
+    }
+
+    /// Drop the cached manager so the next call rebuilds from the URL. Used
+    /// after a hard error so a Redis restart is recovered without a process
+    /// restart. No-op when there is no URL to rebuild from.
+    async fn invalidate(&self) {
+        if self.redis_url.is_some() {
+            let mut guard = self.conn.lock().await;
+            *guard = None;
+        }
+    }
+
+    /// GET a key, rebuilding the connection and retrying once on a transport
+    /// error (the recovery path after a Redis restart).
+    async fn get_with_retry(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.conn().await?;
+        match conn.get::<_, Option<String>>(key).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                warn!(
+                    "⚠️ Redis lookup error for {} ({}); rebuilding connection and retrying",
+                    key, e
+                );
+                self.invalidate().await;
+                let mut conn2 = self.conn().await?;
+                conn2.get::<_, Option<String>>(key).await.map_err(|e2| {
+                    anyhow!("Redis lookup failed for {} after reconnect: {}", key, e2)
+                })
+            }
+        }
+    }
+
+    /// MGET keys, rebuilding the connection and retrying once on a transport error.
+    async fn mget_with_retry(&self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        let mut conn = self.conn().await?;
+        match conn.mget::<_, Vec<Option<String>>>(keys).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                warn!(
+                    "⚠️ Redis MGET error ({}); rebuilding connection and retrying",
+                    e
+                );
+                self.invalidate().await;
+                let mut conn2 = self.conn().await?;
+                conn2
+                    .mget::<_, Vec<Option<String>>>(keys)
+                    .await
+                    .map_err(|e2| anyhow!("Redis MGET failed after reconnect: {}", e2))
+            }
+        }
     }
 
     pub async fn verify_telemetry_signature(
@@ -20,18 +122,11 @@ impl SignatureVerifier {
         payload: &[u8],
         signature_base58: &str,
     ) -> Result<bool> {
-        let mut conn = match &self.redis {
-            Some(conn) => conn.clone(),
-            None => return Ok(false),
-        };
         // 1. Lookup device public key from registry (Redis)
         // Key format: gridtokenx:devices:{meter_id}:pubkey
         let key = format!("gridtokenx:devices:{}:pubkey", meter_id);
 
-        let public_key_hex: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| anyhow!("Redis lookup failed for {}: {}", key, e))?;
+        let public_key_hex: Option<String> = self.get_with_retry(&key).await?;
 
         let hex_str = public_key_hex
             .ok_or_else(|| {
@@ -113,20 +208,13 @@ impl SignatureVerifier {
             return Err(anyhow!("Mismatched batch lengths"));
         }
 
-        let mut conn = match &self.redis {
-            Some(conn) => conn.clone(),
-            None => return Ok(vec![false; meter_ids.len()]),
-        };
         let keys: Vec<String> = meter_ids
             .iter()
             .map(|id| format!("gridtokenx:devices:{}:pubkey", id))
             .collect();
 
-        // Fetch all public keys in one round-trip
-        let public_keys_hex: Vec<Option<String>> = conn
-            .mget(&keys)
-            .await
-            .map_err(|e| anyhow!("Redis MGET failed: {}", e))?;
+        // Fetch all public keys in one round-trip (rebuild + retry on failure).
+        let public_keys_hex: Vec<Option<String>> = self.mget_with_retry(&keys).await?;
 
         let mut results = Vec::with_capacity(meter_ids.len());
 

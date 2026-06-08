@@ -197,12 +197,23 @@ pub async fn ingest_private_network(
         }
     };
 
-    // Dynamic routing to specialized protocol stacks
-    let protocol = payload.protocol.to_lowercase();
-    if protocol != "dlms" && protocol != "simulator" {
+    // Dynamic routing to specialized protocol stacks. `auto` (or an empty
+    // protocol field) triggers field-based detection from the payload so
+    // callers don't have to hard-code the stack per device.
+    let mut protocol = payload.protocol.to_lowercase();
+    if protocol.is_empty() || protocol == "auto" {
+        protocol = crate::protocol::stacks::detect_protocol(&payload.payload).to_string();
+        info!(
+            "🔎 Auto-detected protocol '{}' for {}",
+            protocol, payload.device_id
+        );
+    }
+
+    const SUPPORTED: [&str; 5] = ["dlms", "ocpp", "openadr", "sunspec", "simulator"];
+    if !SUPPORTED.contains(&protocol.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Only DLMS protocol is supported" })),
+            Json(json!({ "error": format!("Unsupported protocol: {}", protocol) })),
         )
             .into_response();
     }
@@ -228,11 +239,13 @@ pub async fn ingest_private_network(
         return disseminate_reading(&state, reading, sig_verified).await;
     }
 
-    let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> =
-        match protocol.as_str() {
-            "dlms" => state.dlms_stack.clone(),
-            _ => unreachable!(),
-        };
+    let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = match protocol.as_str() {
+        "dlms" => state.dlms_stack.clone(),
+        "ocpp" => Arc::new(crate::protocol::stacks::ocpp::OcppStack::new()),
+        "openadr" => Arc::new(crate::protocol::stacks::openadr::OpenAdrStack::new()),
+        "sunspec" => Arc::new(crate::protocol::stacks::sunspec::SunSpecStack::new()),
+        _ => unreachable!(),
+    };
 
     // Serialize payload back to bytes for the stack handlers
     let raw_data = serde_json::to_vec(&payload.payload).unwrap_or_default();
@@ -320,21 +333,25 @@ pub async fn ingest_private_network_batch(
 ) -> impl IntoResponse {
     info!("📥 Received private network batch ingestion: protocol={}", payload.protocol);
     let mut responses = Vec::new();
-    let protocol = payload.protocol.to_lowercase();
-    
-    // We strictly check DLMS for now, but allow 'simulator' for E2E testing
-    if protocol != "dlms" && protocol != "simulator" {
+    // `auto` (or an empty top-level protocol) detects each reading's protocol
+    // from its own fields, so a batch may mix device types.
+    let top_protocol = payload.protocol.to_lowercase();
+    const SUPPORTED: [&str; 6] = ["dlms", "ocpp", "openadr", "sunspec", "simulator", "auto"];
+    if !top_protocol.is_empty() && !SUPPORTED.contains(&top_protocol.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Only DLMS protocol is supported" })),
+            Json(json!({ "error": format!("Unsupported protocol: {}", top_protocol) })),
         )
             .into_response();
     }
 
-    // Dynamic routing to specialized protocol stacks
-    let stack = state.dlms_stack.clone();
-
     for item in payload.readings {
+        // Resolve this reading's protocol (per-item detection under `auto`).
+        let protocol = if top_protocol.is_empty() || top_protocol == "auto" {
+            crate::protocol::stacks::detect_protocol(&item).to_string()
+        } else {
+            top_protocol.clone()
+        };
         let device_id = item
             .get("device_id")
             .or_else(|| item.get("meter_id"))
@@ -425,6 +442,14 @@ pub async fn ingest_private_network_batch(
 
         // Serialize payload back to bytes for the stack handlers
         let raw_data = serde_json::to_vec(&item).unwrap_or_default();
+
+        let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = match protocol.as_str() {
+            "dlms" => state.dlms_stack.clone(),
+            "ocpp" => Arc::new(crate::protocol::stacks::ocpp::OcppStack::new()),
+            "openadr" => Arc::new(crate::protocol::stacks::openadr::OpenAdrStack::new()),
+            "sunspec" => Arc::new(crate::protocol::stacks::sunspec::SunSpecStack::new()),
+            _ => continue,
+        };
 
         match stack.handle_message(device_id, &raw_data).await {
             Ok(Some(reading)) => {

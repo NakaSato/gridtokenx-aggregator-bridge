@@ -236,10 +236,14 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Crypto: Signature Verifier
-    let signature_verifier = Arc::new(infra::crypto::SignatureVerifier::new(
-        early_redis_conn.clone(),
-    ));
+    // Crypto: Signature Verifier.
+    // Pass the Redis URL (not the one-shot `early_redis_conn`) so the verifier
+    // owns a self-healing connection — it rebuilds transparently after a Redis
+    // restart instead of silently rejecting all signed telemetry until the
+    // bridge process is restarted.
+    let signature_verifier = Arc::new(infra::crypto::SignatureVerifier::new(Some(
+        redis_url.clone(),
+    )));
 
     // Crypto: Settlement Signer
     let settlement_signer = if let Ok(key_path) = std::env::var("ORACLE_BRIDGE_SIGNING_KEY") {
