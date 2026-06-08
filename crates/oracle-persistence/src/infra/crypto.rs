@@ -290,3 +290,74 @@ pub struct SettlementData {
     pub net_energy: f64,
     pub timestamp: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A syntactically valid 64-char hex pubkey + base58 sig so the verifier
+    // reaches the Redis lookup before any decode error — the lookup is what we
+    // exercise here.
+    const DUMMY_SIG_B58: &str = "11111111111111111111111111111111111111111111111111111111111111111111";
+
+    /// Security regression guard for the 403-on-all-readings incident: when the
+    /// verifier has no way to reach Redis it MUST return a loud `Err`, never a
+    /// silent `Ok(false)` (indistinguishable from a forged signature).
+    #[tokio::test]
+    async fn verify_errors_loud_when_no_redis_url() {
+        let v = SignatureVerifier::new(None);
+        let res = v
+            .verify_telemetry_signature("meter-1", b"payload", DUMMY_SIG_B58)
+            .await;
+        assert!(res.is_err(), "no-URL verifier must Err, got Ok({:?})", res.ok());
+    }
+
+    /// Same guard for a manager-less verifier built via `from_manager(None)`.
+    #[tokio::test]
+    async fn verify_errors_loud_when_no_manager() {
+        let v = SignatureVerifier::from_manager(None);
+        let res = v
+            .verify_telemetry_signature("meter-1", b"payload", DUMMY_SIG_B58)
+            .await;
+        assert!(res.is_err(), "manager-less verifier must Err, got Ok({:?})", res.ok());
+    }
+
+    /// `sign_canonical` must produce a base58 Ed25519 signature that verifies
+    /// against the signer's own public key for the exact canonical string —
+    /// the contract the Trading Service relies on.
+    #[test]
+    fn settlement_signer_canonical_roundtrip() {
+        let signer = SettlementSigner::new(&[7u8; 32]).unwrap();
+        let msg = "user:meter:12.5:1000:2000";
+
+        let sig_bytes = bs58::decode(signer.sign_canonical(msg)).into_vec().unwrap();
+        let signature = Signature::from_slice(&sig_bytes).unwrap();
+
+        let pk_bytes = bs58::decode(signer.public_key_bs58()).into_vec().unwrap();
+        let pk: [u8; 32] = pk_bytes.try_into().unwrap();
+        let verifying_key = VerifyingKey::from_bytes(&pk).unwrap();
+
+        assert!(verifying_key.verify(msg.as_bytes(), &signature).is_ok());
+        // Tampered message must NOT verify.
+        assert!(verifying_key
+            .verify(b"user:meter:99.9:1000:2000", &signature)
+            .is_err());
+    }
+
+    /// Live reconnect check — exercises `get_with_retry` against a real Redis.
+    /// Ignored by default; run with `cargo test -- --ignored` and Redis up.
+    #[tokio::test]
+    #[ignore = "requires REDIS_URL (default redis://localhost:7010)"]
+    async fn get_with_retry_reads_against_real_redis() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:7010".to_string());
+        let v = SignatureVerifier::new(Some(url));
+        // Missing key => Ok(None) proves the connection built and the round-trip
+        // succeeded without panicking.
+        let got = v
+            .get_with_retry("gridtokenx:test:__nonexistent__:pubkey")
+            .await
+            .expect("get_with_retry should connect to Redis");
+        assert!(got.is_none());
+    }
+}
