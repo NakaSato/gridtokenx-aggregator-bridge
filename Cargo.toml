@@ -2,10 +2,10 @@
 members = ["crates/*"]
 
 [package]
-name = "gridtokenx-oracle-bridge"
+name = "gridtokenx-aggregator-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "GridTokenX Oracle Bridge + IoT Gateway - Unified ingestion and on-chain synchronization"
+description = "GridTokenX Aggregator Bridge + IoT Gateway - Unified ingestion and on-chain synchronization"
 
 [dependencies]
 # Async runtime
@@ -33,7 +33,7 @@ dotenvy = "0.15"
 tracing = "0.1"
 
 # Application layer (re-exports logic/persistence/protocol/stacks/core)
-oracle-api = { path = "crates/oracle-api" }
+aggregator-api = { path = "crates/aggregator-api" }
 
 [profile.release]
 opt-level = 3

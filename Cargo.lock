@@ -94,6 +94,133 @@ dependencies = [
 ]
 
 [[package]]
+name = "aggregator-api"
+version = "0.1.0"
+dependencies = [
+ "aggregator-core",
+ "aggregator-logic",
+ "aggregator-persistence",
+ "aggregator-protocol",
+ "aggregator-stacks",
+ "anyhow",
+ "axum 0.8.9",
+ "buffa",
+ "chrono",
+ "connectrpc",
+ "gridtokenx-telemetry",
+ "hex",
+ "http",
+ "http-body",
+ "metrics",
+ "redis",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower 0.5.3",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "aggregator-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "aggregator-logic"
+version = "0.1.0"
+dependencies = [
+ "aggregator-core",
+ "aggregator-protocol",
+ "aggregator-stacks",
+ "anyhow",
+ "async-nats",
+ "async-trait",
+ "buffa",
+ "chrono",
+ "connectrpc",
+ "gridtokenx-blockchain-core",
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus 0.17.2",
+ "redis",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aggregator-persistence"
+version = "0.1.0"
+dependencies = [
+ "aggregator-protocol",
+ "anyhow",
+ "bs58",
+ "chrono",
+ "connectrpc",
+ "ed25519-dalek 2.2.0",
+ "hex",
+ "http",
+ "lapin",
+ "rdkafka",
+ "redis",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aggregator-protocol"
+version = "0.1.0"
+dependencies = [
+ "buffa",
+ "buffa-build",
+ "connectrpc",
+ "connectrpc-build",
+ "futures",
+ "http",
+ "http-body",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "aggregator-stacks"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "aggregator-core",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2407,6 +2534,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gridtokenx-aggregator-bridge"
+version = "0.1.0"
+dependencies = [
+ "aggregator-api",
+ "anyhow",
+ "async-nats",
+ "axum 0.8.9",
+ "connectrpc",
+ "dotenvy",
+ "http",
+ "metrics",
+ "metrics-exporter-prometheus 0.17.2",
+ "redis",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "gridtokenx-blockchain-core"
 version = "0.1.0"
 dependencies = [
@@ -2447,25 +2593,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "gridtokenx-oracle-bridge"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "axum 0.8.9",
- "connectrpc",
- "dotenvy",
- "http",
- "metrics",
- "metrics-exporter-prometheus 0.17.2",
- "oracle-api",
- "redis",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -3559,133 +3686,6 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "oracle-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.9",
- "buffa",
- "chrono",
- "connectrpc",
- "gridtokenx-telemetry",
- "hex",
- "http",
- "http-body",
- "metrics",
- "oracle-core",
- "oracle-logic",
- "oracle-persistence",
- "oracle-protocol",
- "oracle-stacks",
- "redis",
- "rust_decimal",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tower 0.5.3",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "oracle-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "rust_decimal",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "oracle-logic"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "async-trait",
- "buffa",
- "chrono",
- "connectrpc",
- "gridtokenx-blockchain-core",
- "http",
- "metrics",
- "metrics-exporter-prometheus 0.17.2",
- "oracle-core",
- "oracle-protocol",
- "oracle-stacks",
- "redis",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "oracle-persistence"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bs58",
- "chrono",
- "connectrpc",
- "ed25519-dalek 2.2.0",
- "hex",
- "http",
- "lapin",
- "oracle-protocol",
- "rdkafka",
- "redis",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "oracle-protocol"
-version = "0.1.0"
-dependencies = [
- "buffa",
- "buffa-build",
- "connectrpc",
- "connectrpc-build",
- "futures",
- "http",
- "http-body",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "oracle-stacks"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "async-trait",
- "chrono",
- "crc32fast",
- "oracle-core",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,37 @@
+[package]
+name = "aggregator-persistence"
+version = "0.1.0"
+edition = "2021"
+description = "GridTokenX Aggregator Bridge - persistence & external adapters (storage, kafka, rabbitmq, redis, crypto, platform client)"
+
+[dependencies]
+aggregator-protocol = { path = "../aggregator-protocol" }
+
+# Async runtime
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Storage / messaging / cache
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+rdkafka = { version = "0.37", features = ["zstd"] }
+lapin = "2.5"
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+
+# HTTP / gRPC
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+connectrpc = { version = "0.2.1", features = ["server", "client"] }
+http = "1.0.0"
+
+# Crypto
+ed25519-dalek = "2.1"
+bs58 = "0.5"
+hex = "0.4.3"
+
+# Utils
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
+tracing = "0.1"

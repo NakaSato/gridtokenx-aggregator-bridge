@@ -12,7 +12,7 @@
   - `telemetry.raw`: 15-second intervals.
   - `attestation.signed`: 15-minute intervals.
 
-## 3. Oracle Bridge Layer
+## 3. Aggregator Bridge Layer
 - **UTT Ingestion:** Verified entry point for both paths.
 - **ZK-Prover:** Plonky2 (Goldilocks field, FRI-based).
 - **Finality:** Merkle Root + Plonky2 Proof.

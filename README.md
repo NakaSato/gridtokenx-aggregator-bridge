@@ -1,6 +1,6 @@
-# GridTokenX Oracle Bridge & VPP Operation Service
+# GridTokenX Aggregator Bridge & VPP Operation Service
 
-The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** Convergence Layer designed to orchestrate VPP operations and provide cryptographic integrity for grid-scale energy assets. It serves as the high-throughput ingestion entry point for the GridTokenX VPP, bridging edge gateways to the optimization platform and blockchain settlement.
+The **GridTokenX Aggregator Bridge** is a **Private Cloud-Native** Convergence Layer designed to orchestrate VPP operations and provide cryptographic integrity for grid-scale energy assets. It serves as the high-throughput ingestion entry point for the GridTokenX VPP, bridging edge gateways to the optimization platform and blockchain settlement.
 
 ## Features
 
@@ -15,7 +15,7 @@ The **GridTokenX Oracle Bridge** is a **Private Cloud-Native** Convergence Layer
 
 ## 🚀 Architectural Role
 
-The Oracle Bridge is the **high-performance ingest layer**. It is decoupled from the hardware (Oracle of Edge Meter) and focuses on processing the inbound telemetry and attestation flows.
+The Aggregator Bridge is the **high-performance ingest layer**. It is decoupled from the hardware (Oracle of Edge Meter) and focuses on processing the inbound telemetry and attestation flows.
 
 1.  **Path A (Operational)**: Real-time, cryptographically signed telemetry synchronized with the VPP Platform.
 2.  **Path B (Settlement)**: Batched attestation processing and ZK-rollup generation for HyperEVM.
@@ -24,7 +24,7 @@ The Oracle Bridge is the **high-performance ingest layer**. It is decoupled from
 
 ## ⚡ Quick Start: Security Verification
 
-The Oracle Bridge requires all telemetry to be signed by registered edge devices. You can verify the security pipeline using the automated E2E suite:
+The Aggregator Bridge requires all telemetry to be signed by registered edge devices. You can verify the security pipeline using the automated E2E suite:
 
 ```bash
 # Verify the secure telemetry link (gRPC + REST)

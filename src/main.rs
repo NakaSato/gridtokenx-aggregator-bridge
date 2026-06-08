@@ -9,10 +9,10 @@ use axum::{
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 
-// The entire application now lives in the `oracle-api` crate (which itself layers over
-// oracle-logic / oracle-persistence / oracle-protocol / oracle-stacks / oracle-core).
+// The entire application now lives in the `aggregator-api` crate (which itself layers over
+// aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
-use oracle_api::{
+use aggregator_api::{
     aggregator, dispatch, grpc, handlers, infra, ingester, protocol, router, state, telemetry,
 };
 
@@ -44,9 +44,9 @@ async fn main() -> Result<()> {
     // 1. Initialize
     dotenv().ok();
     // Initialize OpenTelemetry tracing (sets up global subscriber)
-    let _telemetry_guard = telemetry::init_telemetry("gridtokenx-oracle-bridge");
+    let _telemetry_guard = telemetry::init_telemetry("gridtokenx-aggregator-bridge");
 
-    info!("🚀 Starting GridTokenX Oracle Bridge (Zone-Based Microgrid Mode)");
+    info!("🚀 Starting GridTokenX Aggregator Bridge (Zone-Based Microgrid Mode)");
 
     // 2. Configuration
     let redis_url = expand_env(
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     }
 
     info!(
-        "👂 Zone-based Oracle Bridge listening on {} zone streams",
+        "👂 Zone-based Aggregator Bridge listening on {} zone streams",
         num_zones
     );
 
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
     let kafka_producer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
         let topic = std::env::var("KAFKA_TOPIC_METER_READINGS")
             .unwrap_or_else(|_| "meter.readings".to_string());
-        match infra::kafka::OracleKafkaProducer::new(&brokers, &topic) {
+        match infra::kafka::AggregatorKafkaProducer::new(&brokers, &topic) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 warn!(
@@ -190,8 +190,8 @@ async fn main() -> Result<()> {
     // Kafka Consumer for Dispatch
     let kafka_consumer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
         let topic = std::env::var("KAFKA_TOPIC_GRID_STATUS")
-            .unwrap_or_else(|_| "gridtokenx.oracle.grid_status".to_string());
-        match infra::kafka::OracleKafkaConsumer::new(&brokers, "oracle-bridge-group", &topic) {
+            .unwrap_or_else(|_| "gridtokenx.aggregator.grid_status".to_string());
+        match infra::kafka::AggregatorKafkaConsumer::new(&brokers, "aggregator-bridge-group", &topic) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 error!("❌ Kafka consumer init failed: {}", e);
@@ -221,7 +221,7 @@ async fn main() -> Result<()> {
 
     // RabbitMQ Producer
     let rabbitmq_producer = if let Ok(url) = std::env::var("RABBITMQ_URL") {
-        match infra::rabbitmq::OracleRabbitMQProducer::new(&url).await {
+        match infra::rabbitmq::AggregatorRabbitMQProducer::new(&url).await {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 warn!(
@@ -246,7 +246,7 @@ async fn main() -> Result<()> {
     )));
 
     // Crypto: Settlement Signer
-    let settlement_signer = if let Ok(key_path) = std::env::var("ORACLE_BRIDGE_SIGNING_KEY") {
+    let settlement_signer = if let Ok(key_path) = std::env::var("AGGREGATOR_BRIDGE_SIGNING_KEY") {
         match std::fs::read(&key_path) {
             Ok(bytes) => match infra::crypto::SettlementSigner::new(&bytes) {
                 Ok(s) => Some(Arc::new(s)),
@@ -256,12 +256,12 @@ async fn main() -> Result<()> {
                 }
             },
             Err(e) => {
-                warn!("⚠️ Could not read Oracle Bridge signing key at {}: {}. Settlements will use placeholders.", key_path, e);
+                warn!("⚠️ Could not read Aggregator Bridge signing key at {}: {}. Settlements will use placeholders.", key_path, e);
                 None
             }
         }
     } else {
-        info!("ℹ️ Settlement signer disabled (ORACLE_BRIDGE_SIGNING_KEY not set)");
+        info!("ℹ️ Settlement signer disabled (AGGREGATOR_BRIDGE_SIGNING_KEY not set)");
         None
     };
     // 7c. Start UTT Settlement Engine (Path B)
@@ -360,13 +360,13 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to bind IoT Gateway listener")?;
 
-    info!("✅ Oracle Bridge + IoT Gateway initialized");
+    info!("✅ Aggregator Bridge + IoT Gateway initialized");
     info!(
         "   📡 IoT Gateway accepting connections on 0.0.0.0:{}",
         gateway_port
     );
     info!(
-        "   👂 Zone-based Oracle Bridge listening on {} zone streams",
+        "   👂 Zone-based Aggregator Bridge listening on {} zone streams",
         num_zones
     );
     info!(
@@ -375,7 +375,7 @@ async fn main() -> Result<()> {
     );
 
     // 9. Run HTTP and gRPC Servers concurrently (Industrial Standard)
-    // Default to the canonical Oracle Bridge gRPC port (:5030 per the README port
+    // Default to the canonical Aggregator Bridge gRPC port (:5030 per the README port
     // table / Envoy mesh route); override with GRPC_PORT.
     let grpc_port = std::env::var("GRPC_PORT").unwrap_or_else(|_| "5030".to_string());
     let grpc_addr: std::net::SocketAddr = format!("0.0.0.0:{}", grpc_port)
@@ -388,8 +388,8 @@ async fn main() -> Result<()> {
     );
 
     // Initialize gRPC service with platform-standard registration
-    let oracle_grpc = Arc::new(grpc::OracleServiceImpl::new(app_state.clone()));
-    let grpc_router = oracle_grpc.register_service(connectrpc::Router::new());
+    let aggregator_grpc = Arc::new(grpc::AggregatorServiceImpl::new(app_state.clone()));
+    let grpc_router = aggregator_grpc.register_service(connectrpc::Router::new());
     let grpc_server = connectrpc::Server::new(grpc_router);
 
     // 10. Start gRPC server in background
@@ -402,7 +402,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = grpc_shutdown.cancelled() => {
-                info!("🔄 Oracle Industrial gRPC Service shutting down...");
+                info!("🔄 Aggregator Industrial gRPC Service shutting down...");
             }
         }
     });

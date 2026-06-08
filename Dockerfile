@@ -22,19 +22,19 @@ EOT
 WORKDIR /app
 
 # Copy project subdirectories needed for the build
-COPY gridtokenx-oracle-bridge/ gridtokenx-oracle-bridge/
+COPY gridtokenx-aggregator-bridge/ gridtokenx-aggregator-bridge/
 COPY gridtokenx-blockchain-core/ gridtokenx-blockchain-core/
 COPY gridtokenx-iam-service/ gridtokenx-iam-service/
 COPY gridtokenx-telemetry/ gridtokenx-telemetry/
 
-WORKDIR /app/gridtokenx-oracle-bridge
+WORKDIR /app/gridtokenx-aggregator-bridge
 
 # Build in release mode with cargo cache mounts
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/gridtokenx-oracle-bridge/target \
-    cargo build --release --bin gridtokenx-oracle-bridge && \
-    strip target/release/gridtokenx-oracle-bridge && \
-    cp target/release/gridtokenx-oracle-bridge /app/oracle-bridge-bin
+    --mount=type=cache,target=/app/gridtokenx-aggregator-bridge/target \
+    cargo build --release --bin gridtokenx-aggregator-bridge && \
+    strip target/release/gridtokenx-aggregator-bridge && \
+    cp target/release/gridtokenx-aggregator-bridge /app/aggregator-bridge-bin
 
 # -----------------------------------------------------------------------------
 # Stage 2: Runtime (Minimal Debian)
@@ -60,7 +60,7 @@ EOT
 WORKDIR /app
 
 # Copy binary from builder stage
-COPY --from=builder /app/oracle-bridge-bin /app/oracle-bridge
+COPY --from=builder /app/aggregator-bridge-bin /app/aggregator-bridge
 
 # Set ownership
 RUN chown -R appuser:appgroup /app
@@ -69,4 +69,4 @@ RUN chown -R appuser:appgroup /app
 USER appuser
 
 # Run the binary
-ENTRYPOINT ["/app/oracle-bridge"]
+ENTRYPOINT ["/app/aggregator-bridge"]

@@ -1,12 +1,12 @@
 ---
 name: vpp-architect
-description: Architecture and engineering guide for the GridTokenX VPP ecosystem. Use when working on Oracle Bridge logic, Edge Device integration (Smart Meters, BESS, EV), UTT pipeline development, or PDPA-compliant ZK-rollup settlement.
+description: Architecture and engineering guide for the GridTokenX VPP ecosystem. Use when working on Aggregator Bridge logic, Edge Device integration (Smart Meters, BESS, EV), UTT pipeline development, or PDPA-compliant ZK-rollup settlement.
 ---
 
 # VPP Architect
 
 ## Overview
-GridTokenX VPP is a four-layer hybrid edge-cloud platform. This skill enforces the engineering standards for the **Oracle Bridge** and **Edge Device** integration.
+GridTokenX VPP is a four-layer hybrid edge-cloud platform. This skill enforces the engineering standards for the **Aggregator Bridge** and **Edge Device** integration.
 
 ## Core Design Principles
 1. **Unified Trusted Telemetry (UTT):** Every edge device feeds two parallel paths via a single verified entry:
@@ -18,7 +18,7 @@ GridTokenX VPP is a four-layer hybrid edge-cloud platform. This skill enforces t
 ## Layered Architecture
 - **Field Layer:** Smart Meters (RK3566 + ATECC608B) act as universal oracle nodes.
 - **Communication Layer:** EMQX MQTT 5.0 (Field-to-Edge) and Apache Kafka (Edge-to-Platform).
-- **Oracle Bridge Layer:** Cryptographic verification, ZK-rollup aggregation, and EVM relay.
+- **Aggregator Bridge Layer:** Cryptographic verification, ZK-rollup aggregation, and EVM relay.
 - **Market Layer:** HyperEVM settlement and P2P order clearance.
 
 ## Technical Standards
