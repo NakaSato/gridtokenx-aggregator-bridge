@@ -62,6 +62,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 ## Security-critical invariants (don't regress)
 
 - **Fail-closed, loud verification.** Ed25519 signatures checked against device pubkeys in Redis at `gridtokenx:devices:{meter_id}:pubkey`. Redis-unreachable must return `Err`, **never** a silent `Ok(false)` (`crates/aggregator-persistence/src/infra/crypto.rs`).
+- **Encrypted DLMS is wired (no longer a gap).** The secure v4 binary frame is AES-256-GCM; the per-device key lives at `gridtokenx:devices:{meter_id}:enckey` (64-char hex, 32 bytes) and is fetched by `DeviceKeyRegistry` (self-healing, mirrors the verifier). gRPC ingest resolves + decrypts in `decode_secure_frame`; the branch policy is the pure `apply_dlms_key_policy` (`crates/aggregator-api/src/grpc/service.rs`). Under `ENVIRONMENT=production`, a missing `enckey` ⇒ frame **skipped** (fail-closed, never silent plaintext). The dev plaintext fallback is gated behind `ALLOW_PLAINTEXT_DLMS=true` and logged loud — don't decode plaintext by default.
 - **Self-healing connections.** The `SignatureVerifier` owns a Redis *URL* (not a one-shot connection) and rebuilds + retries once on transport error (`get_with_retry`). The `Router::disseminate` publisher does the same for `XADD`. This is why a Redis restart no longer freezes the bridge — preserve it.
 - **Production enforcement.** `ENVIRONMENT=production` makes signature verification strict.
 - Auth falls back to static `GRIDTOKENX_API_KEYS` (comma-separated) when the IAM gRPC client is unavailable.
@@ -70,4 +71,5 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 
 Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `IOT_GATEWAY_PORT`, `GRPC_PORT`, `GRIDTOKENX_API_KEYS`,
 `IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `AGGREGATOR_BRIDGE_SIGNING_KEY`,
-`SETTLEMENT_API_URL`, `IOT_NUM_ZONES` (default 10).
+`SETTLEMENT_API_URL`, `IOT_NUM_ZONES` (default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS
+decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow plaintext v4 frames when a device has no `enckey`).

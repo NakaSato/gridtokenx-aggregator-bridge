@@ -92,11 +92,14 @@ fallback. Gate dev bypass behind the existing `SKIP_SIG_VERIFY`-style flag or a 
       `None` (fail-closed-loud, the helper's `get_device_aes_key` `Err` arm).
 - [x] Dev plaintext fallback gated behind new `ALLOW_PLAINTEXT_DLMS=true`; logged loud when used.
 
-### 5. Docs
-- [ ] [ARCHITECTURE.md](ARCHITECTURE.md) §3 ingestion pipeline: add the decryption step + key convention,
-      with `binary_decoder.rs:line` citations.
-- [ ] [CLAUDE.md](CLAUDE.md) "Real gap" note: flip to "encrypted DLMS wired; key at `…:enckey`".
-- [ ] Update `.env.example` if a new flag (`ALLOW_PLAINTEXT_DLMS`) is added.
+### 5. Docs — ✅ DONE (doc-lint clean)
+- [x] [ARCHITECTURE.md](ARCHITECTURE.md) §3 ingestion pipeline: added the "Secure DLMS decryption" bullet
+      (resolve order + key convention) with `binary_decoder.rs:32/48/98` and `service.rs:55/94` citations.
+- [x] [CLAUDE.md](CLAUDE.md) security-invariants: added "Encrypted DLMS is wired (no longer a gap)" —
+      `…:enckey`, `DeviceKeyRegistry`, production fail-closed, `ALLOW_PLAINTEXT_DLMS` dev gate. Flag added
+      to the Config key-vars list too.
+- [x] `.env.example` Security section: documented `ENVIRONMENT=production` (strict sig + DLMS) and new
+      `ALLOW_PLAINTEXT_DLMS` (dev-only, default off, logged loud).
 
 ---
 

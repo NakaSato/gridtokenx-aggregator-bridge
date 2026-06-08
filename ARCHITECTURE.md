@@ -28,6 +28,23 @@
   `crates/aggregator-persistence/src/infra/crypto.rs:81`) so a Redis restart no longer
   freezes verification. Redis-unreachable returns a loud `Err`, **not** a silent
   `Ok(false)` — fail-closed but observable.
+- **Secure DLMS decryption (per-device key).** The v4 UTT-S+ binary frame is
+  AES-256-GCM encrypted; its header (version, manuf ID, LDN, timestamp) is
+  plaintext and precedes the ciphertext, so the resolve order is
+  `parse_header → meter_id (LDN) → fetch enckey → parse(bytes, Some(key))`.
+  The header-only parse runs CRC-32 + version check, no decrypt (`DlmsHeader` /
+  `parse_header`, verified `crates/aggregator-stacks/src/binary_decoder.rs:32`,
+  `:48`); full decrypt is `parse(payload, Some(key))`
+  (`crates/aggregator-stacks/src/binary_decoder.rs:98`). The per-device AES-256
+  key lives in Redis at `gridtokenx:devices:{meter_id}:enckey` (64-char hex, 32
+  bytes), fetched by the self-healing `DeviceKeyRegistry` (mirrors the verifier).
+  The gRPC ingest path resolves + decrypts in `decode_secure_frame`
+  (`crates/aggregator-api/src/grpc/service.rs:55`); the branch policy is the pure
+  `apply_dlms_key_policy` (`:94`). **Fail-closed:** under `ENVIRONMENT=production`
+  a frame whose `enckey` is missing is skipped (never decoded plaintext); the
+  dev/legacy plaintext fallback is gated behind `ALLOW_PLAINTEXT_DLMS=true` and
+  logged loud. Redis-unreachable / malformed key ⇒ loud skip, never a silent
+  plaintext decode.
 - **Protocol auto-detect.** When an ingest request sets `protocol = "auto"` (or
   omits it), the stack is chosen from the payload field set — dlms / ocpp /
   openadr / sunspec, defaulting to dlms (`detect_protocol`, verified
