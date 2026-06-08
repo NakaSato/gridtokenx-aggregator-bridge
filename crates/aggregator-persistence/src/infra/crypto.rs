@@ -247,6 +247,167 @@ impl SignatureVerifier {
     }
 }
 
+/// Decode a hex-encoded AES-256 key to 32 raw bytes. Errors loudly on invalid
+/// hex or a wrong length — a truncated/padded symmetric key silently produces
+/// garbage plaintext, so we reject rather than coerce.
+fn decode_aes_key_hex(meter_id: &str, raw: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(raw.trim())
+        .map_err(|e| anyhow!("Failed to decode hex enckey for {}: {}", meter_id, e))?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow!(
+            "enckey for {} has wrong length: {} bytes (expected 32)",
+            meter_id,
+            v.len()
+        )
+    })
+}
+
+/// Fetches per-device AES-256 symmetric keys from Redis
+/// (`gridtokenx:devices:{meter_id}:enckey`, 64-char hex) for decrypting secure
+/// UTT-S+ v4 binary DLMS frames.
+///
+/// Mirrors [`SignatureVerifier`]'s self-healing connection: the Redis URL is
+/// owned (not a one-shot connection) and the manager is transparently rebuilt
+/// after a transport error, so a Redis restart does not freeze decryption. A
+/// genuinely-unreachable Redis returns a loud `Err` (fail-closed), never a
+/// silent `Ok(None)` — an absent key and a dead connection must stay
+/// distinguishable, exactly as for signature verification.
+pub struct DeviceKeyRegistry {
+    redis_url: Option<String>,
+    conn: Arc<Mutex<Option<ConnectionManager>>>,
+}
+
+impl DeviceKeyRegistry {
+    /// Construct from a Redis URL; connection built on first use and rebuilt on
+    /// failure.
+    pub fn new(redis_url: Option<String>) -> Self {
+        Self {
+            redis_url,
+            conn: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Construct from an already-established manager (cannot fully rebuild after
+    /// a hard failure without a URL — prefer [`DeviceKeyRegistry::new`]).
+    pub fn from_manager(conn: Option<ConnectionManager>) -> Self {
+        Self {
+            redis_url: None,
+            conn: Arc::new(Mutex::new(conn)),
+        }
+    }
+
+    async fn conn(&self) -> Result<ConnectionManager> {
+        {
+            let guard = self.conn.lock().await;
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        let url = self.redis_url.as_ref().ok_or_else(|| {
+            anyhow!("DeviceKeyRegistry has no live Redis connection or URL; cannot fetch device AES keys")
+        })?;
+        let client = redis::Client::open(url.clone())
+            .map_err(|e| anyhow!("Failed to open Redis client {}: {}", url, e))?;
+        let mgr = ConnectionManager::new(client)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to Redis {}: {}", url, e))?;
+        let mut guard = self.conn.lock().await;
+        *guard = Some(mgr.clone());
+        Ok(mgr)
+    }
+
+    async fn invalidate(&self) {
+        if self.redis_url.is_some() {
+            let mut guard = self.conn.lock().await;
+            *guard = None;
+        }
+    }
+
+    /// GET a key, rebuilding the connection and retrying once on transport error.
+    async fn get_with_retry(&self, key: &str) -> Result<Option<String>> {
+        let mut conn = self.conn().await?;
+        match conn.get::<_, Option<String>>(key).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                warn!(
+                    "⚠️ Redis enckey lookup error for {} ({}); rebuilding connection and retrying",
+                    key, e
+                );
+                self.invalidate().await;
+                let mut conn2 = self.conn().await?;
+                conn2.get::<_, Option<String>>(key).await.map_err(|e2| {
+                    anyhow!("Redis enckey lookup failed for {} after reconnect: {}", key, e2)
+                })
+            }
+        }
+    }
+
+    /// MGET keys, rebuilding the connection and retrying once on transport error.
+    async fn mget_with_retry(&self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        let mut conn = self.conn().await?;
+        match conn.mget::<_, Vec<Option<String>>>(keys).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                warn!(
+                    "⚠️ Redis enckey MGET error ({}); rebuilding connection and retrying",
+                    e
+                );
+                self.invalidate().await;
+                let mut conn2 = self.conn().await?;
+                conn2
+                    .mget::<_, Vec<Option<String>>>(keys)
+                    .await
+                    .map_err(|e2| anyhow!("Redis enckey MGET failed after reconnect: {}", e2))
+            }
+        }
+    }
+
+    /// Fetch one device's AES-256 key. `Ok(None)` only when the key is genuinely
+    /// absent; `Err` on Redis-unreachable (fail-closed) or a malformed/wrong-length
+    /// key (never truncate or pad).
+    pub async fn get_device_aes_key(&self, meter_id: &str) -> Result<Option<[u8; 32]>> {
+        let key = format!("gridtokenx:devices:{}:enckey", meter_id);
+        match self.get_with_retry(&key).await? {
+            Some(hex_str) => Ok(Some(decode_aes_key_hex(meter_id, &hex_str)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Batch fetch via a single MGET (same round-trip shape as
+    /// [`SignatureVerifier::verify_telemetry_signature_batch`], so decrypt and
+    /// sig-verify stay aligned). A genuinely-absent key ⇒ `None`. Unlike the
+    /// single path, a *malformed* key for one meter is logged and yields `None`
+    /// for that entry so one bad key cannot fail the whole batch; Redis-unreachable
+    /// still fails the whole call loudly.
+    pub async fn get_device_aes_keys(
+        &self,
+        meter_ids: &[String],
+    ) -> Result<Vec<Option<[u8; 32]>>> {
+        let keys: Vec<String> = meter_ids
+            .iter()
+            .map(|id| format!("gridtokenx:devices:{}:enckey", id))
+            .collect();
+
+        let raw: Vec<Option<String>> = self.mget_with_retry(&keys).await?;
+
+        let mut out = Vec::with_capacity(meter_ids.len());
+        for (i, slot) in raw.into_iter().enumerate() {
+            let parsed = match slot {
+                Some(hex_str) => match decode_aes_key_hex(&meter_ids[i], &hex_str) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        warn!("🚫 Skipping malformed enckey in batch: {}", e);
+                        None
+                    }
+                },
+                None => None,
+            };
+            out.push(parsed);
+        }
+        Ok(out)
+    }
+}
+
 pub struct SettlementSigner {
     signing_key: SigningKey,
 }
@@ -342,6 +503,60 @@ mod tests {
         assert!(verifying_key
             .verify(b"user:meter:99.9:1000:2000", &signature)
             .is_err());
+    }
+
+    /// Fail-closed-loud guard for the AES key path, mirroring
+    /// `verify_errors_loud_when_no_redis_url`: no Redis URL ⇒ `Err`, never a
+    /// silent `Ok(None)` (a dead connection must not look like an absent key).
+    #[tokio::test]
+    async fn get_aes_key_errors_loud_when_no_redis_url() {
+        let r = DeviceKeyRegistry::new(None);
+        let res = r.get_device_aes_key("meter-1").await;
+        assert!(res.is_err(), "no-URL registry must Err, got Ok({:?})", res.ok());
+    }
+
+    /// Same guard for the batch path — Redis-unreachable fails the whole call.
+    #[tokio::test]
+    async fn get_aes_keys_batch_errors_loud_when_no_redis_url() {
+        let r = DeviceKeyRegistry::new(None);
+        let res = r.get_device_aes_keys(&["meter-1".to_string()]).await;
+        assert!(res.is_err(), "no-URL registry must Err, got Ok({:?})", res.ok());
+    }
+
+    /// A present-but-malformed key is a hard `Err` on the single path (never
+    /// truncate/pad a symmetric key).
+    #[test]
+    fn decode_aes_key_rejects_bad_hex() {
+        assert!(decode_aes_key_hex("m", "nothex!!").is_err());
+    }
+
+    /// Wrong-length (valid hex, 16 bytes) ⇒ `Err`, not a padded 32-byte key.
+    #[test]
+    fn decode_aes_key_rejects_wrong_length() {
+        let half = "00".repeat(16); // 32 hex chars = 16 bytes
+        assert!(decode_aes_key_hex("m", &half).is_err());
+    }
+
+    /// Exactly 64 hex chars ⇒ 32 raw bytes, trimmed.
+    #[test]
+    fn decode_aes_key_accepts_32_bytes() {
+        let hexkey = "ab".repeat(32); // 64 chars
+        let k = decode_aes_key_hex("m", &format!("  {}\n", hexkey)).unwrap();
+        assert_eq!(k, [0xabu8; 32]);
+    }
+
+    /// Live Redis: missing enckey ⇒ `Ok(None)`; seeded key ⇒ `Ok(Some(32 bytes))`.
+    #[tokio::test]
+    #[ignore = "requires REDIS_URL (default redis://localhost:7010)"]
+    async fn get_aes_key_against_real_redis() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:7010".to_string());
+        let r = DeviceKeyRegistry::new(Some(url));
+        let got = r
+            .get_device_aes_key("__nonexistent__")
+            .await
+            .expect("get_device_aes_key should connect to Redis");
+        assert!(got.is_none());
     }
 
     /// Live reconnect check — exercises `get_with_retry` against a real Redis.
