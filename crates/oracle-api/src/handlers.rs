@@ -35,6 +35,38 @@ pub fn signature_enforcement_disabled() -> bool {
     std::env::var("ORACLE_ALLOW_UNVERIFIED_TELEMETRY").unwrap_or_default() == "true"
 }
 
+/// The numeric field a device of `protocol` signs in its canonical
+/// `{device_id}:{value}:{timestamp}` Ed25519 sign-target.
+///
+/// DLMS-family meters sign net/consumed/generated energy (kWh); other stacks
+/// sign their native primary measure — OCPP `energy_wh`, SunSpec `WH`, OpenADR
+/// `actual_kw`. Falls back to the DLMS energy fields so an unrecognized
+/// protocol still has a canonical value to verify against.
+fn canonical_sign_value(protocol: &str, payload: &serde_json::Value) -> String {
+    fn num(payload: &serde_json::Value, key: &str) -> Option<f64> {
+        payload
+            .get(key)
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    }
+    let dlms_energy = || {
+        num(payload, "kwh")
+            .or_else(|| num(payload, "energy_consumed"))
+            .or_else(|| num(payload, "energy_generated"))
+            .unwrap_or(0.0)
+    };
+    let value = match protocol {
+        "ocpp" => num(payload, "energy_wh").unwrap_or_else(dlms_energy),
+        "sunspec" => num(payload, "WH")
+            .or_else(|| num(payload, "W"))
+            .unwrap_or_else(dlms_energy),
+        "openadr" => num(payload, "actual_kw")
+            .or_else(|| num(payload, "baseload_kw"))
+            .unwrap_or_else(dlms_energy),
+        _ => dlms_energy(),
+    };
+    value.to_string()
+}
+
 async fn verify_rest_signature(
     state: &AppState,
     device_id: &str,
@@ -144,11 +176,35 @@ pub async fn ingest_private_network(
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0);
 
+    // Resolve the protocol first. `auto` (or an empty protocol field) triggers
+    // field-based detection so signature verification can use the protocol-native
+    // canonical measure (OCPP `energy_wh`, SunSpec `WH`, …) rather than assuming
+    // DLMS energy fields.
+    let mut protocol = payload.protocol.to_lowercase();
+    if protocol.is_empty() || protocol == "auto" {
+        protocol = crate::protocol::stacks::detect_protocol(&payload.payload).to_string();
+        info!(
+            "🔎 Auto-detected protocol '{}' for {}",
+            protocol, payload.device_id
+        );
+    }
+
+    const SUPPORTED: [&str; 5] = ["dlms", "ocpp", "openadr", "sunspec", "simulator"];
+    if !SUPPORTED.contains(&protocol.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Unsupported protocol: {}", protocol) })),
+        )
+            .into_response();
+    }
+
     // The `simulator` protocol is an explicit unsigned dev ingest path (mirrors
     // the batch handler's simulator bypass); everything else must carry a valid
-    // signature. Fail-CLOSED by default: reject invalid/unverifiable telemetry
-    // unless ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true.
-    let is_simulator = payload.protocol.eq_ignore_ascii_case("simulator");
+    // signature over the protocol-native canonical value. Fail-CLOSED by default:
+    // reject invalid/unverifiable telemetry unless
+    // ORACLE_ALLOW_UNVERIFIED_TELEMETRY=true.
+    let canonical_value = canonical_sign_value(&protocol, &payload.payload);
+    let is_simulator = protocol == "simulator";
     let sig_verified = if is_simulator {
         true
     } else {
@@ -157,7 +213,7 @@ pub async fn ingest_private_network(
             &payload.device_id,
             &payload.payload,
             signature,
-            &kwh,
+            &canonical_value,
             timestamp_ms,
         )
         .await
@@ -196,27 +252,6 @@ pub async fn ingest_private_network(
             }
         }
     };
-
-    // Dynamic routing to specialized protocol stacks. `auto` (or an empty
-    // protocol field) triggers field-based detection from the payload so
-    // callers don't have to hard-code the stack per device.
-    let mut protocol = payload.protocol.to_lowercase();
-    if protocol.is_empty() || protocol == "auto" {
-        protocol = crate::protocol::stacks::detect_protocol(&payload.payload).to_string();
-        info!(
-            "🔎 Auto-detected protocol '{}' for {}",
-            protocol, payload.device_id
-        );
-    }
-
-    const SUPPORTED: [&str; 5] = ["dlms", "ocpp", "openadr", "sunspec", "simulator"];
-    if !SUPPORTED.contains(&protocol.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("Unsupported protocol: {}", protocol) })),
-        )
-            .into_response();
-    }
 
     // Special handling for simulator/json protocol to avoid DLMS stack failure
     if protocol == "simulator" {
@@ -386,6 +421,7 @@ pub async fn ingest_private_network_batch(
             .map(|dt| dt.timestamp_millis())
             .unwrap_or(0);
 
+        let canonical_value = canonical_sign_value(&protocol, &item);
         let is_verified = if protocol == "simulator" {
             true // Skip signature for simulator mode
         } else {
@@ -394,7 +430,7 @@ pub async fn ingest_private_network_batch(
                 device_id,
                 &item,
                 signature,
-                &kwh,
+                &canonical_value,
                 timestamp_ms,
             )
             .await
@@ -476,6 +512,54 @@ pub async fn ingest_private_network_batch(
 // =============================================================================
 // Shared Dissemination
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_sign_value;
+    use serde_json::json;
+
+    #[test]
+    fn ocpp_signs_energy_wh() {
+        let p = json!({"energy_wh": 15000.0, "kwh": 1.0});
+        assert_eq!(canonical_sign_value("ocpp", &p), "15000");
+    }
+
+    #[test]
+    fn sunspec_signs_wh_not_watts() {
+        let p = json!({"W": 5000.0, "WH": 12345.0, "St": 4});
+        assert_eq!(canonical_sign_value("sunspec", &p), "12345");
+    }
+
+    #[test]
+    fn openadr_signs_actual_kw() {
+        let p = json!({"baseload_kw": 3.0, "actual_kw": 2.4});
+        assert_eq!(canonical_sign_value("openadr", &p), "2.4");
+    }
+
+    #[test]
+    fn dlms_signs_kwh() {
+        let p = json!({"kwh": 1.5, "energy_consumed": 1.0});
+        assert_eq!(canonical_sign_value("dlms", &p), "1.5");
+    }
+
+    #[test]
+    fn unknown_protocol_falls_back_to_dlms_energy() {
+        let p = json!({"energy_generated": 3.0});
+        assert_eq!(canonical_sign_value("mystery", &p), "3");
+    }
+
+    #[test]
+    fn ocpp_without_energy_wh_falls_back_to_dlms_energy() {
+        let p = json!({"energy_consumed": 2.0});
+        assert_eq!(canonical_sign_value("ocpp", &p), "2");
+    }
+
+    #[test]
+    fn parses_stringified_numbers() {
+        let p = json!({"energy_wh": "15000"});
+        assert_eq!(canonical_sign_value("ocpp", &p), "15000");
+    }
+}
 
 pub async fn disseminate_reading(
     state: &AppState,
