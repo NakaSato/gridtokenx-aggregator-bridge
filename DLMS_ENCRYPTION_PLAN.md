@@ -128,13 +128,29 @@ fallback. Gate dev bypass behind the existing `SKIP_SIG_VERIFY`-style flag or a 
 - [x] `#[ignore]` live batch: mixed seeded/malformed/absent ⇒ `[Some(32B), None, None]`
       (`get_aes_keys_batch_mixed_against_real_redis`).
 
-### gRPC ingest integration (`aggregator-api`)
-- [ ] Encrypted frame + seeded `enckey` ⇒ decrypted, disseminated, `processed_count == 1`.
-- [ ] Encrypted frame + **missing** key under `ENVIRONMENT=production` ⇒ frame skipped, not processed.
-- [ ] Encrypted frame + missing key in dev with plaintext flag off ⇒ skipped + warn.
-- [ ] Plaintext frame in dev with flag on ⇒ processed.
-- [ ] Bulk path: mixed batch (some keyed, some not) processes only the decryptable+verified frames.
-- [ ] Decryption failure does **not** bypass the existing Ed25519 signature gate (both must pass).
+### Decode policy (`aggregator-api`, inline) — ✅ DONE (7 unit, +pure-fn refactor)
+The decode decision was extracted into a pure free fn `apply_dlms_key_policy(frame, meter_id, key,
+is_production, allow_plaintext)` (Redis-/AppState-free), so the full branch matrix is unit-testable
+without a gRPC/Redis harness. `decode_secure_frame` = header-parse + Redis fetch (fail-closed-loud) +
+this fn. Frames built in-test via `aes-gcm`/`crc32fast` dev-deps.
+- [x] Encrypted frame + correct resolved key ⇒ decoded, `import_wh == 5000`
+      (`policy_decrypts_with_correct_key`).
+- [x] Encrypted frame + wrong key ⇒ `None` (GCM auth fail, no garbage TLVs)
+      (`policy_rejects_wrong_key`).
+- [x] Keyed device sent plaintext ⇒ `None` (must encrypt) (`policy_keyed_device_must_encrypt`).
+- [x] Encrypted frame + **no** key under production ⇒ `None`, never plaintext
+      (`policy_production_no_key_rejects`).
+- [x] Dev + no key + flag off ⇒ `None` (default-deny) (`policy_dev_no_key_no_flag_rejects`).
+- [x] Dev + no key + `ALLOW_PLAINTEXT_DLMS` on + plaintext frame ⇒ decoded
+      (`policy_dev_plaintext_flag_decodes_plaintext_frame`).
+- [x] Production overrides the plaintext flag — prod + no key + flag on ⇒ `None`
+      (`policy_production_overrides_plaintext_flag`).
+
+### gRPC ingest integration — deferred (needs full AppState + Redis + dissemination harness)
+Not yet built — no `AppState` test constructor exists; the decode policy above is covered as pure
+unit tests instead. The Redis key-fetch (fail-closed-loud) is covered by the live registry tests in
+`aggregator-persistence`. Full end-to-end (seeded `enckey` ⇒ `processed_count == 1`, mixed bulk batch,
+decrypt-fail does-not-bypass-sig) remains a gap if an integration harness is added later.
 
 ### Regression guards
 - [ ] Existing `verify_errors_loud_when_no_redis_url` / `_no_manager` still pass (no crypto coupling break).

@@ -97,6 +97,7 @@ dependencies = [
 name = "aggregator-api"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "aggregator-core",
  "aggregator-logic",
  "aggregator-persistence",
@@ -107,6 +108,7 @@ dependencies = [
  "buffa",
  "chrono",
  "connectrpc",
+ "crc32fast",
  "gridtokenx-telemetry",
  "hex",
  "http",

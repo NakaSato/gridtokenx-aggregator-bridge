@@ -75,41 +75,63 @@ impl AggregatorServiceImpl {
             }
         };
 
-        match key {
-            Some(k) => match DlmsBinaryFrame::parse(frame_bytes, Some(&k)) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    warn!("🚫 DLMS decrypt failed for meter={}: {} — frame skipped", meter_id, e);
-                    None
-                }
-            },
-            None if is_production => {
-                warn!(
-                    "🚫 No enckey for meter={} under ENVIRONMENT=production — frame skipped (fail-closed)",
-                    meter_id
-                );
+        // Pure decision — Redis already resolved. Unit-tested without AppState/Redis.
+        apply_dlms_key_policy(frame_bytes, meter_id, key, is_production, allow_plaintext)
+    }
+}
+
+/// Pure decode-policy decision for a secure v4 DLMS frame, given the already-resolved per-device key.
+///
+/// Redis- and AppState-free so the full branch matrix is unit-testable. The caller
+/// ([`AggregatorServiceImpl::decode_secure_frame`]) handles the fail-closed-loud Redis-error path
+/// *before* this is reached; here `key` is either the genuinely-resolved enckey (`Some`) or a
+/// genuinely-absent key (`None`).
+///
+/// - `Some(key)`: decrypt; GCM auth failure ⇒ `None` (skip, never garbage TLVs).
+/// - `None` + production: reject (`None`) — never plaintext-decode an unkeyed frame.
+/// - `None` + `allow_plaintext`: plaintext fallback (dev only, logged loud).
+/// - `None` otherwise: skip.
+fn apply_dlms_key_policy(
+    frame_bytes: &[u8],
+    meter_id: &str,
+    key: Option<[u8; 32]>,
+    is_production: bool,
+    allow_plaintext: bool,
+) -> Option<DlmsBinaryFrame> {
+    match key {
+        Some(k) => match DlmsBinaryFrame::parse(frame_bytes, Some(&k)) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                warn!("🚫 DLMS decrypt failed for meter={}: {} — frame skipped", meter_id, e);
                 None
             }
-            None if allow_plaintext => match DlmsBinaryFrame::parse(frame_bytes, None) {
-                Ok(f) => {
-                    warn!(
-                        "⚠️ ALLOW_PLAINTEXT_DLMS=true — meter={} decoded as PLAINTEXT (dev only)",
-                        meter_id
-                    );
-                    Some(f)
-                }
-                Err(e) => {
-                    warn!("⚠️ DLMS plaintext parse failed for meter={}: {}", meter_id, e);
-                    None
-                }
-            },
-            None => {
+        },
+        None if is_production => {
+            warn!(
+                "🚫 No enckey for meter={} under ENVIRONMENT=production — frame skipped (fail-closed)",
+                meter_id
+            );
+            None
+        }
+        None if allow_plaintext => match DlmsBinaryFrame::parse(frame_bytes, None) {
+            Ok(f) => {
                 warn!(
-                    "🚫 No enckey for meter={} and ALLOW_PLAINTEXT_DLMS not set — frame skipped",
+                    "⚠️ ALLOW_PLAINTEXT_DLMS=true — meter={} decoded as PLAINTEXT (dev only)",
                     meter_id
                 );
+                Some(f)
+            }
+            Err(e) => {
+                warn!("⚠️ DLMS plaintext parse failed for meter={}: {}", meter_id, e);
                 None
             }
+        },
+        None => {
+            warn!(
+                "🚫 No enckey for meter={} and ALLOW_PLAINTEXT_DLMS not set — frame skipped",
+                meter_id
+            );
+            None
         }
     }
 }
@@ -452,5 +474,117 @@ impl OracleService for AggregatorServiceImpl {
             },
             ctx,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
+    use crc32fast::Hasher;
+
+    const V4: u8 = 0x04;
+    const METER: &str = "METER042";
+
+    /// Build a well-formed v4 frame carrying one import-energy TLV (tag 1 = 5000 Wh).
+    /// `key = Some` ⇒ AES-256-GCM encrypted block; `key = None` ⇒ plaintext TLV block.
+    fn build_frame(key: Option<&[u8; 32]>, ldn: &str) -> Vec<u8> {
+        let manuf = b"INC";
+        let ts_bytes = 1700000000_u64.to_be_bytes();
+
+        let mut tlv = Vec::new();
+        tlv.push(1);
+        tlv.push(8);
+        tlv.extend_from_slice(&5000_u64.to_be_bytes());
+
+        let block = match key {
+            Some(k) => {
+                let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k));
+                let mut nonce = [0u8; 12];
+                nonce[0..3].copy_from_slice(manuf);
+                nonce[3..11].copy_from_slice(&ts_bytes);
+                nonce[11] = V4;
+                cipher.encrypt(Nonce::from_slice(&nonce), tlv.as_slice()).unwrap()
+            }
+            None => tlv,
+        };
+
+        let mut ldn_bytes = [0u8; 8];
+        let src = ldn.as_bytes();
+        let n = src.len().min(8);
+        ldn_bytes[..n].copy_from_slice(&src[..n]);
+
+        let mut p = Vec::new();
+        p.push(V4);
+        p.push(0); // total-length placeholder
+        p.extend_from_slice(manuf);
+        p.extend_from_slice(&ldn_bytes);
+        p.extend_from_slice(&ts_bytes);
+        p.extend_from_slice(&block);
+        p[1] = (p.len() - 2 + 4) as u8;
+        let mut h = Hasher::new();
+        h.update(&p);
+        p.extend_from_slice(&h.finalize().to_be_bytes());
+        p
+    }
+
+    // --- the resolved-key is present ---
+
+    #[test]
+    fn policy_decrypts_with_correct_key() {
+        let key = [7u8; 32];
+        let frame = build_frame(Some(&key), METER);
+        let out = apply_dlms_key_policy(&frame, METER, Some(key), false, false);
+        assert_eq!(out.unwrap().active_energy_import_wh, Some(5000));
+    }
+
+    #[test]
+    fn policy_rejects_wrong_key() {
+        let frame = build_frame(Some(&[7u8; 32]), METER);
+        // GCM auth-tag failure ⇒ skip, never garbage TLVs.
+        let out = apply_dlms_key_policy(&frame, METER, Some([9u8; 32]), false, false);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn policy_keyed_device_must_encrypt() {
+        // Device has an enckey but sent a plaintext frame ⇒ GCM decrypt fails ⇒ rejected.
+        let frame = build_frame(None, METER);
+        let out = apply_dlms_key_policy(&frame, METER, Some([7u8; 32]), false, false);
+        assert!(out.is_none());
+    }
+
+    // --- no key provisioned (genuinely absent) ---
+
+    #[test]
+    fn policy_production_no_key_rejects() {
+        // Fail-closed: encrypted frame, no enckey, production ⇒ never plaintext-decode.
+        let frame = build_frame(Some(&[7u8; 32]), METER);
+        let out = apply_dlms_key_policy(&frame, METER, None, true, false);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn policy_dev_no_key_no_flag_rejects() {
+        // Dev, no enckey, ALLOW_PLAINTEXT_DLMS off ⇒ skip (default-deny).
+        let frame = build_frame(Some(&[7u8; 32]), METER);
+        let out = apply_dlms_key_policy(&frame, METER, None, false, false);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn policy_dev_plaintext_flag_decodes_plaintext_frame() {
+        // Dev escape hatch: no enckey + flag on + genuinely-plaintext frame ⇒ decoded.
+        let frame = build_frame(None, METER);
+        let out = apply_dlms_key_policy(&frame, METER, None, false, true);
+        assert_eq!(out.unwrap().active_energy_import_wh, Some(5000));
+    }
+
+    #[test]
+    fn policy_production_overrides_plaintext_flag() {
+        // Even if ALLOW_PLAINTEXT_DLMS is set, production + no key still rejects (prod wins).
+        let frame = build_frame(None, METER);
+        let out = apply_dlms_key_policy(&frame, METER, None, true, true);
+        assert!(out.is_none());
     }
 }

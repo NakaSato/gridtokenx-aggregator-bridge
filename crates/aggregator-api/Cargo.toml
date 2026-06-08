@@ -46,3 +46,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.24"
+
+[dev-dependencies]
+# Build secure v4 DLMS frames in-test to exercise decode_secure_frame's policy matrix.
+aes-gcm = "0.10"
+crc32fast = "1.4"
