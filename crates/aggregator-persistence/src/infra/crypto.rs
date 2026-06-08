@@ -551,12 +551,69 @@ mod tests {
     async fn get_aes_key_against_real_redis() {
         let url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:7010".to_string());
-        let r = DeviceKeyRegistry::new(Some(url));
+        let r = DeviceKeyRegistry::new(Some(url.clone()));
+
+        // Missing key ⇒ Ok(None).
         let got = r
             .get_device_aes_key("__nonexistent__")
             .await
             .expect("get_device_aes_key should connect to Redis");
         assert!(got.is_none());
+
+        // Seed a key, read it back as 32 raw bytes, then clean up.
+        let meter = "__test_seeded__";
+        let hexkey = "cd".repeat(32); // 64 chars ⇒ 32 bytes of 0xcd
+        seed_enckey(&url, meter, &hexkey).await;
+        let got = r
+            .get_device_aes_key(meter)
+            .await
+            .expect("seeded key should read")
+            .expect("seeded key should be present");
+        assert_eq!(got, [0xcdu8; 32]);
+        del_enckey(&url, meter).await;
+    }
+
+    /// Live Redis batch: mixed meters — seeded / absent / malformed ⇒
+    /// `[Some(32 bytes), None, None]` (malformed never fails the whole batch).
+    #[tokio::test]
+    #[ignore = "requires REDIS_URL (default redis://localhost:7010)"]
+    async fn get_aes_keys_batch_mixed_against_real_redis() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:7010".to_string());
+        let r = DeviceKeyRegistry::new(Some(url.clone()));
+
+        let good = "__batch_good__";
+        let bad = "__batch_bad__";
+        let absent = "__batch_absent__";
+        seed_enckey(&url, good, &"ef".repeat(32)).await; // valid 32-byte key
+        seed_enckey(&url, bad, "not-valid-hex").await; // malformed ⇒ None
+        del_enckey(&url, absent).await; // ensure absent ⇒ None
+
+        let got = r
+            .get_device_aes_keys(&[good.to_string(), bad.to_string(), absent.to_string()])
+            .await
+            .expect("batch should connect to Redis");
+
+        assert_eq!(got[0], Some([0xefu8; 32]));
+        assert_eq!(got[1], None);
+        assert_eq!(got[2], None);
+
+        del_enckey(&url, good).await;
+        del_enckey(&url, bad).await;
+    }
+
+    async fn seed_enckey(url: &str, meter: &str, hexkey: &str) {
+        let client = redis::Client::open(url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!("gridtokenx:devices:{}:enckey", meter);
+        let _: () = conn.set(&key, hexkey).await.unwrap();
+    }
+
+    async fn del_enckey(url: &str, meter: &str) {
+        let client = redis::Client::open(url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!("gridtokenx:devices:{}:enckey", meter);
+        let _: () = conn.del(&key).await.unwrap();
     }
 
     /// Live reconnect check — exercises `get_with_retry` against a real Redis.
