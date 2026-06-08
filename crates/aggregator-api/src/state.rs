@@ -63,5 +63,8 @@ pub struct AppState {
     pub kafka_producer: Option<Arc<crate::infra::kafka::AggregatorKafkaProducer>>,
     pub rabbitmq_producer: Option<Arc<crate::infra::rabbitmq::AggregatorRabbitMQProducer>>,
     pub signature_verifier: Arc<crate::infra::crypto::SignatureVerifier>,
+    // Per-device AES-256 key registry for decrypting secure v4 DLMS frames.
+    // Self-healing Redis (mirrors signature_verifier); reads `…:enckey`.
+    pub device_key_registry: Arc<crate::infra::crypto::DeviceKeyRegistry>,
     pub meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
 }

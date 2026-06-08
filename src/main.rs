@@ -245,6 +245,13 @@ async fn main() -> Result<()> {
         redis_url.clone(),
     )));
 
+    // Crypto: Per-device AES key registry (decrypts secure v4 DLMS frames).
+    // Same self-healing Redis URL ownership as the verifier — survives a Redis
+    // restart without freezing decryption.
+    let device_key_registry = Arc::new(infra::crypto::DeviceKeyRegistry::new(Some(
+        redis_url.clone(),
+    )));
+
     // Crypto: Settlement Signer
     let settlement_signer = if let Ok(key_path) = std::env::var("AGGREGATOR_BRIDGE_SIGNING_KEY") {
         match std::fs::read(&key_path) {
@@ -323,6 +330,7 @@ async fn main() -> Result<()> {
         kafka_producer,
         rabbitmq_producer,
         signature_verifier,
+        device_key_registry,
         meter_registry,
     };
 

@@ -35,6 +35,83 @@ impl AggregatorServiceImpl {
         use proto::OracleServiceExt;
         self.register(router)
     }
+
+    /// Resolve the per-device AES key and decrypt+parse a secure v4 DLMS frame.
+    ///
+    /// Order (the decoder stays key-agnostic; the lookup lives here, not in `aggregator-stacks`):
+    /// `parse_header` → LDN (`meter_id`) → `device_key_registry.get_device_aes_key` →
+    /// `parse(bytes, Some(key))`.
+    ///
+    /// Policy mirrors the Ed25519 signature gate (skip-frame, not panic):
+    /// - **production** (`ENVIRONMENT=production`): a missing/invalid `enckey` ⇒ frame **rejected**
+    ///   (`None` + `warn!`), never silently decoded as plaintext — fail-closed.
+    /// - **dev/legacy**: plaintext fallback runs **only** when `ALLOW_PLAINTEXT_DLMS=true`
+    ///   (logged loud); otherwise the frame is skipped.
+    /// - **Redis-unreachable / malformed key**: `get_device_aes_key` returns `Err`; we treat it as
+    ///   fail-closed-loud (`error!` + `None`) — an unreachable key store must never decode telemetry.
+    ///
+    /// Returns `None` when the frame could not be securely decoded; callers skip it (or fall back to
+    /// the request's standard signed fields, exactly as they did when the legacy `parse` errored).
+    async fn decode_secure_frame(&self, frame_bytes: &[u8]) -> Option<DlmsBinaryFrame> {
+        // Header first — it's plaintext and carries the meter identity (LDN) for the key lookup.
+        let header = match DlmsBinaryFrame::parse_header(frame_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("⚠️ DLMS header parse failed: {}", e);
+                return None;
+            }
+        };
+        let meter_id = header.logical_device_name.as_str();
+
+        let is_production = std::env::var("ENVIRONMENT").unwrap_or_default() == "production";
+        let allow_plaintext = std::env::var("ALLOW_PLAINTEXT_DLMS").unwrap_or_default() == "true";
+
+        let key = match self.state.device_key_registry.get_device_aes_key(meter_id).await {
+            Ok(k) => k,
+            Err(e) => {
+                // Fail-closed-loud: key store unreachable / key malformed — never decode unverified.
+                error!("🚫 DLMS key fetch failed for meter={}: {} — frame skipped", meter_id, e);
+                return None;
+            }
+        };
+
+        match key {
+            Some(k) => match DlmsBinaryFrame::parse(frame_bytes, Some(&k)) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    warn!("🚫 DLMS decrypt failed for meter={}: {} — frame skipped", meter_id, e);
+                    None
+                }
+            },
+            None if is_production => {
+                warn!(
+                    "🚫 No enckey for meter={} under ENVIRONMENT=production — frame skipped (fail-closed)",
+                    meter_id
+                );
+                None
+            }
+            None if allow_plaintext => match DlmsBinaryFrame::parse(frame_bytes, None) {
+                Ok(f) => {
+                    warn!(
+                        "⚠️ ALLOW_PLAINTEXT_DLMS=true — meter={} decoded as PLAINTEXT (dev only)",
+                        meter_id
+                    );
+                    Some(f)
+                }
+                Err(e) => {
+                    warn!("⚠️ DLMS plaintext parse failed for meter={}: {}", meter_id, e);
+                    None
+                }
+            },
+            None => {
+                warn!(
+                    "🚫 No enckey for meter={} and ALLOW_PLAINTEXT_DLMS not set — frame skipped",
+                    meter_id
+                );
+                None
+            }
+        }
+    }
 }
 
 // Unified Ingestion Pattern: Both Path A and Path B handled through single verified entry
@@ -69,8 +146,8 @@ impl OracleService for AggregatorServiceImpl {
             sig_bytes.copy_from_slice(&payload[cursor..cursor + 64]);
             cursor += 64;
 
-            // Partially parse to get meter_id and metadata
-            if let Ok(frame) = DlmsBinaryFrame::parse(frame_bytes, None) {
+            // Resolve per-device key, decrypt, parse (prod/dev policy in decode_secure_frame).
+            if let Some(frame) = self.decode_secure_frame(frame_bytes).await {
                 let meter_id = frame.logical_device_name.clone();
                 
                 // Note: We need the canonical string for signature verification, 
@@ -227,8 +304,11 @@ impl OracleService for AggregatorServiceImpl {
 
         // DLMS/COSEM (IEC 62056) Decoding
         if !request.raw_payload.is_empty() {
-            match DlmsBinaryFrame::parse(&request.raw_payload, None) {
-                Ok(frame) => {
+            // Decode the secure frame if it carries one; on skip (None) we keep the request's
+            // standard signed fields (the signature gate above already passed) — same fallback
+            // the legacy parse-error path used.
+            match self.decode_secure_frame(&request.raw_payload).await {
+                Some(frame) => {
                     timestamp = frame.timestamp;
                     if let Some(wh) = frame.active_energy_export_wh {
                         generated_kwh = (wh as f64) / 1000.0;
@@ -247,7 +327,8 @@ impl OracleService for AggregatorServiceImpl {
                     }
                     metadata.insert("dlms_manufacturer_id".to_string(), json!(frame.manufacturer_id));
                 }
-                Err(e) => warn!("⚠️ DLMS decode failed: {}. Using standard fields.", e),
+                // Frame skipped (decode_secure_frame already logged why) — fall back to standard fields.
+                None => {}
             }
         }
 
@@ -329,7 +410,7 @@ impl OracleService for AggregatorServiceImpl {
             let mut metadata = HashMap::new();
 
             if !tel.raw_payload.is_empty() {
-                if let Ok(frame) = DlmsBinaryFrame::parse(&tel.raw_payload, None) {
+                if let Some(frame) = self.decode_secure_frame(&tel.raw_payload).await {
                     timestamp = frame.timestamp;
                     if let Some(wh) = frame.active_energy_export_wh { generated_kwh = (wh as f64) / 1000.0; }
                     if let Some(wh) = frame.active_energy_import_wh { consumed_kwh = (wh as f64) / 1000.0; }
