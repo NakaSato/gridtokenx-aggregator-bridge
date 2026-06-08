@@ -1,8 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use redis::aio::ConnectionManager;
 use redis::streams::StreamMaxlen;
 use redis::AsyncCommands;
-use tracing::info;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{info, warn};
 
 use oracle_core::models::DeviceReading;
 
@@ -13,7 +15,11 @@ use gridtokenx_blockchain_core::rpc::nats_schema::MeterReadingMessage;
 
 /// Routes normalized `DeviceReading` events to zone-partitioned Redis Streams.
 pub struct Router {
-    connection_manager: ConnectionManager,
+    /// Redis URL used to rebuild the connection after a server restart.
+    redis_url: String,
+    /// Cached reconnecting manager; rebuilt on transport error so a Redis
+    /// restart is recovered inline rather than failing the first request.
+    conn: Arc<Mutex<Option<ConnectionManager>>>,
     /// Approximate cap for each stream (MAXLEN ~).
     max_stream_len: usize,
     /// Number of zone partitions
@@ -36,11 +42,37 @@ impl Router {
         info!("🔢 Zone partitions: {}", num_zones);
 
         Ok(Self {
-            connection_manager,
+            redis_url: redis_url.to_string(),
+            conn: Arc::new(Mutex::new(Some(connection_manager))),
             max_stream_len,
             num_zones,
             nats_client,
         })
+    }
+
+    /// Return a live connection manager clone, rebuilding from `redis_url` after
+    /// an [`invalidate`](Self::invalidate). Errors loudly when Redis is down.
+    async fn conn(&self) -> Result<ConnectionManager> {
+        {
+            let guard = self.conn.lock().await;
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        let client = redis::Client::open(self.redis_url.as_str())
+            .map_err(|e| anyhow!("Failed to open Redis client {}: {}", self.redis_url, e))?;
+        let mgr = ConnectionManager::new(client)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to Redis {}: {}", self.redis_url, e))?;
+        let mut guard = self.conn.lock().await;
+        *guard = Some(mgr.clone());
+        Ok(mgr)
+    }
+
+    /// Drop the cached manager so the next [`conn`](Self::conn) rebuilds it.
+    async fn invalidate(&self) {
+        let mut guard = self.conn.lock().await;
+        *guard = None;
     }
 
     /// Determine zone index for a reading
@@ -50,7 +82,7 @@ impl Router {
 
     /// Publish a normalized reading to a zone-partitioned stream.
     pub async fn disseminate(&self, reading: &DeviceReading) -> Result<String> {
-        let mut conn = self.connection_manager.clone();
+        let mut conn = self.conn().await?;
 
         // Route to zone-specific stream
         let zone_idx = self.get_zone_index(reading);
@@ -92,7 +124,7 @@ impl Router {
 
         let json = serde_json::to_string(&event_envelope).context("Failed to serialize reading")?;
 
-        let stream_id: String = conn
+        let stream_id: String = match conn
             .xadd_maxlen(
                 &stream_name,
                 StreamMaxlen::Approx(self.max_stream_len),
@@ -100,7 +132,30 @@ impl Router {
                 &[("event", &json)],
             )
             .await
-            .context("Failed to publish to Redis Stream")?;
+        {
+            Ok(id) => id,
+            Err(e) => {
+                // Transport error (e.g. Redis restarted) — rebuild and retry once
+                // so the request succeeds inline instead of returning HTTP 500.
+                warn!(
+                    "⚠️ Redis XADD error for {} ({}); rebuilding connection and retrying",
+                    stream_name, e
+                );
+                self.invalidate().await;
+                let mut conn2 = self.conn().await?;
+                let id: String = conn2
+                    .xadd_maxlen(
+                        &stream_name,
+                        StreamMaxlen::Approx(self.max_stream_len),
+                        "*",
+                        &[("event", &json)],
+                    )
+                    .await
+                    .context("Failed to publish to Redis Stream after reconnect")?;
+                conn = conn2;
+                id
+            }
+        };
 
         // Also publish to unified stream for general consumers (e.g. trading-service)
         let unified_stream = reading.device_type.target_stream();
