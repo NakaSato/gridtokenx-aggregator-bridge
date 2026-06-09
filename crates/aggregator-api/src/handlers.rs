@@ -35,16 +35,15 @@ pub fn signature_enforcement_disabled() -> bool {
     std::env::var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY").unwrap_or_default() == "true"
 }
 
-/// The numeric field a device of `protocol` signs in its canonical
+/// The numeric value a DLMS/COSEM meter signs in its canonical
 /// `{device_id}:{value}:{timestamp}` Ed25519 sign-target.
 ///
-/// DLMS-family meters sign consumed energy (kWh); other stacks sign their native
-/// primary measure — OCPP `energy_wh`, SunSpec `WH`, OpenADR `actual_kw`. The DLMS
-/// value resolves `kwh` → `energy_consumed` → `energy_generated` → OBIS active
-/// import (1.1.1.8.0.255, Wh/1000) → OBIS export (1.1.2.8.0.255, Wh/1000), so a
-/// real OBIS-coded meter signs the same kWh the decoder reconstructs. Falls back
-/// to these DLMS fields so an unrecognized protocol still has a value to verify.
-fn canonical_sign_value(protocol: &str, payload: &serde_json::Value) -> String {
+/// The value is consumption in kWh: it resolves `kwh` → `energy_consumed` →
+/// `energy_generated` → OBIS active import (1.1.1.8.0.255, Wh/1000) → OBIS export
+/// (1.1.2.8.0.255, Wh/1000), so a real OBIS-coded meter signs the same kWh the
+/// decoder reconstructs. `protocol` is unused (DLMS/COSEM is the only stack) but
+/// kept in the signature for call-site symmetry.
+fn canonical_sign_value(_protocol: &str, payload: &serde_json::Value) -> String {
     fn num(payload: &serde_json::Value, key: &str) -> Option<f64> {
         payload
             .get(key)
@@ -55,25 +54,13 @@ fn canonical_sign_value(protocol: &str, payload: &serde_json::Value) -> String {
     // match the decoder's `consumed_kwh`/`generated_kwh` (dlms.rs). Without this a
     // pure-OBIS meter (no `kwh` field) would sign `{id}:0:{ts}` — the signed value
     // would not match the decoded reading.
-    let dlms_energy = || {
-        num(payload, "kwh")
-            .or_else(|| num(payload, "energy_consumed"))
-            .or_else(|| num(payload, "energy_generated"))
-            // OBIS active import total (1.1.1.8.0.255) → consumed; export → generated.
-            .or_else(|| num(payload, "1.1.1.8.0.255").map(|wh| wh / 1000.0))
-            .or_else(|| num(payload, "1.1.2.8.0.255").map(|wh| wh / 1000.0))
-            .unwrap_or(0.0)
-    };
-    let value = match protocol {
-        "ocpp" => num(payload, "energy_wh").unwrap_or_else(dlms_energy),
-        "sunspec" => num(payload, "WH")
-            .or_else(|| num(payload, "W"))
-            .unwrap_or_else(dlms_energy),
-        "openadr" => num(payload, "actual_kw")
-            .or_else(|| num(payload, "baseload_kw"))
-            .unwrap_or_else(dlms_energy),
-        _ => dlms_energy(),
-    };
+    let value = num(payload, "kwh")
+        .or_else(|| num(payload, "energy_consumed"))
+        .or_else(|| num(payload, "energy_generated"))
+        // OBIS active import total (1.1.1.8.0.255) → consumed; export → generated.
+        .or_else(|| num(payload, "1.1.1.8.0.255").map(|wh| wh / 1000.0))
+        .or_else(|| num(payload, "1.1.2.8.0.255").map(|wh| wh / 1000.0))
+        .unwrap_or(0.0);
     value.to_string()
 }
 
@@ -186,20 +173,15 @@ pub async fn ingest_private_network(
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0);
 
-    // Resolve the protocol first. `auto` (or an empty protocol field) triggers
-    // field-based detection so signature verification can use the protocol-native
-    // canonical measure (OCPP `energy_wh`, SunSpec `WH`, …) rather than assuming
-    // DLMS energy fields.
+    // DLMS/COSEM is the only meter protocol. `auto` or an empty protocol field
+    // resolves to `dlms` (no detection needed); `simulator` is the unsigned dev
+    // ingest bypass handled below.
     let mut protocol = payload.protocol.to_lowercase();
     if protocol.is_empty() || protocol == "auto" {
-        protocol = crate::protocol::stacks::detect_protocol(&payload.payload).to_string();
-        info!(
-            "🔎 Auto-detected protocol '{}' for {}",
-            protocol, payload.device_id
-        );
+        protocol = "dlms".to_string();
     }
 
-    const SUPPORTED: [&str; 5] = ["dlms", "ocpp", "openadr", "sunspec", "simulator"];
+    const SUPPORTED: [&str; 2] = ["dlms", "simulator"];
     if !SUPPORTED.contains(&protocol.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -284,13 +266,8 @@ pub async fn ingest_private_network(
         return disseminate_reading(&state, reading, sig_verified).await;
     }
 
-    let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = match protocol.as_str() {
-        "dlms" => state.dlms_stack.clone(),
-        "ocpp" => Arc::new(crate::protocol::stacks::ocpp::OcppStack::new()),
-        "openadr" => Arc::new(crate::protocol::stacks::openadr::OpenAdrStack::new()),
-        "sunspec" => Arc::new(crate::protocol::stacks::sunspec::SunSpecStack::new()),
-        _ => unreachable!(),
-    };
+    // Only DLMS/COSEM remains; `simulator` returned above, `auto`/empty mapped to dlms.
+    let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = state.dlms_stack.clone();
 
     // Serialize payload back to bytes for the stack handlers
     let raw_data = serde_json::to_vec(&payload.payload).unwrap_or_default();
@@ -378,10 +355,10 @@ pub async fn ingest_private_network_batch(
 ) -> impl IntoResponse {
     info!("📥 Received private network batch ingestion: protocol={}", payload.protocol);
     let mut responses = Vec::new();
-    // `auto` (or an empty top-level protocol) detects each reading's protocol
-    // from its own fields, so a batch may mix device types.
+    // DLMS/COSEM is the only meter protocol; `auto`/empty resolve to `dlms`,
+    // `simulator` is the unsigned dev bypass.
     let top_protocol = payload.protocol.to_lowercase();
-    const SUPPORTED: [&str; 6] = ["dlms", "ocpp", "openadr", "sunspec", "simulator", "auto"];
+    const SUPPORTED: [&str; 3] = ["dlms", "simulator", "auto"];
     if !top_protocol.is_empty() && !SUPPORTED.contains(&top_protocol.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -391,9 +368,9 @@ pub async fn ingest_private_network_batch(
     }
 
     for item in payload.readings {
-        // Resolve this reading's protocol (per-item detection under `auto`).
+        // `auto`/empty resolve to dlms; otherwise honor the declared protocol.
         let protocol = if top_protocol.is_empty() || top_protocol == "auto" {
-            crate::protocol::stacks::detect_protocol(&item).to_string()
+            "dlms".to_string()
         } else {
             top_protocol.clone()
         };
@@ -489,13 +466,8 @@ pub async fn ingest_private_network_batch(
         // Serialize payload back to bytes for the stack handlers
         let raw_data = serde_json::to_vec(&item).unwrap_or_default();
 
-        let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = match protocol.as_str() {
-            "dlms" => state.dlms_stack.clone(),
-            "ocpp" => Arc::new(crate::protocol::stacks::ocpp::OcppStack::new()),
-            "openadr" => Arc::new(crate::protocol::stacks::openadr::OpenAdrStack::new()),
-            "sunspec" => Arc::new(crate::protocol::stacks::sunspec::SunSpecStack::new()),
-            _ => continue,
-        };
+        // Only DLMS/COSEM remains; `simulator` handled above, `auto`/empty mapped to dlms.
+        let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = state.dlms_stack.clone();
 
         match stack.handle_message(device_id, &raw_data).await {
             Ok(Some(reading)) => {
@@ -527,24 +499,6 @@ pub async fn ingest_private_network_batch(
 mod tests {
     use super::canonical_sign_value;
     use serde_json::json;
-
-    #[test]
-    fn ocpp_signs_energy_wh() {
-        let p = json!({"energy_wh": 15000.0, "kwh": 1.0});
-        assert_eq!(canonical_sign_value("ocpp", &p), "15000");
-    }
-
-    #[test]
-    fn sunspec_signs_wh_not_watts() {
-        let p = json!({"W": 5000.0, "WH": 12345.0, "St": 4});
-        assert_eq!(canonical_sign_value("sunspec", &p), "12345");
-    }
-
-    #[test]
-    fn openadr_signs_actual_kw() {
-        let p = json!({"baseload_kw": 3.0, "actual_kw": 2.4});
-        assert_eq!(canonical_sign_value("openadr", &p), "2.4");
-    }
 
     #[test]
     fn dlms_signs_kwh() {
@@ -582,21 +536,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_protocol_falls_back_to_dlms_energy() {
+    fn falls_back_to_energy_generated() {
         let p = json!({"energy_generated": 3.0});
-        assert_eq!(canonical_sign_value("mystery", &p), "3");
-    }
-
-    #[test]
-    fn ocpp_without_energy_wh_falls_back_to_dlms_energy() {
-        let p = json!({"energy_consumed": 2.0});
-        assert_eq!(canonical_sign_value("ocpp", &p), "2");
+        assert_eq!(canonical_sign_value("dlms", &p), "3");
     }
 
     #[test]
     fn parses_stringified_numbers() {
-        let p = json!({"energy_wh": "15000"});
-        assert_eq!(canonical_sign_value("ocpp", &p), "15000");
+        let p = json!({"kwh": "1.5"});
+        assert_eq!(canonical_sign_value("dlms", &p), "1.5");
     }
 }
 

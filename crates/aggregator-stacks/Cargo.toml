@@ -2,7 +2,7 @@
 name = "aggregator-stacks"
 version = "0.1.0"
 edition = "2021"
-description = "Aggregator Bridge device protocol stacks (DLMS, OCPP, SunSpec, OpenADR)"
+description = "Aggregator Bridge device protocol stack (DLMS/COSEM + secure binary frame)"
 
 [dependencies]
 aggregator-core = { path = "../aggregator-core" }

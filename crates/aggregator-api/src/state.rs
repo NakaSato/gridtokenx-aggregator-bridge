@@ -51,8 +51,7 @@ impl Metrics {
 pub struct AppState {
     pub router: Arc<Router>,
 
-    // Private Network Protocol Stacks (only DLMS wired into the dispatch match today;
-    // OCPP/SunSpec/OpenADR live in aggregator-stacks, re-add fields here when wired)
+    // Private Network Protocol Stack: DLMS/COSEM is the only meter protocol.
     pub dlms_stack: Arc<DlmsStack>,
 
     pub api_keys: Vec<String>,

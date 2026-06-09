@@ -45,12 +45,12 @@
   dev/legacy plaintext fallback is gated behind `ALLOW_PLAINTEXT_DLMS=true` and
   logged loud. Redis-unreachable / malformed key ⇒ loud skip, never a silent
   plaintext decode.
-- **Protocol auto-detect.** When an ingest request sets `protocol = "auto"` (or
-  omits it), the stack is chosen from the payload field set — dlms / ocpp /
-  openadr / sunspec, defaulting to dlms (`detect_protocol`, verified
-  `crates/aggregator-stacks/src/stacks/mod.rs:19`). Wired into single ingest
-  (`crates/aggregator-api/src/handlers.rs:205`) and per-item in batch ingest
-  (`crates/aggregator-api/src/handlers.rs:351`).
+- **Protocol resolution.** DLMS/COSEM is the only meter protocol. An ingest
+  request with `protocol = "auto"` (or omitted) resolves to `dlms`; the only
+  other accepted value is `simulator` (unsigned dev bypass). Wired into single
+  ingest (`crates/aggregator-api/src/handlers.rs:180`) and per-item in batch
+  ingest (`crates/aggregator-api/src/handlers.rs:361`); both dispatch to the lone
+  `dlms_stack` (`crates/aggregator-api/src/handlers.rs:270`).
 - **Dissemination (self-healing).** Verified readings fan out to
   zone-partitioned Redis Streams; the publisher rebuilds its connection and
   retries the `XADD` once on transport error (`Router::disseminate`, verified

@@ -44,7 +44,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 | --- | --- |
 | `aggregator-core` | Domain models, numeric types. Zero internal deps. |
 | `aggregator-protocol` | Generated ConnectRPC/prost types from `proto/{oracle,dispatch}.proto` via `build.rs` → `OUT_DIR`. Packages: `oracle::*`, `dispatch::*`, `identity::*`. |
-| `aggregator-stacks` | Per-protocol meter decoders (dlms / ocpp / openadr / sunspec) + `binary_decoder`. `detect_protocol` picks the stack from the payload field set when `protocol="auto"`. |
+| `aggregator-stacks` | DLMS/COSEM meter decoder (`dlms`) + `binary_decoder` (secure v4 frame). DLMS/COSEM is the only meter protocol; `protocol="auto"`/omitted resolves to `dlms`. |
 | `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry, circular-buffer/sync storage. |
 | `aggregator-logic` | Aggregator, Router (dissemination), ZK prover (Plonky2 circuit), dispatch engine, IEEE 2030.5 standards. Depends on `gridtokenx-blockchain-core` (sibling submodule). |
 | `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, settlement, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |

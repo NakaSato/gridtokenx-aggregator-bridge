@@ -85,12 +85,12 @@ pub enum BatteryMode {
 }
 
 // =============================================================================
-// Private Network Ingestion (OCPP, SunSpec, DLMS, OpenADR)
+// Private Network Ingestion (DLMS/COSEM)
 // =============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct PrivateNetworkPayload {
-    pub protocol: String, // "ocpp", "sunspec", "dlms", "openadr"
+    pub protocol: String, // "dlms" ("auto"/empty → dlms; "simulator" = unsigned dev bypass)
     pub device_id: String,
     pub payload: serde_json::Value,
 }
