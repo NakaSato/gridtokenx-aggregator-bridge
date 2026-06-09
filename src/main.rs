@@ -271,25 +271,9 @@ async fn main() -> Result<()> {
         info!("ℹ️ Settlement signer disabled (AGGREGATOR_BRIDGE_SIGNING_KEY not set)");
         None
     };
-    // 7c. Start UTT Settlement Engine (Path B)
-    let settlement_agg = aggregator.clone();
-    let settlement_shutdown = shutdown_token.clone();
-    let settlement_api_url = std::env::var("SETTLEMENT_API_URL")
-        .or_else(|_| std::env::var("TRADING_HTTP_URL"))
-        .unwrap_or_else(|_| "http://trading-service:8093".to_string());
-    
-    info!("💰 UTT Path B Settlement target: {}", settlement_api_url);
-    let settlement_signer_task = settlement_signer.clone();
-    let _settlement_handle = tokio::spawn(async move {
-        let engine = ingester::settlement_engine::SettlementEngine::new(
-            settlement_agg,
-            settlement_api_url,
-            settlement_signer_task,
-        );
-        engine.run(settlement_shutdown).await;
-    });
-
-    // 7. Initialize IAM gRPC Client (optional - auth falls back to static API keys)
+    // 7. Initialize IAM gRPC Client (optional - auth falls back to static API keys).
+    // Built before the Settlement Engine so the generation-mint path can resolve
+    // recipient wallets via `GetUserWallet`.
     use connectrpc::client::{ClientConfig, Http2Connection};
     use connectrpc::Protocol;
 
@@ -311,6 +295,57 @@ async fn main() -> Result<()> {
         Some(Arc::new(client))
     }
     .await;
+
+    // 7c. Start UTT Settlement Engine (Path B)
+    let settlement_agg = aggregator.clone();
+    let settlement_shutdown = shutdown_token.clone();
+    let settlement_api_url = std::env::var("SETTLEMENT_API_URL")
+        .or_else(|_| std::env::var("TRADING_HTTP_URL"))
+        .unwrap_or_else(|_| "http://trading-service:8093".to_string());
+
+    info!("💰 UTT Path B Settlement target: {}", settlement_api_url);
+
+    // Generation-mint routing: when MINT_VIA_CHAIN_BRIDGE=true the aggregator mints
+    // GRID directly via Chain Bridge (Vault signs) instead of POSTing to trading-service.
+    // Requires a working BlockchainService AND the IAM client; otherwise fall back to HTTP.
+    let mint_via_chain_bridge_requested = std::env::var("MINT_VIA_CHAIN_BRIDGE")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    let settlement_blockchain = if mint_via_chain_bridge_requested {
+        match ingester::settlement_engine::build_blockchain_service().await {
+            Ok(svc) => Some(svc),
+            Err(e) => {
+                error!(
+                    "❌ MINT_VIA_CHAIN_BRIDGE requested but BlockchainService build failed: {} — using HTTP path",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mint_via_chain_bridge =
+        mint_via_chain_bridge_requested && settlement_blockchain.is_some() && identity_client.is_some();
+    if mint_via_chain_bridge {
+        info!("⚡ Generation mint path: Chain Bridge (Vault-signed)");
+    } else if mint_via_chain_bridge_requested {
+        warn!("⚠️ MINT_VIA_CHAIN_BRIDGE requested but prerequisites missing (blockchain/IAM) — using HTTP settlement path");
+    }
+
+    let settlement_signer_task = settlement_signer.clone();
+    let settlement_identity_client = identity_client.clone();
+    let _settlement_handle = tokio::spawn(async move {
+        let engine = ingester::settlement_engine::SettlementEngine::new(
+            settlement_agg,
+            settlement_api_url,
+            settlement_signer_task,
+            mint_via_chain_bridge,
+            settlement_blockchain,
+            settlement_identity_client,
+        );
+        engine.run(settlement_shutdown).await;
+    });
 
     // 7b. Initialize Prometheus metrics exporter
     let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new()

@@ -109,6 +109,7 @@ dependencies = [
  "chrono",
  "connectrpc",
  "crc32fast",
+ "gridtokenx-blockchain-core",
  "gridtokenx-telemetry",
  "hex",
  "http",
