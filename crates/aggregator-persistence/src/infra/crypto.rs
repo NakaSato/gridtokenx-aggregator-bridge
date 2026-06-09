@@ -208,6 +208,14 @@ impl SignatureVerifier {
             return Err(anyhow!("Mismatched batch lengths"));
         }
 
+        // Empty batch ⇒ nothing to verify. Short-circuit BEFORE issuing MGET: Redis
+        // rejects a zero-key MGET ("wrong number of arguments"), which would surface a
+        // bulk batch whose every frame was decode-skipped as a hard INTERNAL error
+        // instead of the fail-closed processed_count==0 the skip path intends.
+        if meter_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let keys: Vec<String> = meter_ids
             .iter()
             .map(|id| format!("gridtokenx:devices:{}:pubkey", id))
@@ -481,6 +489,18 @@ mod tests {
             .verify_telemetry_signature("meter-1", b"payload", DUMMY_SIG_B58)
             .await;
         assert!(res.is_err(), "manager-less verifier must Err, got Ok({:?})", res.ok());
+    }
+
+    /// An empty batch must short-circuit to `Ok(vec![])` BEFORE any Redis call —
+    /// a zero-key MGET errors ("wrong number of arguments"), which would turn a
+    /// bulk batch whose every frame was decode-skipped into a hard error instead
+    /// of the intended fail-closed `processed_count == 0`. Holds even with no Redis
+    /// (the guard returns before the lookup).
+    #[tokio::test]
+    async fn verify_batch_empty_is_ok_without_redis() {
+        let v = SignatureVerifier::new(None);
+        let res = v.verify_telemetry_signature_batch(&[], &[], &[]).await;
+        assert!(matches!(res.as_deref(), Ok(&[])), "empty batch must be Ok([]), got {:?}", res);
     }
 
     /// `sign_canonical` must produce a base58 Ed25519 signature that verifies
