@@ -65,10 +65,20 @@ impl ZoneEventIngester {
         let group_name = "aggregator_bridge_zone_group".to_string();
         let consumer_name = format!("zone_consumer_{}", Uuid::new_v4());
 
-        // Create batch forwarder with Redis connection for ACKing
-        let platform_client = PlatformClient::new(api_services_url)
-            .await
-            .context("Failed to initialize PlatformClient for zone ingester")?;
+        // Create batch forwarder with Redis connection for ACKing.
+        // The platform (OracleService) client is best-effort: the live forward path is a
+        // Redis-ACK bypass, so a missing/unreachable target must NOT block the ingester —
+        // local aggregation (Path B billing bins) depends only on Redis + the Aggregator.
+        let platform_client = match PlatformClient::new(api_services_url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!(
+                    "⚠️ PlatformClient unavailable ({}): zone ingester runs without gRPC forwarding (Path B bins still fill locally).",
+                    e
+                );
+                None
+            }
+        };
         let batch_handle = BatchWorker::spawn(
             platform_client,
             connection_manager.clone(),

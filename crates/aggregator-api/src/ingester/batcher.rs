@@ -87,7 +87,11 @@ impl BatchHandle {
 
 /// Worker that manages the batching and forwarding logic (UTT Pipeline)
 pub struct BatchWorker {
-    platform_client: PlatformClient,
+    // Vestigial: the live forward path is a Redis-ACK bypass (see `flush`), so the
+    // gRPC platform client is never invoked. Optional so the zone ingester can start
+    // even when no OracleService target is reachable (Path B bins still fill locally).
+    #[allow(dead_code)]
+    platform_client: Option<PlatformClient>,
     connection_manager: ConnectionManager,
     group_name: String,
     batch: Vec<BatchEntry>,
@@ -98,7 +102,7 @@ pub struct BatchWorker {
 
 impl BatchWorker {
     pub fn spawn(
-        platform_client: PlatformClient,
+        platform_client: Option<PlatformClient>,
         connection_manager: ConnectionManager,
         group_name: String,
         _metrics: Arc<crate::state::Metrics>,
