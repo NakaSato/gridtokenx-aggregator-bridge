@@ -38,20 +38,30 @@ pub fn signature_enforcement_disabled() -> bool {
 /// The numeric field a device of `protocol` signs in its canonical
 /// `{device_id}:{value}:{timestamp}` Ed25519 sign-target.
 ///
-/// DLMS-family meters sign net/consumed/generated energy (kWh); other stacks
-/// sign their native primary measure — OCPP `energy_wh`, SunSpec `WH`, OpenADR
-/// `actual_kw`. Falls back to the DLMS energy fields so an unrecognized
-/// protocol still has a canonical value to verify against.
+/// DLMS-family meters sign consumed energy (kWh); other stacks sign their native
+/// primary measure — OCPP `energy_wh`, SunSpec `WH`, OpenADR `actual_kw`. The DLMS
+/// value resolves `kwh` → `energy_consumed` → `energy_generated` → OBIS active
+/// import (1.1.1.8.0.255, Wh/1000) → OBIS export (1.1.2.8.0.255, Wh/1000), so a
+/// real OBIS-coded meter signs the same kWh the decoder reconstructs. Falls back
+/// to these DLMS fields so an unrecognized protocol still has a value to verify.
 fn canonical_sign_value(protocol: &str, payload: &serde_json::Value) -> String {
     fn num(payload: &serde_json::Value, key: &str) -> Option<f64> {
         payload
             .get(key)
             .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
     }
+    // DLMS canonical value = consumption in kWh. Plain fields win first (existing
+    // clients), then OBIS active import/export — which arrive in Wh, so /1000 to
+    // match the decoder's `consumed_kwh`/`generated_kwh` (dlms.rs). Without this a
+    // pure-OBIS meter (no `kwh` field) would sign `{id}:0:{ts}` — the signed value
+    // would not match the decoded reading.
     let dlms_energy = || {
         num(payload, "kwh")
             .or_else(|| num(payload, "energy_consumed"))
             .or_else(|| num(payload, "energy_generated"))
+            // OBIS active import total (1.1.1.8.0.255) → consumed; export → generated.
+            .or_else(|| num(payload, "1.1.1.8.0.255").map(|wh| wh / 1000.0))
+            .or_else(|| num(payload, "1.1.2.8.0.255").map(|wh| wh / 1000.0))
             .unwrap_or(0.0)
     };
     let value = match protocol {
@@ -539,6 +549,35 @@ mod tests {
     #[test]
     fn dlms_signs_kwh() {
         let p = json!({"kwh": 1.5, "energy_consumed": 1.0});
+        assert_eq!(canonical_sign_value("dlms", &p), "1.5");
+    }
+
+    #[test]
+    fn dlms_signs_obis_import_as_kwh() {
+        // Real DLMS meter sends OBIS-coded active import (Wh), no `kwh` field.
+        // Canonical value must derive from OBIS import / 1000 (kWh), matching the
+        // decoder's `consumed_kwh` — NOT fall through to 0.
+        let p = json!({"1.1.1.8.0.255": 10000.0});
+        assert_eq!(canonical_sign_value("dlms", &p), "10");
+    }
+
+    #[test]
+    fn dlms_obis_export_fallback_when_no_import() {
+        // Export-only meter (e.g. pure generation): fall back to OBIS export / 1000.
+        let p = json!({"1.1.2.8.0.255": 5000.0});
+        assert_eq!(canonical_sign_value("dlms", &p), "5");
+    }
+
+    #[test]
+    fn dlms_obis_import_wins_over_export() {
+        let p = json!({"1.1.1.8.0.255": 7000.0, "1.1.2.8.0.255": 5000.0});
+        assert_eq!(canonical_sign_value("dlms", &p), "7");
+    }
+
+    #[test]
+    fn dlms_kwh_field_wins_over_obis() {
+        // Explicit `kwh` field takes precedence over OBIS — existing clients unaffected.
+        let p = json!({"kwh": 1.5, "1.1.1.8.0.255": 99000.0});
         assert_eq!(canonical_sign_value("dlms", &p), "1.5");
     }
 
