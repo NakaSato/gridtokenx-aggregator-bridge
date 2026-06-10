@@ -1,13 +1,18 @@
 use chrono::{DateTime, Timelike, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::debug;
 use uuid::Uuid;
 
 /// Duration of a billing window in minutes
 const WINDOW_MINUTES: u32 = 15;
 
-#[derive(Debug, Clone)]
+/// Stable identity of a billing bin: (meter, window start). Used as the
+/// in-memory map key and as the durable-store field key.
+pub type BinKey = (Uuid, DateTime<Utc>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingBin {
     pub meter_id: Uuid,
     pub user_id: Uuid,
@@ -17,6 +22,13 @@ pub struct BillingBin {
     pub energy_generated: Decimal,
     pub energy_consumed: Decimal,
     pub reading_count: u64,
+}
+
+impl BillingBin {
+    /// Stable key for this bin: (meter_id, window_start).
+    pub fn key(&self) -> BinKey {
+        (self.meter_id, self.start_time)
+    }
 }
 
 pub struct Aggregator {
@@ -31,7 +43,9 @@ impl Aggregator {
         }
     }
 
-    /// Handles a new meter reading and updates or creates the corresponding billing bin
+    /// Handles a new meter reading and updates or creates the corresponding billing
+    /// bin. Returns a snapshot (clone) of the updated bin so the async edge can
+    /// write it through to the durable store (crash-recovery of accumulated energy).
     pub fn handle_reading(
         &mut self,
         meter_id: Uuid,
@@ -40,7 +54,7 @@ impl Aggregator {
         generated: Decimal,
         consumed: Decimal,
         timestamp: DateTime<Utc>,
-    ) {
+    ) -> BillingBin {
         let start_time = self.get_window_start(timestamp);
         let end_time = start_time + chrono::Duration::minutes(WINDOW_MINUTES as i64);
 
@@ -67,30 +81,35 @@ impl Aggregator {
         bin.energy_generated += generated;
         bin.energy_consumed += consumed;
         bin.reading_count += 1;
+        bin.clone()
     }
 
-    /// Returns a list of all billing bins that have reached their end time and removes them from the aggregator
-    pub fn take_completed_bins(&mut self) -> Vec<BillingBin> {
+    /// Returns clones of all billing bins past their end time WITHOUT removing them.
+    /// Non-destructive on purpose: the settlement engine evicts a bin only after the
+    /// mint is confirmed submitted (see `remove_bins`), so a failed/crashed mint
+    /// retries on the next tick instead of silently losing the energy.
+    pub fn peek_completed_bins(&self) -> Vec<BillingBin> {
         let now = Utc::now();
-        let mut completed = Vec::new();
-        let mut to_remove = Vec::new();
+        self.active_bins
+            .values()
+            .filter(|bin| bin.end_time <= now)
+            .cloned()
+            .collect()
+    }
 
-        for (key, bin) in &self.active_bins {
-            if bin.end_time <= now {
-                completed.push(bin.clone());
-                to_remove.push(*key);
-            }
+    /// Removes the given bins (settled & evicted from the durable store by the caller).
+    pub fn remove_bins(&mut self, keys: &[BinKey]) {
+        for key in keys {
+            self.active_bins.remove(key);
         }
+    }
 
-        for key in to_remove {
-            self.active_bins.remove(&key);
+    /// Reloads bins from the durable store on boot. Existing in-memory bins win
+    /// (a live reading already created them); only missing keys are inserted.
+    pub fn rehydrate(&mut self, bins: Vec<BillingBin>) {
+        for bin in bins {
+            self.active_bins.entry(bin.key()).or_insert(bin);
         }
-
-        if !completed.is_empty() {
-            info!("📊 Aggregated {} completed billing bins", completed.len());
-        }
-
-        completed
     }
 
     /// Helper to calculate the start of the 15-minute window for a given timestamp

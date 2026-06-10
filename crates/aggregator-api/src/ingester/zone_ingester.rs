@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::aggregator::Aggregator;
 use crate::infra::platform::{MeterReading, PlatformClient};
 use crate::ingester::batcher::{BatchHandle, BatchWorker, BATCH_TIMEOUT_MS, FORWARD_BATCH_SIZE};
+use crate::ingester::bin_store::BinStore;
 use crate::ingester::Event;
 use crate::utils::numeric::to_positive_decimal;
 
@@ -42,6 +43,8 @@ pub struct ZoneEventIngester {
     num_zones: usize,
     /// Meter → User ID resolver
     meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
+    /// Durable billing-bin store (crash recovery). None ⇒ degraded (RAM-only) mode.
+    bin_store: Option<BinStore>,
 }
 
 impl ZoneEventIngester {
@@ -52,6 +55,7 @@ impl ZoneEventIngester {
         metrics: Arc<crate::state::Metrics>,
         num_zones: usize,
         meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
+        bin_store: Option<BinStore>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let connection_manager = Self::create_connection_manager(&client).await?;
@@ -103,6 +107,7 @@ impl ZoneEventIngester {
             batch_handle,
             num_zones,
             meter_registry,
+            bin_store,
         })
     }
 
@@ -513,8 +518,9 @@ impl ZoneEventIngester {
             }
         };
 
-        // 1. Update Aggregator (local stats)
-        {
+        // 1. Update Aggregator (local stats) + write-through to durable store.
+        // Snapshot is taken under the lock; the Redis I/O happens after release.
+        let bin_snapshot = {
             let mut agg = self.aggregator.lock().await;
             agg.handle_reading(
                 meter_id,
@@ -523,7 +529,15 @@ impl ZoneEventIngester {
                 energy_generated,
                 energy_consumed,
                 reading.timestamp,
-            );
+            )
+        };
+        if let Some(store) = &self.bin_store {
+            if let Err(e) = store.persist(&bin_snapshot).await {
+                warn!(
+                    "⚠️ Billing-bin persist failed for {} (in-memory only, energy at-risk on restart): {}",
+                    bin_snapshot.meter_serial, e
+                );
+            }
         }
 
         // 2. Forward to API Gateway (batched)

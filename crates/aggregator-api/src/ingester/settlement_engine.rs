@@ -1,6 +1,7 @@
-use crate::aggregator::{Aggregator, BillingBin};
+use crate::aggregator::{Aggregator, BillingBin, BinKey};
 use crate::infra::crypto::SettlementSigner;
 use crate::infra::platform::PlatformClient;
+use crate::ingester::bin_store::BinStore;
 use crate::state::{identity, IdentityServiceClient};
 use crate::zk::prover::ZkProver;
 use connectrpc::client::SharedHttp2Connection;
@@ -55,9 +56,12 @@ pub struct SettlementEngine {
     mint_via_chain_bridge: bool,
     blockchain: Option<Arc<BlockchainService>>,
     identity_client: Option<Arc<IdentityServiceClient<SharedHttp2Connection>>>,
+    /// Durable bin store; settled bins are evicted here only after confirmed submit.
+    bin_store: Option<BinStore>,
 }
 
 impl SettlementEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregator: Arc<Mutex<Aggregator>>,
         api_services_url: String,
@@ -65,6 +69,7 @@ impl SettlementEngine {
         mint_via_chain_bridge: bool,
         blockchain: Option<Arc<BlockchainService>>,
         identity_client: Option<Arc<IdentityServiceClient<SharedHttp2Connection>>>,
+        bin_store: Option<BinStore>,
     ) -> Self {
         Self {
             aggregator,
@@ -74,6 +79,7 @@ impl SettlementEngine {
             mint_via_chain_bridge,
             blockchain,
             identity_client,
+            bin_store,
         }
     }
 
@@ -97,11 +103,18 @@ impl SettlementEngine {
         }
     }
 
-    /// Scans the aggregator for completed bins and submits them to the API
+    /// Scans the aggregator for completed bins and submits them to the API.
+    ///
+    /// Bins are *peeked* (non-destructive), submitted, and only then *evicted* —
+    /// from both the in-memory map and the durable store. A bin is evicted ONLY if
+    /// its energy was minted/settled (or is structurally unmintable, e.g. zero
+    /// generation). Anything that failed for a transient reason (mint batch error,
+    /// IAM/wallet lookup down) is left in place and retried on the next tick, so
+    /// no real energy is silently dropped.
     async fn process_completed_bins(&self) -> anyhow::Result<()> {
         let bins = {
-            let mut agg = self.aggregator.lock().await;
-            agg.take_completed_bins()
+            let agg = self.aggregator.lock().await;
+            agg.peek_completed_bins()
         };
 
         if bins.is_empty() {
@@ -115,30 +128,72 @@ impl SettlementEngine {
 
         // Generation-mint path: aggregator owns issuance — build + submit the GRID
         // mint tx directly via Chain Bridge (Vault signs), bypassing trading-service.
-        if self.mint_via_chain_bridge {
-            return self.mint_bins_via_chain_bridge(bins).await;
-        }
+        let evict: Vec<BinKey> = if self.mint_via_chain_bridge {
+            self.mint_bins_via_chain_bridge(bins).await?
+        } else {
+            self.settle_bins_via_http(bins).await?
+        };
 
-        // Legacy path: POST settlement payloads to trading-service over REST.
-        // We can reuse a single PlatformClient for these requests
+        self.evict_settled(&evict).await;
+        Ok(())
+    }
+
+    /// Remove settled bins from the in-memory aggregator and the durable store.
+    /// Durable-store removal is best-effort: a failure leaves a stale entry that
+    /// `rehydrate` would reload, but the in-memory removal already happened, so it
+    /// only risks a one-time replay after a crash — never lost energy.
+    async fn evict_settled(&self, keys: &[BinKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        {
+            let mut agg = self.aggregator.lock().await;
+            agg.remove_bins(keys);
+        }
+        if let Some(store) = &self.bin_store {
+            if let Err(e) = store.remove(keys).await {
+                warn!(
+                    "⚠️ Failed to evict {} settled bins from durable store: {}",
+                    keys.len(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Legacy path: POST settlement payloads to trading-service over REST.
+    /// Returns the keys of bins that were accepted (safe to evict).
+    async fn settle_bins_via_http(&self, bins: Vec<BillingBin>) -> anyhow::Result<Vec<BinKey>> {
         let platform_client = PlatformClient::new(&self.api_services_url).await?;
 
         let mut settlement_payloads = Vec::new();
-
+        let mut keys = Vec::new();
         for bin in bins {
+            let key = bin.key();
             match self.prepare_settlement_payload(bin).await {
-                Ok(payload) => settlement_payloads.push(payload),
+                Ok(payload) => {
+                    settlement_payloads.push(payload);
+                    keys.push(key);
+                }
                 Err(e) => error!("❌ Failed to prepare settlement payload: {}", e),
             }
         }
 
-        if !settlement_payloads.is_empty() {
-            if let Err(e) = platform_client.settle_generation_mint_batch(&self.api_services_url, settlement_payloads).await {
-                error!("❌ Batched settlement submission failed: {}", e);
-            }
+        if settlement_payloads.is_empty() {
+            return Ok(vec![]);
         }
 
-        Ok(())
+        match platform_client
+            .settle_generation_mint_batch(&self.api_services_url, settlement_payloads)
+            .await
+        {
+            Ok(_) => Ok(keys),
+            Err(e) => {
+                // Keep bins for retry on the next tick — do not evict.
+                error!("❌ Batched settlement submission failed: {}", e);
+                Ok(vec![])
+            }
+        }
     }
 
     /// Generation-mint via Chain Bridge: resolve each bin's recipient wallet through
@@ -146,7 +201,15 @@ impl SettlementEngine {
     /// single batched, UNSIGNED mint transaction. Chain Bridge (Vault `platform_admin`)
     /// is the sole signer; the PolicyEngine must allowlist ENERGY_TOKEN + SPL-ATA for
     /// the Aggregator Bridge identity.
-    async fn mint_bins_via_chain_bridge(&self, bins: Vec<BillingBin>) -> anyhow::Result<()> {
+    ///
+    /// Returns the keys of bins safe to evict: those included in a successfully
+    /// submitted batch, plus zero-generation bins (nothing to mint). Bins whose
+    /// wallet could not be resolved (transient IAM outage) or whose batch submit
+    /// failed are NOT returned — they stay in the aggregator and retry next tick.
+    async fn mint_bins_via_chain_bridge(
+        &self,
+        bins: Vec<BillingBin>,
+    ) -> anyhow::Result<Vec<BinKey>> {
         let blockchain = self.blockchain.as_ref().ok_or_else(|| {
             anyhow::anyhow!("MINT_VIA_CHAIN_BRIDGE is set but BlockchainService is not wired")
         })?;
@@ -157,8 +220,13 @@ impl SettlementEngine {
         // 1e9 = GRID has 9 decimals (atomic units).
         let scale = Decimal::from(1_000_000_000i64);
         let mut inputs: Vec<(Pubkey, u64)> = Vec::with_capacity(bins.len());
+        // Bins included in the mint batch — evicted only after a confirmed submit.
+        let mut minted_keys: Vec<BinKey> = Vec::with_capacity(bins.len());
+        // Zero-generation bins — nothing to mint, safe to evict regardless of outcome.
+        let mut zero_keys: Vec<BinKey> = Vec::new();
 
         for bin in bins {
+            let key = bin.key();
             let amount_atomic =
                 ToPrimitive::to_u64(&(bin.energy_generated * scale).trunc()).unwrap_or(0);
             if amount_atomic == 0 {
@@ -166,6 +234,7 @@ impl SettlementEngine {
                     "⏭️ Skipping mint for user {} — zero generated energy",
                     bin.user_id
                 );
+                zero_keys.push(key);
                 continue;
             }
 
@@ -177,8 +246,9 @@ impl SettlementEngine {
             let wallet_str = match identity_client.get_user_wallet(request).await {
                 Ok(resp) => resp.into_owned().wallet_address,
                 Err(e) => {
+                    // Transient (IAM down) — retain bin for retry, do NOT evict.
                     error!(
-                        "❌ Failed to resolve wallet for user {} via IAM: {} — skipping",
+                        "❌ Failed to resolve wallet for user {} via IAM: {} — retrying next tick",
                         bin.user_id, e
                     );
                     continue;
@@ -188,8 +258,9 @@ impl SettlementEngine {
             let wallet = match BlockchainService::parse_pubkey(&wallet_str) {
                 Ok(pk) => pk,
                 Err(e) => {
+                    // Retain for retry; an invalid wallet logs loud each tick until fixed.
                     error!(
-                        "❌ Invalid wallet '{}' for user {}: {} — skipping",
+                        "❌ Invalid wallet '{}' for user {}: {} — retrying next tick",
                         wallet_str, bin.user_id, e
                     );
                     continue;
@@ -197,11 +268,13 @@ impl SettlementEngine {
             };
 
             inputs.push((wallet, amount_atomic));
+            minted_keys.push(key);
         }
 
         if inputs.is_empty() {
             info!("ℹ️ No mintable bins after wallet resolution");
-            return Ok(());
+            // Zero-gen bins are still safe to evict; wallet-failed bins were retained.
+            return Ok(zero_keys);
         }
 
         let count = inputs.len();
@@ -209,11 +282,16 @@ impl SettlementEngine {
         match blockchain.execute_generation_mint_batch(inputs).await {
             Ok(signature) => {
                 info!("✅ Generation mint batch submitted ({count} recipients): {signature}");
-                Ok(())
+                // Evict minted + zero-gen bins. NOTE: "submitted" ≠ on-chain finalized;
+                // a crash between submit and eviction can replay a mint. True
+                // exactly-once needs chain-side idempotency on (meter, window).
+                zero_keys.extend(minted_keys);
+                Ok(zero_keys)
             }
             Err(e) => {
+                // Batch failed — retain ALL minted bins for retry, evict only zero-gen.
                 error!("❌ Generation mint batch failed: {e}");
-                Err(e)
+                Ok(zero_keys)
             }
         }
     }

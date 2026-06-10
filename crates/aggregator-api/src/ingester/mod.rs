@@ -1,4 +1,5 @@
 pub mod batcher;
+pub mod bin_store;
 pub mod settlement_engine;
 pub mod zone_ingester;
 

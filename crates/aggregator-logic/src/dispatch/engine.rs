@@ -45,10 +45,10 @@ impl DispatchEngine {
     }
 
     async fn dispatch_action(&mut self, adapter: Arc<dyn DispatchAdapter>, action: DispatchType, capacity_kw: f64) -> Result<()> {
-        // Query aggregator state
-        let mut aggregator = self.aggregator.lock().await;
-        let bins = aggregator.take_completed_bins();
-        
+        // Query aggregator state (read-only: dispatch must NOT drain settlement's bins).
+        let aggregator = self.aggregator.lock().await;
+        let bins = aggregator.peek_completed_bins();
+
         // Calculate total capacity
         let total_capacity: rust_decimal::Decimal = bins.iter().map(|b| b.energy_generated).sum();
         

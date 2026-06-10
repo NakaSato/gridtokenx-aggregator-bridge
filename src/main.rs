@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use anyhow::{Context as _, Result};
 use axum::{
@@ -102,6 +101,29 @@ async fn main() -> Result<()> {
         early_redis_conn.clone(),
     ));
 
+    // 4c. Durable billing-bin store (crash recovery for unsettled energy). Restore
+    // any bins persisted before a previous restart BEFORE settlement starts, so a
+    // bounce mid-window doesn't silently drop the GRID those readings should mint.
+    let bin_store = early_redis_conn
+        .clone()
+        .map(ingester::bin_store::BinStore::new);
+    if let Some(store) = &bin_store {
+        match store.load_all().await {
+            Ok(bins) if !bins.is_empty() => {
+                let n = bins.len();
+                aggregator.lock().await.rehydrate(bins);
+                info!("♻️ Restored {} unsettled billing bins from durable store", n);
+            }
+            Ok(_) => info!("♻️ Durable bin store empty — fresh start"),
+            Err(e) => warn!(
+                "⚠️ Failed to restore billing bins from Redis: {} — starting empty",
+                e
+            ),
+        }
+    } else {
+        warn!("⚠️ No Redis — billing bins are RAM-only (energy lost on restart)");
+    }
+
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
     let zone_ingester = match ingester::zone_ingester::ZoneEventIngester::new(
@@ -111,6 +133,7 @@ async fn main() -> Result<()> {
         metrics.clone(),
         num_zones,
         meter_registry.clone(),
+        bin_store.clone(),
     )
     .await
     {
@@ -182,8 +205,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    // 8. Initialize Dispatch Engine
-    let aggregator = Arc::new(Mutex::new(aggregator::Aggregator::default()));
+    // 8. Initialize Dispatch Engine — reuses the SINGLE shared aggregator (the one
+    // the zone ingester fills). Must NOT create a second instance: a separate
+    // aggregator here would never see any readings, and previously caused settlement
+    // (which clones this binding) to scan an always-empty map → zero mints.
     let grpc_client = dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?;
     let mut dispatch_engine = dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
     
@@ -289,7 +314,12 @@ async fn main() -> Result<()> {
             })
             .ok()?
             .shared(1024);
-        let config = ClientConfig::new(uri).protocol(Protocol::Grpc);
+        // IAM gates GetUserWallet behind ServiceRole::AggregatorBridge. The role is
+        // derived from the `x-gridtokenx-role` header (see ServiceRole::from_headers in
+        // gridtokenx-blockchain-core); without it the call is denied as Unknown.
+        let config = ClientConfig::new(uri)
+            .protocol(Protocol::Grpc)
+            .default_header("x-gridtokenx-role", "aggregator-bridge");
         let client = state::IdentityServiceClient::new(conn, config);
         info!("✅ IAM gRPC client connected to {}", iam_service_url);
         Some(Arc::new(client))
@@ -335,6 +365,7 @@ async fn main() -> Result<()> {
 
     let settlement_signer_task = settlement_signer.clone();
     let settlement_identity_client = identity_client.clone();
+    let settlement_bin_store = bin_store.clone();
     let _settlement_handle = tokio::spawn(async move {
         let engine = ingester::settlement_engine::SettlementEngine::new(
             settlement_agg,
@@ -343,6 +374,7 @@ async fn main() -> Result<()> {
             mint_via_chain_bridge,
             settlement_blockchain,
             settlement_identity_client,
+            settlement_bin_store,
         );
         engine.run(settlement_shutdown).await;
     });
