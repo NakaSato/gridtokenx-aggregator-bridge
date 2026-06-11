@@ -1,9 +1,9 @@
 use crate::dispatch::grpc_client::DispatchType;
 use crate::dispatch::DispatchAdapter;
-use anyhow::{Result};
-use tracing::info;
-use serde::{Serialize, Deserialize};
+use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use tracing::info;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DerControlPayload {
@@ -45,4 +45,3 @@ impl DispatchAdapter for Ieee2030_5Adapter {
         Ok(())
     }
 }
-

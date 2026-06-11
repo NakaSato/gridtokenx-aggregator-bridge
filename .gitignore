@@ -34,3 +34,6 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Vendored reference repos (not part of this workspace; e.g. openleadr-rs for local VTN testing)
+vendor/

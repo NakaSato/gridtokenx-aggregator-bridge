@@ -74,3 +74,15 @@ Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `IOT_GATEWAY_PORT`, `GRPC
 `IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `AGGREGATOR_BRIDGE_SIGNING_KEY`,
 `SETTLEMENT_API_URL`, `IOT_NUM_ZONES` (default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS
 decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow plaintext v4 frames when a device has no `enckey`).
+
+OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
+(`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.
+Optional: `OPENLEADR_CLIENT_ID`/`OPENLEADR_CLIENT_SECRET` (OAuth pair), `OPENLEADR_PROGRAM_ID`,
+`OPENLEADR_PROGRAM_NAME` (default `gridtokenx-flex-dispatch`), `OPENLEADR_TARGET`,
+`OPENLEADR_EVENT_DURATION_HOURS` (default 1.0). A local VTN for testing runs as the superproject's
+`openleadr-vtn` compose service (port 4030, upstream openleadr-rs v0.2.3 — same version as the
+`openleadr-client`/`openleadr-wire` crates.io deps; dev credentials `bl-client`/`bl-client` are
+seeded by the one-shot `openleadr-vtn-seed` service). The dispatch trigger is a Kafka
+`GridStatusEvent` JSON message on `KAFKA_TOPIC_GRID_STATUS` (default
+`gridtokenx.aggregator.grid_status`); dispatch also requires at least one completed aggregation
+bin (capacity > 0), so ingest telemetry first.

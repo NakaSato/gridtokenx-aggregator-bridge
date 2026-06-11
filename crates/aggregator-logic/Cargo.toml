@@ -15,6 +15,11 @@ redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 async-nats = "0.37"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
+# OpenADR demand response client
+openleadr-client = "0.2.3"
+openleadr-wire = "0.2.3"
+url = "2.5"
+
 # Async
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync"] }
 async-trait = "0.1"
