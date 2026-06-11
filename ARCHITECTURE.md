@@ -56,6 +56,51 @@
   retries the `XADD` once on transport error (`Router::disseminate`, verified
   `crates/aggregator-logic/src/router.rs:84`).
 
+### Dispatch layer (VPP flex)
+
+Frequency-driven demand response. The fleet itself is the frequency sensor —
+no external SCADA feed:
+
+- **Self-sourced grid status.** The zone ingester feeds each reading's
+  `frequency` / `frequency_hz` metadata into a rolling window
+  (`FrequencyMonitor`, verified `crates/aggregator-logic/src/grid_status.rs:19`;
+  ingester hook verified
+  `crates/aggregator-api/src/ingester/zone_ingester.rs:466`, extraction `:597`).
+  Implausible samples (<40 / >70 Hz) are dropped. A publisher task in `main`
+  turns the window mean into `GridStatusEvent` JSON on the Kafka dispatch topic
+  every `GRID_STATUS_PUBLISH_SECS` (default 30s; verified `src/main.rs:224`).
+- **Dispatch engine.** A Kafka listener (verified `src/main.rs:294`) feeds each
+  grid-status frequency to `DispatchEngine::evaluate_and_dispatch` (verified
+  `crates/aggregator-logic/src/dispatch/engine.rs:116`): below
+  `DISPATCH_FREQ_LOW_HZ` ⇒ FLEX_UP, above `DISPATCH_FREQ_HIGH_HZ` ⇒ FLEX_DOWN,
+  capacity `DISPATCH_CAPACITY_KW`. Dispatch refuses to fire with zero completed
+  aggregation capacity. Repeat suppression: a same-action re-dispatch waits out
+  `DISPATCH_COOLDOWN_SECS` (default 900 = one settlement window); an action flip
+  bypasses it; the cooldown starts only on success (`cooldown_allows`, verified
+  `crates/aggregator-logic/src/dispatch/engine.rs:35`).
+- **Adapters.** `DISPATCH_ADAPTER` picks `grpc` (ConnectRPC to edge
+  controllers), `ieee` (IEEE 2030.5 DERControl), or `openleadr` (default when
+  configured, else `ieee`).
+- **OpenADR 3, BL side (outbound).** `OpenLeadrAdapter` (verified
+  `crates/aggregator-logic/src/standards/openleadr.rs:25`) acts as business
+  logic against a VTN (`OPENLEADR_VTN_URL`): each dispatch becomes an OpenADR
+  event with a signed-kW `DISPATCH_SETPOINT` payload (up = +, down = −;
+  `dispatch_event`, verified
+  `crates/aggregator-logic/src/standards/openleadr.rs:87`). The program is
+  resolved by name before create — blind create 409s forever after a restart.
+- **OpenADR 3, VEN side (inbound).** `OpenLeadrVenListener` (verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:33`) polls a
+  (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
+  `DISPATCH_SETPOINT` events and executes them through an injected adapter —
+  `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
+  to a VTN. Events dedupe on id + `modificationDateTime`; failed dispatches
+  retry next poll (`poll_once`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:102`).
+- **Local test loop.** The superproject compose runs an `openleadr-vtn` service
+  (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
+  `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
+  → dispatch → VTN event → VEN execution.
+
 ## 4. Market Layer
 - **Settlement:** HyperEVM.
 - **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
