@@ -12,8 +12,8 @@ use tracing::{error, info, warn};
 // aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
 use aggregator_api::{
-    aggregator, dispatch, grpc, handlers, infra, ingester, protocol, router, standards, state,
-    telemetry,
+    aggregator, dispatch, grid_status, grpc, handlers, infra, ingester, protocol, router,
+    standards, state, telemetry,
 };
 
 use tokio::signal;
@@ -127,6 +127,20 @@ async fn main() -> Result<()> {
 
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
+
+    // Rolling grid-frequency window, fed by the zone ingester from reading
+    // metadata and drained by the grid-status publisher below. Only useful
+    // when Kafka is configured (the dispatch trigger path).
+    let frequency_monitor = std::env::var("KAFKA_BOOTSTRAP_SERVERS").ok().map(|_| {
+        let window_secs = std::env::var("GRID_FREQ_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        Arc::new(grid_status::FrequencyMonitor::new(
+            std::time::Duration::from_secs(window_secs),
+        ))
+    });
+
     let zone_ingester = match ingester::zone_ingester::ZoneEventIngester::new(
         &redis_url,
         &api_services_grpc_url,
@@ -135,6 +149,7 @@ async fn main() -> Result<()> {
         num_zones,
         meter_registry.clone(),
         bin_store.clone(),
+        frequency_monitor.clone(),
     )
     .await
     {
@@ -205,6 +220,51 @@ async fn main() -> Result<()> {
         info!("ℹ️ Kafka disabled (KAFKA_BOOTSTRAP_SERVERS not set)");
         None
     };
+
+    // Grid-status publisher: periodically turn the rolling frequency window
+    // (fed by the zone ingester from meter telemetry) into GridStatusEvents on
+    // the dispatch topic. The fleet itself is the frequency sensor — no
+    // external SCADA feed needed for frequency-driven dispatch.
+    if let (Some(monitor), Some(producer)) = (frequency_monitor.clone(), kafka_producer.clone()) {
+        let topic = std::env::var("KAFKA_TOPIC_GRID_STATUS")
+            .unwrap_or_else(|_| "gridtokenx.aggregator.grid_status".to_string());
+        let publish_secs = std::env::var("GRID_STATUS_PUBLISH_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1);
+        let publisher_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            info!(
+                "📶 Grid-status publisher started (every {}s → {})",
+                publish_secs, topic
+            );
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(publish_secs));
+            loop {
+                tokio::select! {
+                    _ = publisher_shutdown.cancelled() => {
+                        info!("🔄 Grid-status publisher shutting down...");
+                        return;
+                    }
+                    _ = ticker.tick() => {
+                        let Some(frequency) = monitor.mean() else { continue };
+                        let event = infra::kafka::GridStatusEvent {
+                            frequency,
+                            load_kw: 0.0,
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or_default(),
+                        };
+                        if let Err(e) = producer.publish_grid_status(&topic, &event).await {
+                            warn!("⚠️ Grid-status publish failed: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // 8. Initialize Dispatch Engine — reuses the SINGLE shared aggregator (the one
     // the zone ingester fills). Must NOT create a second instance: a separate

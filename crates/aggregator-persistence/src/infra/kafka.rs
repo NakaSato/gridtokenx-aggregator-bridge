@@ -78,6 +78,20 @@ impl AggregatorKafkaProducer {
 
         Ok(())
     }
+
+    /// Publish a grid status event to the given topic (the producer's default
+    /// topic is the meter-readings stream, so the topic is explicit here).
+    pub async fn publish_grid_status(&self, topic: &str, event: &GridStatusEvent) -> Result<()> {
+        let payload = serde_json::to_string(event)?;
+        let record = FutureRecord::to(topic).key("grid_status").payload(&payload);
+
+        self.producer
+            .send(record, Duration::from_secs(5))
+            .await
+            .map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
+
+        Ok(())
+    }
 }
 
 pub struct AggregatorKafkaConsumer {

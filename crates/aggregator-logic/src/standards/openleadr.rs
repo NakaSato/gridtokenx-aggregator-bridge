@@ -142,11 +142,25 @@ impl OpenLeadrAdapter {
                 .map_err(|e| anyhow!("OpenADR program lookup failed: {e}"));
         }
 
-        let program = self
+        // Look the program up by name before creating it: program_name is
+        // unique on the VTN, so after a process restart (cached id lost) a
+        // blind create would 409 forever.
+        let existing = self
             .client
-            .create_program(ProgramRequest::new(self.program_name.clone()))
+            .get_program_list(openleadr_client::Filter::<&str>::None)
             .await
-            .map_err(|e| anyhow!("OpenADR program creation failed: {e}"))?;
+            .map_err(|e| anyhow!("OpenADR program list failed: {e}"))?
+            .into_iter()
+            .find(|p| p.content().program_name == self.program_name);
+
+        let program = match existing {
+            Some(program) => program,
+            None => self
+                .client
+                .create_program(ProgramRequest::new(self.program_name.clone()))
+                .await
+                .map_err(|e| anyhow!("OpenADR program creation failed: {e}"))?,
+        };
         *self.program_id.lock().await = Some(program.id().clone());
         Ok(program)
     }

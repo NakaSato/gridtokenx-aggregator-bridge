@@ -45,6 +45,9 @@ pub struct ZoneEventIngester {
     meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
     /// Durable billing-bin store (crash recovery). None ⇒ degraded (RAM-only) mode.
     bin_store: Option<BinStore>,
+    /// Rolling grid-frequency window fed from reading metadata. None ⇒ no
+    /// frequency-driven dispatch (e.g. Kafka disabled).
+    frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
 }
 
 impl ZoneEventIngester {
@@ -56,6 +59,7 @@ impl ZoneEventIngester {
         num_zones: usize,
         meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
         bin_store: Option<BinStore>,
+        frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let connection_manager = Self::create_connection_manager(&client).await?;
@@ -108,6 +112,7 @@ impl ZoneEventIngester {
             num_zones,
             meter_registry,
             bin_store,
+            frequency_monitor,
         })
     }
 
@@ -458,6 +463,14 @@ impl ZoneEventIngester {
     ) -> Result<()> {
         use crate::models::DeviceMetrics;
 
+        // Feed the grid-frequency window (drives the dispatch engine via the
+        // periodic grid-status publisher in main).
+        if let Some(monitor) = &self.frequency_monitor {
+            if let Some(hz) = extract_frequency(&reading.metadata) {
+                monitor.record(hz);
+            }
+        }
+
         let (energy_generated, energy_consumed, net_kwh) = match reading.metrics {
             DeviceMetrics::Energy {
                 generated_kwh,
@@ -573,7 +586,51 @@ impl ZoneEventIngester {
         let _: () = redis::AsyncCommands::xack(&mut conn, stream_name, &self.group_name, &[entry_id])
             .await
             .context("Failed to ACK message in Redis stream")?;
-            
+
         Ok(())
+    }
+}
+
+/// Pull a grid-frequency sample (Hz) out of reading metadata. Accepts both the
+/// REST/simulator key (`frequency`) and the explicit-unit variant
+/// (`frequency_hz`), as number or numeric string.
+fn extract_frequency(metadata: &std::collections::HashMap<String, serde_json::Value>) -> Option<f64> {
+    ["frequency", "frequency_hz"]
+        .iter()
+        .find_map(|key| metadata.get(*key))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_frequency;
+    use std::collections::HashMap;
+
+    fn meta(key: &str, value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        HashMap::from([(key.to_string(), value)])
+    }
+
+    #[test]
+    fn frequency_from_number_and_string() {
+        assert_eq!(
+            extract_frequency(&meta("frequency", serde_json::json!(49.9))),
+            Some(49.9)
+        );
+        assert_eq!(
+            extract_frequency(&meta("frequency_hz", serde_json::json!("50.1"))),
+            Some(50.1)
+        );
+    }
+
+    #[test]
+    fn missing_or_non_numeric_frequency_is_none() {
+        assert_eq!(extract_frequency(&HashMap::new()), None);
+        assert_eq!(
+            extract_frequency(&meta("frequency", serde_json::json!("not-a-number"))),
+            None
+        );
     }
 }
