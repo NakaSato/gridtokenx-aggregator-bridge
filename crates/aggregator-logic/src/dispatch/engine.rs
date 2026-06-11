@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::aggregator::Aggregator;
 use crate::dispatch::grpc_client::{DispatchClient, DispatchType};
@@ -16,6 +16,8 @@ pub struct DispatchEngine {
     freq_low_hz: f64,
     freq_high_hz: f64,
     capacity_kw: f64,
+    cooldown: std::time::Duration,
+    last_dispatch: Option<(DispatchType, std::time::Instant)>,
 }
 
 fn env_f64(var: &str, default: f64) -> f64 {
@@ -23,6 +25,22 @@ fn env_f64(var: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
+}
+
+/// Repeat-suppression policy: a dispatch goes through when there is no prior
+/// dispatch, when the action flipped (grid condition reversed — react now), or
+/// when the cooldown since the last same-action dispatch has elapsed. Without
+/// this, a sustained excursion re-fires on every grid-status message and
+/// floods the adapter (e.g. one OpenADR event per publish interval).
+fn cooldown_allows(
+    last: Option<(DispatchType, std::time::Instant)>,
+    action: DispatchType,
+    cooldown: std::time::Duration,
+) -> bool {
+    match last {
+        Some((last_action, at)) => last_action != action || at.elapsed() >= cooldown,
+        None => true,
+    }
 }
 
 impl DispatchEngine {
@@ -72,6 +90,15 @@ impl DispatchEngine {
             freq_low_hz: env_f64("DISPATCH_FREQ_LOW_HZ", 49.8),
             freq_high_hz: env_f64("DISPATCH_FREQ_HIGH_HZ", 50.2),
             capacity_kw: env_f64("DISPATCH_CAPACITY_KW", 100.0),
+            // Default one settlement window: a sustained excursion produces one
+            // dispatch per 15 minutes, not one per grid-status message.
+            cooldown: std::time::Duration::from_secs(
+                std::env::var("DISPATCH_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(900),
+            ),
+            last_dispatch: None,
         }
     }
 
@@ -95,16 +122,32 @@ impl DispatchEngine {
             .ok_or_else(|| anyhow!("dispatch adapter {} not registered", self.adapter_name))?
             .clone();
 
-        if frequency < self.freq_low_hz {
-            warn!("Frequency low! Dispatching FLEX_UP command.");
-            self.dispatch_action(adapter, DispatchType::FLEX_UP, self.capacity_kw)
-                .await?;
+        let action = if frequency < self.freq_low_hz {
+            Some(DispatchType::FLEX_UP)
         } else if frequency > self.freq_high_hz {
-            info!("Frequency high! Dispatching FLEX_DOWN command.");
-            self.dispatch_action(adapter, DispatchType::FLEX_DOWN, self.capacity_kw)
-                .await?;
+            Some(DispatchType::FLEX_DOWN)
         } else {
             info!("Frequency stable.");
+            None
+        };
+
+        if let Some(action) = action {
+            if !cooldown_allows(self.last_dispatch, action, self.cooldown) {
+                debug!(
+                    "Dispatch of {:?} suppressed (cooldown {:?} active)",
+                    action, self.cooldown
+                );
+                return Ok(());
+            }
+            match action {
+                DispatchType::FLEX_UP => warn!("Frequency low! Dispatching FLEX_UP command."),
+                DispatchType::FLEX_DOWN => info!("Frequency high! Dispatching FLEX_DOWN command."),
+            }
+            self.dispatch_action(adapter, action, self.capacity_kw)
+                .await?;
+            // Record only on success: a failed dispatch must retry on the next
+            // grid-status message, not silently sit out the cooldown.
+            self.last_dispatch = Some((action, std::time::Instant::now()));
         }
 
         Ok(())
@@ -172,5 +215,44 @@ mod tests {
     #[test]
     fn env_f64_falls_back_on_missing_or_garbage() {
         assert_eq!(env_f64("DISPATCH_TEST_UNSET_VAR", 49.8), 49.8);
+    }
+
+    #[test]
+    fn cooldown_allows_first_dispatch() {
+        assert!(cooldown_allows(
+            None,
+            DispatchType::FLEX_UP,
+            std::time::Duration::from_secs(900)
+        ));
+    }
+
+    #[test]
+    fn cooldown_suppresses_repeat_action() {
+        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
+        assert!(!cooldown_allows(
+            last,
+            DispatchType::FLEX_UP,
+            std::time::Duration::from_secs(900)
+        ));
+    }
+
+    #[test]
+    fn cooldown_lets_flipped_action_through() {
+        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
+        assert!(cooldown_allows(
+            last,
+            DispatchType::FLEX_DOWN,
+            std::time::Duration::from_secs(900)
+        ));
+    }
+
+    #[test]
+    fn cooldown_expires() {
+        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
+        assert!(cooldown_allows(
+            last,
+            DispatchType::FLEX_UP,
+            std::time::Duration::from_secs(0)
+        ));
     }
 }
