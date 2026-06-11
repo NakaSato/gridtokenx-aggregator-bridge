@@ -12,7 +12,8 @@ use tracing::{error, info, warn};
 // aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
 use aggregator_api::{
-    aggregator, dispatch, grpc, handlers, infra, ingester, protocol, router, state, telemetry,
+    aggregator, dispatch, grpc, handlers, infra, ingester, protocol, router, standards, state,
+    telemetry,
 };
 
 use tokio::signal;
@@ -242,6 +243,32 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // VEN-side OpenADR listener: poll a utility VTN for DISPATCH_SETPOINT events
+    // and execute them downstream. The downstream adapter is independent of the
+    // dispatch engine's (BL-side) adapter — never "openleadr", or events would
+    // loop back to a VTN.
+    {
+        let ven_adapter: Arc<dyn dispatch::DispatchAdapter> =
+            match std::env::var("OPENLEADR_VEN_DISPATCH_ADAPTER").as_deref() {
+                Ok("grpc") => {
+                    let addr = std::env::var("DISPATCH_GRPC_URL")
+                        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+                    Arc::new(dispatch::grpc_client::DispatchClient::new(addr).await?)
+                }
+                _ => Arc::new(standards::ieee2030_5::Ieee2030_5Adapter::new()),
+            };
+        match standards::openleadr_ven::OpenLeadrVenListener::from_env(ven_adapter) {
+            Ok(Some(listener)) => {
+                let ven_shutdown = shutdown_token.clone();
+                tokio::spawn(async move {
+                    listener.run(ven_shutdown.cancelled_owned()).await;
+                });
+            }
+            Ok(None) => {}
+            Err(e) => warn!("⚠️ OpenADR VEN listener disabled: {}", e),
+        }
     }
 
     // RabbitMQ Producer

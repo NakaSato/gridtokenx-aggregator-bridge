@@ -86,3 +86,10 @@ seeded by the one-shot `openleadr-vtn-seed` service). The dispatch trigger is a 
 `GridStatusEvent` JSON message on `KAFKA_TOPIC_GRID_STATUS` (default
 `gridtokenx.aggregator.grid_status`); dispatch also requires at least one completed aggregation
 bin (capacity > 0), so ingest telemetry first.
+
+OpenADR VEN side: `OPENLEADR_VEN_VTN_URL` enables a polling listener
+(`crates/aggregator-logic/src/standards/openleadr_ven.rs`) that consumes `DISPATCH_SETPOINT` events
+from a (utility) VTN and executes them via `OPENLEADR_VEN_DISPATCH_ADAPTER` (`ieee` default, `grpc`
+→ `DISPATCH_GRPC_URL`) — never `openleadr`, or events would loop back to a VTN. Positive setpoint =
+FLEX_UP, negative = FLEX_DOWN; events are deduped by id + modificationDateTime and retried next
+poll on dispatch failure.
