@@ -51,17 +51,36 @@ impl DlmsStack {
         let mut generated_wh = 0.0;
         let mut consumed_wh = 0.0;
         let mut metadata = HashMap::new();
+        // Plain JSON energy keys (kWh). REST meters sign over these via
+        // `canonical_sign_value` (aggregator-api handlers.rs), so they must land in
+        // the same metrics or the signed value diverges from the stored one. OBIS
+        // registers take precedence when both forms appear (HashMap iteration order
+        // is random — resolve after the loop, not by last-write-wins).
+        let mut plain_generated_kwh: Option<f64> = None;
+        let mut plain_consumed_kwh: Option<f64> = None;
+        let mut obis_generated = false;
+        let mut obis_consumed = false;
 
         for (key, val) in payload {
             match key.as_str() {
                 // Electricity - Active Energy
                 obis::ELEC_ACTIVE_IMPORT_TOTAL => {
                     consumed_wh = val.as_f64().unwrap_or(0.0);
+                    obis_consumed = true;
                     metadata.insert("obis_active_import".to_string(), val.clone());
                 }
                 obis::ELEC_ACTIVE_EXPORT_TOTAL => {
                     generated_wh = val.as_f64().unwrap_or(0.0);
+                    obis_generated = true;
                     metadata.insert("obis_active_export".to_string(), val.clone());
+                }
+                "energy_generated" => {
+                    plain_generated_kwh = val.as_f64();
+                    metadata.insert(key.clone(), val.clone());
+                }
+                "energy_consumed" => {
+                    plain_consumed_kwh = val.as_f64();
+                    metadata.insert(key.clone(), val.clone());
                 }
 
                 // Electricity - Reactive Energy
@@ -133,6 +152,17 @@ impl DlmsStack {
             }
         }
 
+        if !obis_generated {
+            if let Some(kwh) = plain_generated_kwh {
+                generated_wh = kwh * 1000.0;
+            }
+        }
+        if !obis_consumed {
+            if let Some(kwh) = plain_consumed_kwh {
+                consumed_wh = kwh * 1000.0;
+            }
+        }
+
         (generated_wh / 1000.0, consumed_wh / 1000.0, metadata)
     }
 }
@@ -160,13 +190,23 @@ impl ProtocolStack for DlmsStack {
             Value::from("active_attribute_proxy"),
         );
 
+        // Meter-reported timestamp drives the 15-minute billing windows (offline
+        // meters batch backdated readings); fall back to arrival time when the
+        // field is absent or unparseable.
+        let timestamp = payload
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
+
         Ok(Some(DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: device_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: device_id.to_string(),
             zone_code: None,
-            timestamp: Utc::now(),
+            timestamp,
             metrics: DeviceMetrics::Energy {
                 generated_kwh,
                 consumed_kwh,
@@ -216,6 +256,59 @@ mod tests {
             reading.metadata.get("demand_response_status").unwrap(),
             &json!("load_shedding")
         );
+    }
+
+    #[tokio::test]
+    async fn test_dlms_plain_energy_keys_and_meter_timestamp() {
+        let stack = DlmsStack::new();
+        // REST meters sign over plain energy keys (canonical_sign_value) and
+        // report their own timestamp — both must survive decoding.
+        let payload = json!({
+            "device_id": "PLAIN-MTR",
+            "timestamp": "2026-06-11T10:07:30.000Z",
+            "energy_generated": 20.0,
+            "energy_consumed": 3.5,
+            "signature": "ignored-here"
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+
+        let reading = stack.handle_message("PLAIN-MTR", &raw).await.unwrap().unwrap();
+
+        if let DeviceMetrics::Energy {
+            generated_kwh,
+            consumed_kwh,
+            net_kwh,
+        } = reading.metrics
+        {
+            assert_eq!(generated_kwh, 20.0);
+            assert_eq!(consumed_kwh, 3.5);
+            assert_eq!(net_kwh, 16.5);
+        } else {
+            panic!("expected Energy metrics");
+        }
+        assert_eq!(
+            reading.timestamp,
+            chrono::DateTime::parse_from_rfc3339("2026-06-11T10:07:30.000Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dlms_obis_overrides_plain_energy_keys() {
+        let stack = DlmsStack::new();
+        let payload = json!({
+            "1.1.2.8.0.255": 5000.0,   // OBIS export 5 kWh — wins
+            "energy_generated": 99.0,  // plain key — ignored when OBIS present
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+
+        let reading = stack.handle_message("MIX-MTR", &raw).await.unwrap().unwrap();
+        if let DeviceMetrics::Energy { generated_kwh, .. } = reading.metrics {
+            assert_eq!(generated_kwh, 5.0);
+        } else {
+            panic!("expected Energy metrics");
+        }
     }
 
     #[tokio::test]
