@@ -37,7 +37,16 @@ impl FrequencyMonitor {
         let mut samples = self.samples.lock().expect("frequency monitor poisoned");
         samples.push_back((Instant::now(), hz));
         // Opportunistic eviction keeps the deque bounded even without reads.
-        let cutoff = Instant::now() - self.window;
+        Self::evict(&mut samples, self.window);
+    }
+
+    /// Evict samples older than the window. `checked_sub`: early in process
+    /// life `Instant::now() - window` underflows on some platforms — a panic
+    /// here would poison the mutex and kill frequency tracking permanently.
+    fn evict(samples: &mut VecDeque<(Instant, f64)>, window: Duration) {
+        let Some(cutoff) = Instant::now().checked_sub(window) else {
+            return;
+        };
         while samples.front().is_some_and(|(t, _)| *t < cutoff) {
             samples.pop_front();
         }
@@ -46,10 +55,7 @@ impl FrequencyMonitor {
     /// Mean frequency over the window, or None when no fresh samples exist.
     pub fn mean(&self) -> Option<f64> {
         let mut samples = self.samples.lock().expect("frequency monitor poisoned");
-        let cutoff = Instant::now() - self.window;
-        while samples.front().is_some_and(|(t, _)| *t < cutoff) {
-            samples.pop_front();
-        }
+        Self::evict(&mut samples, self.window);
         if samples.is_empty() {
             return None;
         }

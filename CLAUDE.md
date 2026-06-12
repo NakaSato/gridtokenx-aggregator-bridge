@@ -90,6 +90,10 @@ bin (capacity > 0), so ingest telemetry first.
 OpenADR VEN side: `OPENLEADR_VEN_VTN_URL` enables a polling listener
 (`crates/aggregator-logic/src/standards/openleadr_ven.rs`) that consumes `DISPATCH_SETPOINT` events
 from a (utility) VTN and executes them via `OPENLEADR_VEN_DISPATCH_ADAPTER` (`ieee` default, `grpc`
-→ `DISPATCH_GRPC_URL`) — never `openleadr`, or events would loop back to a VTN. Positive setpoint =
-FLEX_UP, negative = FLEX_DOWN; events are deduped by id + modificationDateTime and retried next
-poll on dispatch failure.
+→ `DISPATCH_GRPC_URL`) — never `openleadr`, or events would loop back to a VTN. Note: `ieee` is a
+simulation stub (logs, no actuation) — main.rs warns loud when the VEN uses it because execution
+reports would attest simulated dispatch. Positive setpoint = FLEX_UP, negative = FLEX_DOWN;
+multi-interval events execute each interval as its window opens (deduped per interval); events are
+deduped by id + modificationDateTime and retried next poll on dispatch failure. When
+`OPENLEADR_VEN_VTN_URL` equals `OPENLEADR_VTN_URL` with no program/target filter, main.rs warns:
+the VEN would consume the bridge's own outbound events (double actuation).

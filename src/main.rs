@@ -270,7 +270,18 @@ async fn main() -> Result<()> {
     // the zone ingester fills). Must NOT create a second instance: a separate
     // aggregator here would never see any readings, and previously caused settlement
     // (which clones this binding) to scan an always-empty map → zero mints.
-    let grpc_client = dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?;
+    let dispatch_grpc_url = std::env::var("DISPATCH_GRPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let grpc_client = match dispatch::grpc_client::DispatchClient::new(dispatch_grpc_url.clone()).await {
+        Ok(client) => client,
+        Err(e) => {
+            warn!(
+                "⚠️ DISPATCH_GRPC_URL '{}' invalid ({}); falling back to http://127.0.0.1:50051",
+                dispatch_grpc_url, e
+            );
+            dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?
+        }
+    };
     let mut dispatch_engine = dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
     
     // Kafka Consumer for Dispatch
@@ -309,25 +320,57 @@ async fn main() -> Result<()> {
     // and execute them downstream. The downstream adapter is independent of the
     // dispatch engine's (BL-side) adapter — never "openleadr", or events would
     // loop back to a VTN.
-    {
-        let ven_adapter: Arc<dyn dispatch::DispatchAdapter> =
+    if let Ok(ven_vtn_url) = std::env::var("OPENLEADR_VEN_VTN_URL") {
+        // Self-consumption guard: BL publishes to and VEN polls the SAME VTN.
+        // Without a program/target filter the VEN would execute the bridge's own
+        // outbound dispatch events — double actuation.
+        if std::env::var("OPENLEADR_VTN_URL").as_deref() == Ok(ven_vtn_url.as_str())
+            && std::env::var("OPENLEADR_VEN_PROGRAM_ID").is_err()
+            && std::env::var("OPENLEADR_VEN_TARGET").is_err()
+        {
+            warn!(
+                "⚠️ OPENLEADR_VEN_VTN_URL matches OPENLEADR_VTN_URL with no \
+                 OPENLEADR_VEN_PROGRAM_ID/OPENLEADR_VEN_TARGET filter — the VEN \
+                 will execute this bridge's own outbound dispatch events"
+            );
+        }
+        let ven_adapter: Option<Arc<dyn dispatch::DispatchAdapter>> =
             match std::env::var("OPENLEADR_VEN_DISPATCH_ADAPTER").as_deref() {
                 Ok("grpc") => {
                     let addr = std::env::var("DISPATCH_GRPC_URL")
                         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
-                    Arc::new(dispatch::grpc_client::DispatchClient::new(addr).await?)
+                    match dispatch::grpc_client::DispatchClient::new(addr.clone()).await {
+                        Ok(client) => Some(Arc::new(client)),
+                        Err(e) => {
+                            warn!(
+                                "⚠️ OpenADR VEN listener disabled: DISPATCH_GRPC_URL '{}' invalid: {}",
+                                addr, e
+                            );
+                            None
+                        }
+                    }
                 }
-                _ => Arc::new(standards::ieee2030_5::Ieee2030_5Adapter::new()),
+                _ => {
+                    warn!(
+                        "⚠️ OpenADR VEN downstream adapter is the IEEE 2030.5 SIMULATION \
+                         stub — dispatches are logged, not actuated, yet execution reports \
+                         are still posted to the VTN. Set OPENLEADR_VEN_DISPATCH_ADAPTER=grpc \
+                         (or OPENLEADR_VEN_REPORTS=false) for production."
+                    );
+                    Some(Arc::new(standards::ieee2030_5::Ieee2030_5Adapter::new()))
+                }
             };
-        match standards::openleadr_ven::OpenLeadrVenListener::from_env(ven_adapter) {
-            Ok(Some(listener)) => {
-                let ven_shutdown = shutdown_token.clone();
-                tokio::spawn(async move {
-                    listener.run(ven_shutdown.cancelled_owned()).await;
-                });
+        if let Some(ven_adapter) = ven_adapter {
+            match standards::openleadr_ven::OpenLeadrVenListener::from_env(ven_adapter) {
+                Ok(Some(listener)) => {
+                    let ven_shutdown = shutdown_token.clone();
+                    tokio::spawn(async move {
+                        listener.run(ven_shutdown.cancelled_owned()).await;
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => warn!("⚠️ OpenADR VEN listener disabled: {}", e),
             }
-            Ok(None) => {}
-            Err(e) => warn!("⚠️ OpenADR VEN listener disabled: {}", e),
         }
     }
 

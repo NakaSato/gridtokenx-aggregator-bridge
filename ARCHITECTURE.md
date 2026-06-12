@@ -69,15 +69,17 @@ no external SCADA feed:
   Implausible samples (<40 / >70 Hz) are dropped. A publisher task in `main`
   turns the window mean into `GridStatusEvent` JSON on the Kafka dispatch topic
   every `GRID_STATUS_PUBLISH_SECS` (default 30s; verified `src/main.rs:224`).
-- **Dispatch engine.** A Kafka listener (verified `src/main.rs:294`) feeds each
+- **Dispatch engine.** A Kafka listener (verified `src/main.rs:303`) feeds each
   grid-status frequency to `DispatchEngine::evaluate_and_dispatch` (verified
-  `crates/aggregator-logic/src/dispatch/engine.rs:116`): below
+  `crates/aggregator-logic/src/dispatch/engine.rs:133`): below
   `DISPATCH_FREQ_LOW_HZ` ⇒ FLEX_UP, above `DISPATCH_FREQ_HIGH_HZ` ⇒ FLEX_DOWN,
   capacity `DISPATCH_CAPACITY_KW`. Dispatch refuses to fire with zero completed
-  aggregation capacity. Repeat suppression: a same-action re-dispatch waits out
-  `DISPATCH_COOLDOWN_SECS` (default 900 = one settlement window); an action flip
-  bypasses it; the cooldown starts only on success (`cooldown_allows`, verified
-  `crates/aggregator-logic/src/dispatch/engine.rs:35`).
+  aggregation capacity. Repeat suppression is tracked **per action**: a
+  re-dispatch of the same action waits out `DISPATCH_COOLDOWN_SECS` (default
+  900 = one settlement window); a flipped action fires immediately on its own
+  independent timer, so an oscillating frequency cannot reset the cooldown by
+  alternating directions; a cooldown starts only on success (`cooldown_allows`,
+  verified `crates/aggregator-logic/src/dispatch/engine.rs:41`).
 - **Adapters.** `DISPATCH_ADAPTER` picks `grpc` (ConnectRPC to edge
   controllers), `ieee` (IEEE 2030.5 DERControl), or `openleadr` (default when
   configured, else `ieee`).
@@ -89,25 +91,29 @@ no external SCADA feed:
   `crates/aggregator-logic/src/standards/openleadr.rs:87`). The program is
   resolved by name before create — blind create 409s forever after a restart.
 - **OpenADR 3, VEN side (inbound).** `OpenLeadrVenListener` (verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:42`) polls a
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:46`) polls a
   (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
   `DISPATCH_SETPOINT` events and executes them through an injected adapter —
   `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
-  to a VTN. Event schedules are honored (`decide`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:344`): future windows
-  wait, expired windows are skipped, the interval-level period wins over the
-  event-level default, and a period-less event executes immediately. Events
-  dedupe on id + `modificationDateTime` — persisted to Redis
-  (`gridtokenx:openleadr:ven:executed`) so a restart does not re-execute
-  still-listed events; failed dispatches retry next poll (`poll_once`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:145`). Optional
+  to a VTN. Event schedules are honored across **all** setpoint intervals
+  (`decide`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:492`): each interval
+  executes as its window opens (deduped per interval), future windows wait,
+  an event is done only when no pending interval remains, the interval-level
+  period wins over the event-level default, and a period-less interval
+  executes immediately. Events dedupe on id + `modificationDateTime` —
+  persisted to Redis (`gridtokenx:openleadr:ven:executed`) so a restart does
+  not re-execute still-listed events; failed dispatches retry next poll, and
+  entries for events the VTN no longer lists are pruned after 7 days
+  (`poll_once`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:170`). Optional
   `OPENLEADR_VEN_TARGET` restricts polling to events carrying that target. An
   executed event that vanishes from the VTN while still active is flagged loud
   (cancellation visibility) — no automatic revert, by design. Each executed
   dispatch is confirmed back to the VTN as an OpenADR report (AGGREGATED_REPORT
   resource, SETPOINT payload; best-effort — a report failure never fails or
   retries the dispatch; `post_execution_report`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:277`).
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:333`).
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka

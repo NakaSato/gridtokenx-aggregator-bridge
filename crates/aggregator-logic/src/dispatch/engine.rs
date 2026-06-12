@@ -17,7 +17,10 @@ pub struct DispatchEngine {
     freq_high_hz: f64,
     capacity_kw: f64,
     cooldown: std::time::Duration,
-    last_dispatch: Option<(DispatchType, std::time::Instant)>,
+    // Last successful dispatch per action. Per-action (not just "the last
+    // action") so an oscillating frequency cannot defeat the cooldown by
+    // flip-flopping between FLEX_UP and FLEX_DOWN.
+    last_dispatch: Vec<(DispatchType, std::time::Instant)>,
 }
 
 fn env_f64(var: &str, default: f64) -> f64 {
@@ -27,18 +30,20 @@ fn env_f64(var: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// Repeat-suppression policy: a dispatch goes through when there is no prior
-/// dispatch, when the action flipped (grid condition reversed — react now), or
-/// when the cooldown since the last same-action dispatch has elapsed. Without
-/// this, a sustained excursion re-fires on every grid-status message and
-/// floods the adapter (e.g. one OpenADR event per publish interval).
+/// Repeat-suppression policy: a dispatch goes through when this action has
+/// never fired, or when its own cooldown has elapsed. A flipped action still
+/// reacts immediately (its timer is independent), but — unlike tracking only
+/// the most recent action — an oscillating frequency cannot reset the timer
+/// by alternating FLEX_UP/FLEX_DOWN: each direction holds its own cooldown.
+/// Without this, a sustained or oscillating excursion re-fires on every
+/// grid-status message and floods the adapter (e.g. one OpenADR event per
+/// publish interval).
 fn cooldown_allows(
-    last: Option<(DispatchType, std::time::Instant)>,
-    action: DispatchType,
+    last_same_action: Option<std::time::Instant>,
     cooldown: std::time::Duration,
 ) -> bool {
-    match last {
-        Some((last_action, at)) => last_action != action || at.elapsed() >= cooldown,
+    match last_same_action {
+        Some(at) => at.elapsed() >= cooldown,
         None => true,
     }
 }
@@ -98,8 +103,20 @@ impl DispatchEngine {
                     .and_then(|v| v.parse::<u64>().ok())
                     .unwrap_or(900),
             ),
-            last_dispatch: None,
+            last_dispatch: Vec::new(),
         }
+    }
+
+    fn last_dispatch_of(&self, action: DispatchType) -> Option<std::time::Instant> {
+        self.last_dispatch
+            .iter()
+            .find(|(a, _)| *a == action)
+            .map(|(_, at)| *at)
+    }
+
+    fn record_dispatch(&mut self, action: DispatchType) {
+        self.last_dispatch.retain(|(a, _)| *a != action);
+        self.last_dispatch.push((action, std::time::Instant::now()));
     }
 
     fn default_adapter_name(
@@ -132,7 +149,7 @@ impl DispatchEngine {
         };
 
         if let Some(action) = action {
-            if !cooldown_allows(self.last_dispatch, action, self.cooldown) {
+            if !cooldown_allows(self.last_dispatch_of(action), self.cooldown) {
                 debug!(
                     "Dispatch of {:?} suppressed (cooldown {:?} active)",
                     action, self.cooldown
@@ -147,7 +164,7 @@ impl DispatchEngine {
                 .await?;
             // Record only on success: a failed dispatch must retry on the next
             // grid-status message, not silently sit out the cooldown.
-            self.last_dispatch = Some((action, std::time::Instant::now()));
+            self.record_dispatch(action);
         }
 
         Ok(())
@@ -219,40 +236,43 @@ mod tests {
 
     #[test]
     fn cooldown_allows_first_dispatch() {
-        assert!(cooldown_allows(
-            None,
-            DispatchType::FLEX_UP,
-            std::time::Duration::from_secs(900)
-        ));
+        assert!(cooldown_allows(None, std::time::Duration::from_secs(900)));
     }
 
     #[test]
     fn cooldown_suppresses_repeat_action() {
-        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
         assert!(!cooldown_allows(
-            last,
-            DispatchType::FLEX_UP,
-            std::time::Duration::from_secs(900)
-        ));
-    }
-
-    #[test]
-    fn cooldown_lets_flipped_action_through() {
-        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
-        assert!(cooldown_allows(
-            last,
-            DispatchType::FLEX_DOWN,
+            Some(std::time::Instant::now()),
             std::time::Duration::from_secs(900)
         ));
     }
 
     #[test]
     fn cooldown_expires() {
-        let last = Some((DispatchType::FLEX_UP, std::time::Instant::now()));
         assert!(cooldown_allows(
-            last,
-            DispatchType::FLEX_UP,
+            Some(std::time::Instant::now()),
             std::time::Duration::from_secs(0)
         ));
+    }
+
+    // Per-action tracking: a flipped action fires immediately (independent
+    // timer), but oscillation cannot reset a direction's own cooldown.
+    #[test]
+    fn per_action_timers_survive_oscillation() {
+        let mut last: Vec<(DispatchType, std::time::Instant)> = Vec::new();
+        let lookup = |last: &Vec<(DispatchType, std::time::Instant)>, action: DispatchType| {
+            last.iter().find(|(a, _)| *a == action).map(|(_, at)| *at)
+        };
+        let cooldown = std::time::Duration::from_secs(900);
+
+        // FLEX_UP fires, then frequency flips: FLEX_DOWN still allowed.
+        last.push((DispatchType::FLEX_UP, std::time::Instant::now()));
+        assert!(cooldown_allows(lookup(&last, DispatchType::FLEX_DOWN), cooldown));
+
+        // FLEX_DOWN fires too; now flipping BACK to FLEX_UP is suppressed —
+        // its own timer is still hot.
+        last.push((DispatchType::FLEX_DOWN, std::time::Instant::now()));
+        assert!(!cooldown_allows(lookup(&last, DispatchType::FLEX_UP), cooldown));
+        assert!(!cooldown_allows(lookup(&last, DispatchType::FLEX_DOWN), cooldown));
     }
 }

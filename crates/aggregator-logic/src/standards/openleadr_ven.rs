@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -62,14 +62,22 @@ pub struct OpenLeadrVenListener {
     client_name: String,
 }
 
-/// What to do with one polled event, given "now".
+/// What to do with one polled event, given "now" and the set of interval ids
+/// already executed for the current event version.
 #[derive(Debug, PartialEq)]
 enum EventDecision {
-    /// Active dispatch event — execute this setpoint.
-    Execute { setpoint_kw: f64 },
-    /// Dispatch event whose window hasn't started — re-check next poll.
+    /// An active, not-yet-executed dispatch interval — execute this setpoint.
+    /// `more_pending` means other intervals (future, or also active) remain,
+    /// so the event must stay live for the next poll instead of being marked
+    /// fully seen.
+    Execute {
+        setpoint_kw: f64,
+        interval_id: i32,
+        more_pending: bool,
+    },
+    /// Dispatch event with no active interval yet — re-check next poll.
     NotYetActive,
-    /// Dispatch event whose window already ended — never execute.
+    /// No pending interval remains (all expired or already executed).
     Expired,
     /// Not a numeric DISPATCH_SETPOINT event.
     NotDispatch,
@@ -203,12 +211,26 @@ impl OpenLeadrVenListener {
                 continue;
             }
 
-            match decide(event.content(), now) {
+            // Interval ids already executed for THIS version of the event
+            // (per-interval dedup keys: "{event_id}#{interval_id}").
+            let interval_prefix = format!("{id}#");
+            let executed: HashSet<i32> = self
+                .seen
+                .iter()
+                .filter_map(|(key, ts)| {
+                    let suffix = key.strip_prefix(&interval_prefix)?;
+                    (*ts >= modified)
+                        .then(|| suffix.parse::<i32>().ok())
+                        .flatten()
+                })
+                .collect();
+
+            match decide(event.content(), now, &executed) {
                 EventDecision::NotDispatch => {
                     self.mark_seen(id, modified).await;
                 }
                 EventDecision::Expired => {
-                    debug!("OpenADR VEN event {} expired before execution", id);
+                    debug!("OpenADR VEN event {} has no pending interval", id);
                     self.mark_seen(id, modified).await;
                 }
                 EventDecision::NotYetActive => {
@@ -216,17 +238,28 @@ impl OpenLeadrVenListener {
                     // until its window opens.
                     debug!("OpenADR VEN event {} not yet active", id);
                 }
-                EventDecision::Execute { setpoint_kw } => {
+                EventDecision::Execute {
+                    setpoint_kw,
+                    interval_id,
+                    more_pending,
+                } => {
                     let (action, capacity_kw) = setpoint_to_dispatch(setpoint_kw);
                     match self.adapter.execute_dispatch(action, capacity_kw).await {
                         Ok(()) => {
                             info!(
-                                "OpenADR VEN event executed: event_id={} setpoint_kw={} action={:?} capacity_kw={}",
-                                id, setpoint_kw, action, capacity_kw
+                                "OpenADR VEN event executed: event_id={} interval_id={} setpoint_kw={} action={:?} capacity_kw={}",
+                                id, interval_id, setpoint_kw, action, capacity_kw
                             );
                             self.executed_active
                                 .insert(id.clone(), active_window_end(event.content(), now));
-                            self.mark_seen(id, modified).await;
+                            if more_pending {
+                                // Other intervals still pending: dedup only
+                                // this interval, keep the event live.
+                                self.mark_seen(format!("{id}#{interval_id}"), modified)
+                                    .await;
+                            } else {
+                                self.mark_seen(id.clone(), modified).await;
+                            }
                             dispatched += 1;
                             // Best-effort: the dispatch already happened, so a
                             // report failure must not fail (or retry) it.
@@ -267,6 +300,29 @@ impl OpenLeadrVenListener {
             }
             false
         });
+
+        // Bound the dedup map: drop entries for events the VTN no longer lists
+        // AND whose recorded modification time is old. The age guard protects
+        // against a paginated/filtered listing that hides an event the VTN
+        // still has — pruning it while fresh could re-execute it.
+        let prune_cutoff = now - chrono::Duration::days(7);
+        let stale: Vec<String> = self
+            .seen
+            .iter()
+            .filter(|(key, modified)| {
+                let base = key.split('#').next().unwrap_or(key);
+                !present.contains_key(base) && **modified < prune_cutoff
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.seen.remove(&key);
+            if let Some(store) = &mut self.redis {
+                if let Err(e) = store.remove(&key).await {
+                    warn!("OpenADR VEN dedup prune failed for {}: {}", key, e);
+                }
+            }
+        }
 
         Ok(dispatched)
     }
@@ -387,62 +443,114 @@ impl RedisSeenStore {
         }
         Ok(())
     }
+
+    async fn remove(&mut self, id: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let res: redis::RedisResult<()> = redis::AsyncCommands::hdel(&mut conn, SEEN_KEY, id).await;
+        if res.is_err() {
+            // One rebuild + retry, mirroring the verifier/router pattern.
+            self.conn = None;
+            let mut conn = self.conn().await?;
+            let _: () = redis::AsyncCommands::hdel(&mut conn, SEEN_KEY, id).await?;
+        }
+        Ok(())
+    }
 }
 
-/// First numeric DISPATCH_SETPOINT payload + the interval period governing it.
-fn find_setpoint(event: &EventRequest) -> Option<(f64, Option<&IntervalPeriod>)> {
-    event.intervals.as_ref()?.iter().find_map(|interval| {
-        interval.payloads.iter().find_map(|payload| {
-            if payload.value_type != EventType::DispatchSetpoint {
-                return None;
-            }
-            payload.values.iter().find_map(|v| match v {
-                Value::Number(n) => Some((*n, interval.interval_period.as_ref())),
-                _ => None,
+/// Every numeric DISPATCH_SETPOINT payload in the event: (interval id,
+/// setpoint, interval-level period). One entry per interval (first numeric
+/// setpoint payload of each).
+fn find_setpoints(event: &EventRequest) -> Vec<(i32, f64, Option<&IntervalPeriod>)> {
+    event
+        .intervals
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|interval| {
+            interval.payloads.iter().find_map(|payload| {
+                if payload.value_type != EventType::DispatchSetpoint {
+                    return None;
+                }
+                payload.values.iter().find_map(|v| match v {
+                    Value::Number(n) => {
+                        Some((interval.id, *n, interval.interval_period.as_ref()))
+                    }
+                    _ => None,
+                })
             })
         })
-    })
+        .collect()
 }
 
-/// Decide what to do with an event at time `now`, honoring its schedule.
-/// The interval-level period wins over the event-level default; an event with
-/// no period at all executes immediately (an "as soon as possible" dispatch).
-fn decide(event: &EventRequest, now: DateTime<Utc>) -> EventDecision {
-    let Some((setpoint_kw, interval_period)) = find_setpoint(event) else {
+/// Decide what to do with an event at time `now`, honoring its schedule
+/// across ALL setpoint intervals (not only the first — a multi-interval
+/// schedule executes each interval as its window opens). `executed` holds the
+/// interval ids already dispatched for this event version.
+/// Per interval: the interval-level period wins over the event-level default;
+/// an interval with no period at all executes immediately ("as soon as
+/// possible") unless already executed.
+fn decide(event: &EventRequest, now: DateTime<Utc>, executed: &HashSet<i32>) -> EventDecision {
+    let setpoints = find_setpoints(event);
+    if setpoints.is_empty() {
         return EventDecision::NotDispatch;
-    };
-
-    let Some(period) = interval_period.or(event.interval_period.as_ref()) else {
-        return EventDecision::Execute { setpoint_kw };
-    };
-
-    if now < period.start {
-        return EventDecision::NotYetActive;
     }
-    let duration = period.duration.as_ref().or(event.duration.as_ref());
-    if let Some(d) = duration {
-        let end = period.start + d.to_chrono_at_datetime(period.start);
-        if now >= end {
-            return EventDecision::Expired;
+
+    let mut any_future = false;
+    let mut active_unexecuted: Vec<(i32, f64)> = Vec::new();
+    for (interval_id, setpoint_kw, interval_period) in setpoints {
+        let active = match interval_period.or(event.interval_period.as_ref()) {
+            // No schedule: an "as soon as possible" dispatch, always active.
+            None => true,
+            Some(period) if now < period.start => {
+                any_future = true;
+                false
+            }
+            Some(period) => {
+                let duration = period.duration.as_ref().or(event.duration.as_ref());
+                match duration {
+                    Some(d) => now < period.start + d.to_chrono_at_datetime(period.start),
+                    None => true, // open-ended interval
+                }
+            }
+        };
+        if active && !executed.contains(&interval_id) {
+            active_unexecuted.push((interval_id, setpoint_kw));
         }
     }
-    EventDecision::Execute { setpoint_kw }
+
+    if let Some(&(interval_id, setpoint_kw)) = active_unexecuted.first() {
+        return EventDecision::Execute {
+            setpoint_kw,
+            interval_id,
+            more_pending: any_future || active_unexecuted.len() > 1,
+        };
+    }
+    if any_future {
+        EventDecision::NotYetActive
+    } else {
+        EventDecision::Expired
+    }
 }
 
-/// End of the event's active window (for cancellation tracking). Unbounded
-/// events get "now + 24h" — enough to notice a near-term cancellation without
+/// End of the event's active window (for cancellation tracking): the latest
+/// end across all setpoint intervals. Unbounded/period-less intervals count
+/// as "now + 24h" — enough to notice a near-term cancellation without
 /// tracking them forever.
 fn active_window_end(event: &EventRequest, now: DateTime<Utc>) -> DateTime<Utc> {
-    let period = find_setpoint(event)
-        .and_then(|(_, p)| p)
-        .or(event.interval_period.as_ref());
-    match period {
-        Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
-            Some(d) => p.start + d.to_chrono_at_datetime(p.start),
-            None => now + chrono::Duration::hours(24),
-        },
-        None => now + chrono::Duration::hours(24),
-    }
+    let fallback = now + chrono::Duration::hours(24);
+    find_setpoints(event)
+        .iter()
+        .map(|(_, _, interval_period)| {
+            match interval_period.or(event.interval_period.as_ref()) {
+                Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
+                    Some(d) => p.start + d.to_chrono_at_datetime(p.start),
+                    None => fallback,
+                },
+                None => fallback,
+            }
+        })
+        .max()
+        .unwrap_or(fallback)
 }
 
 /// Signed setpoint (kW) → dispatch action + magnitude. Positive = FLEX_UP.
@@ -500,13 +608,21 @@ mod tests {
         assert_eq!(setpoint_to_dispatch(0.0), (DispatchType::FLEX_UP, 0.0));
     }
 
+    fn no_executed() -> HashSet<i32> {
+        HashSet::new()
+    }
+
     #[test]
     fn unscheduled_event_executes_immediately() {
         let event =
             event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
         assert_eq!(
-            decide(&event, Utc::now()),
-            EventDecision::Execute { setpoint_kw: 42.0 }
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::Execute {
+                setpoint_kw: 42.0,
+                interval_id: 0,
+                more_pending: false
+            }
         );
     }
 
@@ -515,22 +631,32 @@ mod tests {
         // Started 10 min ago, lasts 1h.
         let event = setpoint_event(-10, 1.0);
         assert_eq!(
-            decide(&event, Utc::now()),
-            EventDecision::Execute { setpoint_kw: 42.0 }
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::Execute {
+                setpoint_kw: 42.0,
+                interval_id: 0,
+                more_pending: false
+            }
         );
     }
 
     #[test]
     fn future_event_waits() {
         let event = setpoint_event(30, 1.0);
-        assert_eq!(decide(&event, Utc::now()), EventDecision::NotYetActive);
+        assert_eq!(
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::NotYetActive
+        );
     }
 
     #[test]
     fn expired_event_skipped() {
         // Started 3h ago, lasted 1h.
         let event = setpoint_event(-180, 1.0);
-        assert_eq!(decide(&event, Utc::now()), EventDecision::Expired);
+        assert_eq!(
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::Expired
+        );
     }
 
     #[test]
@@ -539,18 +665,77 @@ mod tests {
         let mut event = setpoint_event(-10, 1.0);
         let future = IntervalPeriod::new(Utc::now() + chrono::Duration::minutes(30));
         event.intervals.as_mut().unwrap()[0].interval_period = Some(future);
-        assert_eq!(decide(&event, Utc::now()), EventDecision::NotYetActive);
+        assert_eq!(
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::NotYetActive
+        );
     }
 
     #[test]
     fn non_setpoint_event_is_not_dispatch() {
         let event = event_with_payload(EventType::Price, vec![Value::Number(1.0)]);
-        assert_eq!(decide(&event, Utc::now()), EventDecision::NotDispatch);
+        assert_eq!(
+            decide(&event, Utc::now(), &no_executed()),
+            EventDecision::NotDispatch
+        );
         let text = event_with_payload(
             EventType::DispatchSetpoint,
             vec![Value::String("oops".to_string())],
         );
-        assert_eq!(decide(&text, Utc::now()), EventDecision::NotDispatch);
+        assert_eq!(
+            decide(&text, Utc::now(), &no_executed()),
+            EventDecision::NotDispatch
+        );
+    }
+
+    /// Two intervals: one active now, one starting later. The active one
+    /// executes with more_pending=true; once executed, the event waits for
+    /// the future interval instead of being marked expired; when that opens
+    /// it executes as the last pending interval (more_pending=false).
+    #[test]
+    fn multi_interval_schedule_executes_each_window() {
+        fn interval(id: i32, setpoint: f64, start_offset_mins: i64) -> EventInterval {
+            let mut period =
+                IntervalPeriod::new(Utc::now() + chrono::Duration::minutes(start_offset_mins));
+            period.duration = Some(WireDuration::hours(1.0));
+            EventInterval {
+                id,
+                interval_period: Some(period),
+                payloads: vec![EventValuesMap {
+                    value_type: EventType::DispatchSetpoint,
+                    values: vec![Value::Number(setpoint)],
+                }],
+            }
+        }
+        let mut event = EventRequest::new(ProgramId::new("test-program").unwrap());
+        event.intervals = Some(vec![interval(0, 10.0, -10), interval(1, -20.0, 120)]);
+
+        let now = Utc::now();
+        // First poll: interval 0 active, interval 1 future.
+        assert_eq!(
+            decide(&event, now, &no_executed()),
+            EventDecision::Execute {
+                setpoint_kw: 10.0,
+                interval_id: 0,
+                more_pending: true
+            }
+        );
+        // Interval 0 executed: hold for interval 1, do NOT expire the event.
+        let executed: HashSet<i32> = [0].into();
+        assert_eq!(decide(&event, now, &executed), EventDecision::NotYetActive);
+        // Interval 1's window opens (starts +120min, lasts 1h — jump to +150min).
+        let later = now + chrono::Duration::minutes(150);
+        assert_eq!(
+            decide(&event, later, &executed),
+            EventDecision::Execute {
+                setpoint_kw: -20.0,
+                interval_id: 1,
+                more_pending: false
+            }
+        );
+        // Both executed, nothing future: done.
+        let executed: HashSet<i32> = [0, 1].into();
+        assert_eq!(decide(&event, later, &executed), EventDecision::Expired);
     }
 
     #[test]
