@@ -44,4 +44,8 @@ impl DispatchAdapter for Ieee2030_5Adapter {
         info!("IEEE 2030.5 payload transmitted successfully.");
         Ok(())
     }
+
+    fn is_simulation(&self) -> bool {
+        true
+    }
 }

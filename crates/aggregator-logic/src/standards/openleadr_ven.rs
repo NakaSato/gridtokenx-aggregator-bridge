@@ -104,6 +104,11 @@ impl OpenLeadrVenListener {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
+        let simulated = adapter.is_simulation();
+        let reports_override = std::env::var("OPENLEADR_VEN_REPORTS")
+            .ok()
+            .map(|v| v.to_lowercase() != "false");
+
         let mut listener = Self::new(
             &vtn_url,
             credentials,
@@ -113,9 +118,18 @@ impl OpenLeadrVenListener {
             adapter,
             std::env::var("REDIS_URL").ok(),
         )?;
-        listener.reports_enabled = std::env::var("OPENLEADR_VEN_REPORTS")
-            .map(|v| v.to_lowercase() != "false")
-            .unwrap_or(true);
+        // Fail-safe: a simulated adapter must not attest dispatch it never
+        // performed. Reports stay off for a sim adapter unless the operator
+        // sets OPENLEADR_VEN_REPORTS=true explicitly (e.g. to exercise the
+        // report path in tests).
+        listener.reports_enabled = resolve_reports_enabled(reports_override, simulated);
+        if !listener.reports_enabled && reports_override.is_none() && simulated {
+            warn!(
+                "OpenADR VEN execution reports suppressed: downstream adapter is a \
+                 simulation and would attest dispatch that never physically happened. \
+                 Set OPENLEADR_VEN_REPORTS=true to force reporting."
+            );
+        }
         if let Ok(name) = std::env::var("OPENLEADR_VEN_CLIENT_NAME") {
             listener.client_name = name;
         }
@@ -608,6 +622,18 @@ fn setpoint_to_dispatch(setpoint_kw: f64) -> (DispatchType, f64) {
     }
 }
 
+/// Whether the VEN should post execution reports back to the VTN.
+///
+/// An explicit `OPENLEADR_VEN_REPORTS` setting always wins. With no override,
+/// a simulated adapter defaults to *off* (don't attest dispatch that never
+/// physically happened); a real adapter defaults to *on*.
+fn resolve_reports_enabled(reports_override: Option<bool>, simulated: bool) -> bool {
+    match (reports_override, simulated) {
+        (Some(explicit), _) => explicit,
+        (None, simulated) => !simulated,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +668,21 @@ mod tests {
         period.duration = Some(WireDuration::hours(duration_hours));
         event.interval_period = Some(period);
         event
+    }
+
+    #[test]
+    fn reports_default_off_for_simulation_on_for_real() {
+        // No override: real adapter reports, simulated adapter stays silent.
+        assert!(resolve_reports_enabled(None, false));
+        assert!(!resolve_reports_enabled(None, true));
+    }
+
+    #[test]
+    fn reports_explicit_override_wins_over_simulation_default() {
+        // Operator can force a simulated adapter to report (e.g. e2e tests),
+        // or silence a real adapter.
+        assert!(resolve_reports_enabled(Some(true), true));
+        assert!(!resolve_reports_enabled(Some(false), false));
     }
 
     #[test]

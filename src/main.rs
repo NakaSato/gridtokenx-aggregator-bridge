@@ -41,6 +41,13 @@ fn expand_env(s: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install default crypto provider for rustls (required for rustls 0.23+ when both
+    // ring and aws-lc-rs are in the dependency graph; the mTLS Chain Bridge client
+    // panics on provider ambiguity otherwise).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install default crypto provider");
+
     // 1. Initialize
     dotenv().ok();
     // Initialize OpenTelemetry tracing (sets up global subscriber)
@@ -354,9 +361,10 @@ async fn main() -> Result<()> {
                 _ => {
                     warn!(
                         "⚠️ OpenADR VEN downstream adapter is the IEEE 2030.5 SIMULATION \
-                         stub — dispatches are logged, not actuated, yet execution reports \
-                         are still posted to the VTN. Set OPENLEADR_VEN_DISPATCH_ADAPTER=grpc \
-                         (or OPENLEADR_VEN_REPORTS=false) for production."
+                         stub — dispatches are logged, not actuated. Execution reports are \
+                         suppressed (so the VTN is not told a simulated dispatch happened) \
+                         unless OPENLEADR_VEN_REPORTS=true is set. Set \
+                         OPENLEADR_VEN_DISPATCH_ADAPTER=grpc for production."
                     );
                     Some(Arc::new(standards::ieee2030_5::Ieee2030_5Adapter::new()))
                 }
