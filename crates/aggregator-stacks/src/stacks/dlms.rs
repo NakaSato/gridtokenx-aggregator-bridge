@@ -32,6 +32,8 @@ mod obis {
 
     // Gas (Medium 7)
     pub const GAS_VOLUME_TOTAL: &str = "7.0.11.0.0.255";
+    // Kept for OBIS-dictionary completeness even while no decoder reads it.
+    #[allow(dead_code)]
     pub const GAS_TEMPERATURE: &str = "7.0.41.0.0.255";
 
     // Water (Medium 8)

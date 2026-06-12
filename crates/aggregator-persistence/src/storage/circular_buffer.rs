@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-use tracing::{debug, error, info};
+use std::path::Path;
+use tracing::{debug, info};
 
 /// A local, resilient telemetry ring-buffer using SQLite.
 /// Ensures 24-hour data retention for offline operation.

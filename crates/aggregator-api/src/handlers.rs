@@ -1,7 +1,6 @@
 use crate::models::{
     BatchPrivateNetworkPayload, DeviceReading, DeviceType, IngestResponse, PrivateNetworkPayload,
 };
-use crate::protocol::stacks::ProtocolStack;
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::json;

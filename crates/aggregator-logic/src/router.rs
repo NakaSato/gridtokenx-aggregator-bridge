@@ -88,35 +88,6 @@ impl Router {
         let zone_idx = self.get_zone_index(reading);
         let stream_name = format!("gridtokenx:events:zone_{}", zone_idx);
 
-        // Map DeviceMetrics to flattened payload for api-services Compatibility
-        let (generated, consumed, net) = match reading.metrics {
-            aggregator_core::models::DeviceMetrics::Energy {
-                generated_kwh,
-                consumed_kwh,
-                net_kwh,
-            } => (Some(generated_kwh), Some(consumed_kwh), net_kwh),
-            _ => (None, None, 0.0),
-        };
-
-        // Construct payload matching api-services::domain::events::MeterReadingPayload
-        let event_payload = serde_json::json!({
-            "reading_id": reading.reading_id,
-            "meter_id": reading.device_id,
-            "meter_serial": reading.serial_number,
-            "user_id": "00000000-0000-0000-0000-000000000000", // Placeholder for persistence worker
-            "wallet_address": reading.serial_number,
-            "zone_code": reading.zone_code,
-            "kwh": net,
-            "energy_generated": generated,
-            "energy_consumed": consumed,
-            "voltage": reading.metadata.get("voltage_v"),
-            "current": reading.metadata.get("current_a"),
-            "battery_level": reading.metadata.get("battery_level_pct"),
-            "temperature": reading.metadata.get("temperature_c"),
-            "metadata": reading.metadata,
-            "timestamp": reading.timestamp,
-        });
-
         let event_envelope = serde_json::json!({
             "event_type": self.event_type_name(reading),
             "payload": reading,
@@ -178,6 +149,10 @@ impl Router {
         // Option A: Forward telemetry directly to NATS for chain-bridge ingestion
         if let Some(nats) = &self.nats_client {
             if reading.device_type == aggregator_core::models::DeviceType::SmartMeter {
+                let net = match reading.metrics {
+                    aggregator_core::models::DeviceMetrics::Energy { net_kwh, .. } => net_kwh,
+                    _ => 0.0,
+                };
                 let nats_payload = MeterReadingMessage {
                     device_id: reading.device_id.clone(),
                     wallet_address: reading.serial_number.clone(), // using serial_number as wallet/device correlation

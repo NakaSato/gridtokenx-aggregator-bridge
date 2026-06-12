@@ -6,7 +6,6 @@
 //! - Batching telemetry submissions to API Gateway
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, Client};
@@ -20,7 +19,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::aggregator::Aggregator;
-use crate::infra::platform::{MeterReading, PlatformClient};
+use crate::infra::platform::PlatformClient;
 use crate::ingester::batcher::{BatchHandle, BatchWorker, BATCH_TIMEOUT_MS, FORWARD_BATCH_SIZE};
 use crate::ingester::bin_store::BinStore;
 use crate::ingester::Event;
@@ -471,7 +470,7 @@ impl ZoneEventIngester {
             }
         }
 
-        let (energy_generated, energy_consumed, net_kwh) = match reading.metrics {
+        let (energy_generated, energy_consumed, _net_kwh) = match reading.metrics {
             DeviceMetrics::Energy {
                 generated_kwh,
                 consumed_kwh,
@@ -553,35 +552,13 @@ impl ZoneEventIngester {
             }
         }
 
-        // 2. Forward to API Gateway (batched)
-        self.forward_to_api_services(
-            reading.reading_id,
-            meter_id,
-            reading.serial_number,
-            reading.zone_code.clone(),
-            net_kwh,
-            reading.timestamp,
-            stream_name,
-            entry_id,
-        )
-        .await
+        // 2. ACK in Redis to prevent redelivery. (The legacy HTTP/gRPC
+        // forwarder to the API gateway was removed in favor of direct Kafka
+        // streaming; Kafka publish happens earlier in this handler.)
+        self.ack_entry(stream_name, entry_id).await
     }
 
-    /// Forward meter reading to API Gateway with batching (UTT Pipeline)
-    async fn forward_to_api_services(
-        &self,
-        reading_id: Uuid,
-        meter_id: Uuid,
-        meter_serial: String,
-        zone_code: Option<String>,
-        net_kwh: Decimal,
-        timestamp: DateTime<Utc>,
-        stream_name: &str,
-        entry_id: &str,
-    ) -> Result<()> {
-        // BYPASS: Legacy HTTP/gRPC forwarder removed in favor of direct Kafka streaming.
-        
-        // Directly ACK the message in Redis to prevent redelivery
+    async fn ack_entry(&self, stream_name: &str, entry_id: &str) -> Result<()> {
         let mut conn = self.connection_manager.clone();
         let _: () = redis::AsyncCommands::xack(&mut conn, stream_name, &self.group_name, &[entry_id])
             .await

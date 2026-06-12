@@ -185,10 +185,6 @@ impl BatchWorker {
         let count = self.batch.len();
         let start = Instant::now();
 
-        // Clone requests for the RPC (UTT Unified Ingestion)
-        let requests: Vec<MeterReading> =
-            self.batch.iter().map(|e| e.request.clone()).collect();
-
         debug!(
             "📤 Forwarding unified batch of {} readings to API Gateway...",
             count
