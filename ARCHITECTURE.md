@@ -89,13 +89,21 @@ no external SCADA feed:
   `crates/aggregator-logic/src/standards/openleadr.rs:87`). The program is
   resolved by name before create — blind create 409s forever after a restart.
 - **OpenADR 3, VEN side (inbound).** `OpenLeadrVenListener` (verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:33`) polls a
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:42`) polls a
   (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
   `DISPATCH_SETPOINT` events and executes them through an injected adapter —
   `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
-  to a VTN. Events dedupe on id + `modificationDateTime`; failed dispatches
-  retry next poll (`poll_once`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:102`).
+  to a VTN. Event schedules are honored (`decide`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:344`): future windows
+  wait, expired windows are skipped, the interval-level period wins over the
+  event-level default, and a period-less event executes immediately. Events
+  dedupe on id + `modificationDateTime` — persisted to Redis
+  (`gridtokenx:openleadr:ven:executed`) so a restart does not re-execute
+  still-listed events; failed dispatches retry next poll (`poll_once`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:145`). Optional
+  `OPENLEADR_VEN_TARGET` restricts polling to events carrying that target. An
+  executed event that vanishes from the VTN while still active is flagged loud
+  (cancellation visibility) — no automatic revert, by design.
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
