@@ -8,6 +8,7 @@ use connectrpc::client::SharedHttp2Connection;
 use gridtokenx_blockchain_core::{BlockchainService, NoopMetrics, Pubkey, SolanaProgramsConfig};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -280,16 +281,41 @@ impl SettlementEngine {
         let count = inputs.len();
         info!("💰 [Chain Bridge] Submitting batched generation mint for {count} recipient(s)");
         match blockchain.execute_generation_mint_batch(inputs).await {
-            Ok(signature) => {
-                info!("✅ Generation mint batch submitted ({count} recipients): {signature}");
-                // Evict minted + zero-gen bins. NOTE: "submitted" ≠ on-chain finalized;
-                // a crash between submit and eviction can replay a mint. True
-                // exactly-once needs chain-side idempotency on (meter, window).
-                zero_keys.extend(minted_keys);
+            Ok(outcome) => {
+                // The batch is chunked into multiple transactions that submit
+                // independently — a failed chunk is skipped, so submitted bins are an
+                // arbitrary subset (not a prefix). Evict exactly the bins covered by
+                // submitted chunks (`submitted_indices` into `minted_keys`, which is
+                // lockstep with `inputs`) and retain the rest for retry — a poison
+                // chunk no longer stalls the bins behind it.
+                // NOTE: "submitted" ≠ on-chain finalized; a crash between submit and
+                // eviction can replay a mint. True exactly-once needs chain-side
+                // idempotency on (meter, window).
+                let submitted: HashSet<usize> = outcome.submitted_indices.into_iter().collect();
+                if let Some(e) = &outcome.error {
+                    error!(
+                        "❌ Generation mint batch partially failed ({}/{count} recipient(s) \
+                         submitted): {e} — retaining unsubmitted bins for retry",
+                        submitted.len()
+                    );
+                } else {
+                    info!(
+                        "✅ Generation mint batch submitted ({count} recipients, {} tx): {:?}",
+                        outcome.signatures.len(),
+                        outcome.signatures
+                    );
+                }
+                // Evict submitted bins; retained (unsubmitted) keys are simply dropped,
+                // leaving their bins in the store for the next tick.
+                for (i, key) in minted_keys.into_iter().enumerate() {
+                    if submitted.contains(&i) {
+                        zero_keys.push(key);
+                    }
+                }
                 Ok(zero_keys)
             }
             Err(e) => {
-                // Batch failed — retain ALL minted bins for retry, evict only zero-gen.
+                // Batch failed before any submit — retain ALL minted bins, evict zero-gen.
                 error!("❌ Generation mint batch failed: {e}");
                 Ok(zero_keys)
             }

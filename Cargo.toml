@@ -31,6 +31,9 @@ metrics-exporter-prometheus = "0.17"
 anyhow = "1.0"
 dotenvy = "0.15"
 tracing = "0.1"
+# Pin the process-level CryptoProvider: the dependency graph enables both ring and
+# aws-lc-rs, and rustls 0.23 panics on provider ambiguity unless main() installs one.
+rustls = { version = "0.23", features = ["ring"] }
 
 # Application layer (re-exports logic/persistence/protocol/stacks/core)
 aggregator-api = { path = "crates/aggregator-api" }

@@ -2762,6 +2762,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus 0.17.2",
  "redis",
+ "rustls",
  "tokio",
  "tokio-util",
  "tracing",
