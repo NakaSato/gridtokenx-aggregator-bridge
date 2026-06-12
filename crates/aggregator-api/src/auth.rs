@@ -11,7 +11,6 @@ use crate::state::{
     AppState,
 };
 
-#[allow(dead_code)]
 pub async fn api_key_auth(
     State(state): State<AppState>,
     req: Request,
@@ -80,7 +79,8 @@ pub async fn api_key_auth(
         return Ok(next.run(req).await);
     }
 
-    warn!("🚫 API Key not authorized: {}", api_key);
+    // Don't log the key itself — a mistyped real credential would land in logs.
+    warn!("🚫 API Key not authorized (len={})", api_key.len());
     state.metrics.record_request(false, 0);
     Err(StatusCode::UNAUTHORIZED)
 }

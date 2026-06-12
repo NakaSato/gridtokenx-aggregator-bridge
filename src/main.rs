@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 // aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
 use aggregator_api::{
-    aggregator, dispatch, grid_status, grpc, handlers, infra, ingester, protocol, router,
+    aggregator, auth, dispatch, grid_status, grpc, handlers, infra, ingester, protocol, router,
     standards, state, telemetry,
 };
 
@@ -535,15 +535,15 @@ async fn main() -> Result<()> {
     // 8. Build IoT Gateway HTTP routes
     let metrics_handle = Arc::new(metrics_handle);
 
-    let app = AxumRouter::new()
-        .route("/health", get(handlers::health))
-        .route(
-            "/metrics",
-            get(move || {
-                let handle = metrics_handle.clone();
-                async move { handle.render() }
-            }),
-        )
+    // Ingest routes require an API key (IAM gRPC when available, else the
+    // static GRIDTOKENX_API_KEYS fallback); /health and /metrics stay open.
+    if app_state.api_keys.is_empty() && app_state.identity_client.is_none() {
+        warn!(
+            "⚠️ No GRIDTOKENX_API_KEYS configured and IAM is unavailable — \
+             every ingest request will be rejected with 401"
+        );
+    }
+    let ingest_routes = AxumRouter::new()
         .route(
             "/v1/private-network/ingest",
             post(handlers::ingest_private_network),
@@ -560,6 +560,21 @@ async fn main() -> Result<()> {
             "/v1/ingest/telemetry/batch",
             post(handlers::ingest_legacy_batch),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            auth::api_key_auth,
+        ));
+
+    let app = AxumRouter::new()
+        .route("/health", get(handlers::health))
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = metrics_handle.clone();
+                async move { handle.render() }
+            }),
+        )
+        .merge(ingest_routes)
         // .layer(axum::middleware::from_fn(middleware::otel_tracing::otel_tracing_middleware))
         .with_state(app_state.clone());
 
