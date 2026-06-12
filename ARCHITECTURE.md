@@ -94,10 +94,13 @@ no external SCADA feed:
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:46`) polls a
   (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
   `DISPATCH_SETPOINT` events and executes them through an injected adapter —
+  at startup it self-registers a VEN object named `OPENLEADR_VEN_CLIENT_NAME`
+  on the VTN, best-effort (`ensure_registered`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:177`) —
   `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
   to a VTN. Event schedules are honored across **all** setpoint intervals
   (`decide`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:492`): each interval
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:538`): each interval
   executes as its window opens (deduped per interval), future windows wait,
   an event is done only when no pending interval remains, the interval-level
   period wins over the event-level default, and a period-less interval
@@ -106,14 +109,14 @@ no external SCADA feed:
   not re-execute still-listed events; failed dispatches retry next poll, and
   entries for events the VTN no longer lists are pruned after 7 days
   (`poll_once`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:170`). Optional
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:212`). Optional
   `OPENLEADR_VEN_TARGET` restricts polling to events carrying that target. An
   executed event that vanishes from the VTN while still active is flagged loud
   (cancellation visibility) — no automatic revert, by design. Each executed
   dispatch is confirmed back to the VTN as an OpenADR report (AGGREGATED_REPORT
   resource, SETPOINT payload; best-effort — a report failure never fails or
   retries the dispatch; `post_execution_report`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:333`).
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:378`).
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka

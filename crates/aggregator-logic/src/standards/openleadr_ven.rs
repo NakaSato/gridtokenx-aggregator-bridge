@@ -12,6 +12,7 @@ use openleadr_wire::{
     report::{ReportResource, ResourceName},
     target::Target,
     values_map::{Value, ValueType, ValuesMap},
+    ven::VenVenRequest,
 };
 use redis::aio::ConnectionManager;
 use tracing::{debug, info, warn};
@@ -60,6 +61,8 @@ pub struct OpenLeadrVenListener {
     reports_enabled: bool,
     /// `clientName` stamped on execution reports.
     client_name: String,
+    /// Self-register a VEN object named `client_name` on the VTN at startup.
+    register: bool,
 }
 
 /// What to do with one polled event, given "now" and the set of interval ids
@@ -116,6 +119,9 @@ impl OpenLeadrVenListener {
         if let Ok(name) = std::env::var("OPENLEADR_VEN_CLIENT_NAME") {
             listener.client_name = name;
         }
+        listener.register = std::env::var("OPENLEADR_VEN_REGISTER")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
         Ok(Some(listener))
     }
 
@@ -158,7 +164,47 @@ impl OpenLeadrVenListener {
             seen_loaded: false,
             reports_enabled: true,
             client_name: "gridtokenx-aggregator-bridge".to_string(),
+            register: true,
         })
+    }
+
+    /// Best-effort VEN self-registration: ensure a VEN object named
+    /// `client_name` exists on the VTN. Utility VTNs typically require the
+    /// VEN object before events can be targeted at it. Failure (e.g. the
+    /// OAuth client lacks `write_vens_ven`) is logged loud and polling
+    /// proceeds unregistered — the VTN operator may have provisioned the VEN
+    /// out-of-band.
+    async fn ensure_registered(&self) {
+        if !self.register {
+            return;
+        }
+        if let Ok(ven) = self.client.get_ven_by_name(&self.client_name).await {
+            debug!(
+                "OpenADR VEN already registered on VTN: ven_id={} name={}",
+                ven.id().as_str(),
+                self.client_name
+            );
+            return;
+        }
+        match self
+            .client
+            .create_ven(VenVenRequest {
+                ven_name: self.client_name.clone(),
+                attributes: None,
+            })
+            .await
+        {
+            Ok(ven) => info!(
+                "OpenADR VEN registered on VTN: ven_id={} name={}",
+                ven.id().as_str(),
+                self.client_name
+            ),
+            Err(e) => warn!(
+                "OpenADR VEN registration failed for '{}' (continuing unregistered; \
+                 set OPENLEADR_VEN_REGISTER=false to silence): {}",
+                self.client_name, e
+            ),
+        }
     }
 
     /// One poll cycle: fetch events, dispatch every new/updated DISPATCH_SETPOINT
@@ -377,6 +423,7 @@ impl OpenLeadrVenListener {
             "OpenADR VEN listener started (poll every {:?})",
             self.poll_interval
         );
+        self.ensure_registered().await;
         tokio::pin!(shutdown);
         let mut ticker = tokio::time::interval(self.poll_interval);
         loop {

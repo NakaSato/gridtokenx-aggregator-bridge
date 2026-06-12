@@ -94,6 +94,8 @@ from a (utility) VTN and executes them via `OPENLEADR_VEN_DISPATCH_ADAPTER` (`ie
 simulation stub (logs, no actuation) — main.rs warns loud when the VEN uses it because execution
 reports would attest simulated dispatch. Positive setpoint = FLEX_UP, negative = FLEX_DOWN;
 multi-interval events execute each interval as its window opens (deduped per interval); events are
-deduped by id + modificationDateTime and retried next poll on dispatch failure. When
+deduped by id + modificationDateTime and retried next poll on dispatch failure. At startup the
+listener self-registers a VEN object named `OPENLEADR_VEN_CLIENT_NAME` on the VTN (best-effort;
+needs `write_vens_ven` scope; `OPENLEADR_VEN_REGISTER=false` disables). When
 `OPENLEADR_VEN_VTN_URL` equals `OPENLEADR_VTN_URL` with no program/target filter, main.rs warns:
 the VEN would consume the bridge's own outbound events (double actuation).
