@@ -249,6 +249,7 @@ async fn main() -> Result<()> {
                     }
                     _ = ticker.tick() => {
                         let Some(frequency) = monitor.mean() else { continue };
+                        ::metrics::gauge!("aggregator_grid_frequency_hz").set(frequency);
                         let event = infra::kafka::GridStatusEvent {
                             frequency,
                             load_kw: 0.0,
@@ -532,16 +533,17 @@ async fn main() -> Result<()> {
     };
 
     // 8. Build IoT Gateway HTTP routes
-    let api_routes = AxumRouter::new().route(
-        "/private-network/ingest",
-        post(handlers::ingest_private_network),
-    );
-
-    // Metrics endpoint that returns Prometheus format
     let metrics_handle = Arc::new(metrics_handle);
 
     let app = AxumRouter::new()
         .route("/health", get(handlers::health))
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = metrics_handle.clone();
+                async move { handle.render() }
+            }),
+        )
         .route(
             "/v1/private-network/ingest",
             post(handlers::ingest_private_network),

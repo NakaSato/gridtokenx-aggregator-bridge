@@ -301,6 +301,31 @@ pub fn record_energy_reading(reading_type: &str, value_kwh: f64, device_id: &str
 }
 
 // =============================================================================
+// Dispatch / OpenADR Metrics
+// =============================================================================
+
+/// Records a dispatch-engine outcome: "fired", "suppressed" (cooldown), or
+/// "failed" (adapter error — retried on the next grid-status message).
+pub fn record_dispatch_outcome(action: &str, adapter: &str, outcome: &str) {
+    counter!("aggregator_dispatch_total",
+        "action" => action.to_string(),
+        "adapter" => adapter.to_string(),
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+/// Records an OpenADR VEN listener outcome per polled event:
+/// "executed", "dispatch_failed" (retried next poll), or "report_failed"
+/// (best-effort report did not reach the VTN; dispatch already done).
+pub fn record_ven_event(outcome: &str) {
+    counter!("aggregator_openleadr_ven_events_total",
+        "outcome" => outcome.to_string()
+    )
+    .increment(1);
+}
+
+// =============================================================================
 // Batch Forwarding Metrics
 // =============================================================================
 

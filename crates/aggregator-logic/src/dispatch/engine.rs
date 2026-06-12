@@ -149,10 +149,16 @@ impl DispatchEngine {
         };
 
         if let Some(action) = action {
+            let action_label = format!("{:?}", action);
             if !cooldown_allows(self.last_dispatch_of(action), self.cooldown) {
                 debug!(
                     "Dispatch of {:?} suppressed (cooldown {:?} active)",
                     action, self.cooldown
+                );
+                crate::metrics::record_dispatch_outcome(
+                    &action_label,
+                    &self.adapter_name,
+                    "suppressed",
                 );
                 return Ok(());
             }
@@ -160,8 +166,18 @@ impl DispatchEngine {
                 DispatchType::FLEX_UP => warn!("Frequency low! Dispatching FLEX_UP command."),
                 DispatchType::FLEX_DOWN => info!("Frequency high! Dispatching FLEX_DOWN command."),
             }
-            self.dispatch_action(adapter, action, self.capacity_kw)
-                .await?;
+            if let Err(e) = self
+                .dispatch_action(adapter, action, self.capacity_kw)
+                .await
+            {
+                crate::metrics::record_dispatch_outcome(
+                    &action_label,
+                    &self.adapter_name,
+                    "failed",
+                );
+                return Err(e);
+            }
+            crate::metrics::record_dispatch_outcome(&action_label, &self.adapter_name, "fired");
             // Record only on success: a failed dispatch must retry on the next
             // grid-status message, not silently sit out the cooldown.
             self.record_dispatch(action);

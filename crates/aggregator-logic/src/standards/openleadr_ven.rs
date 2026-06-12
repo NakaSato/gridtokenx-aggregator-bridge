@@ -161,10 +161,6 @@ impl OpenLeadrVenListener {
         })
     }
 
-    pub fn poll_interval(&self) -> StdDuration {
-        self.poll_interval
-    }
-
     /// One poll cycle: fetch events, dispatch every new/updated DISPATCH_SETPOINT
     /// event that is inside its active window. Returns dispatches executed.
     pub async fn poll_once(&mut self) -> Result<usize> {
@@ -200,12 +196,12 @@ impl OpenLeadrVenListener {
         .map_err(|e| anyhow!("OpenADR VEN event poll failed: {e}"))?;
 
         let now = Utc::now();
-        let mut present: HashMap<String, ()> = HashMap::new();
+        let mut present: HashSet<String> = HashSet::new();
         let mut dispatched = 0;
 
         for event in events {
             let id = event.id().as_str().to_string();
-            present.insert(id.clone(), ());
+            present.insert(id.clone());
             let modified = event.modification_date_time();
             if self.seen.get(&id).is_some_and(|prev| *prev >= modified) {
                 continue;
@@ -261,6 +257,7 @@ impl OpenLeadrVenListener {
                                 self.mark_seen(id.clone(), modified).await;
                             }
                             dispatched += 1;
+                            crate::metrics::record_ven_event("executed");
                             // Best-effort: the dispatch already happened, so a
                             // report failure must not fail (or retry) it.
                             if self.reports_enabled {
@@ -272,12 +269,14 @@ impl OpenLeadrVenListener {
                                         event.id().as_str(),
                                         e
                                     );
+                                    crate::metrics::record_ven_event("report_failed");
                                 }
                             }
                         }
                         Err(e) => {
                             // Leave it out of `seen` so the next cycle retries.
                             warn!("OpenADR VEN dispatch failed for event {}: {}", id, e);
+                            crate::metrics::record_ven_event("dispatch_failed");
                         }
                     }
                 }
@@ -289,7 +288,7 @@ impl OpenLeadrVenListener {
         // revert — the right counter-action is operator/market specific — but
         // it must not pass silently.
         self.executed_active.retain(|id, end| {
-            if present.contains_key(id) {
+            if present.contains(id) {
                 return *end > now;
             }
             if *end > now {
@@ -311,7 +310,7 @@ impl OpenLeadrVenListener {
             .iter()
             .filter(|(key, modified)| {
                 let base = key.split('#').next().unwrap_or(key);
-                !present.contains_key(base) && **modified < prune_cutoff
+                !present.contains(base) && **modified < prune_cutoff
             })
             .map(|(key, _)| key.clone())
             .collect();

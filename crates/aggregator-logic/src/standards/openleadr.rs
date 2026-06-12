@@ -24,7 +24,12 @@ use url::Url;
 /// - optional `OPENLEADR_PROGRAM_ID`, `OPENLEADR_PROGRAM_NAME`, `OPENLEADR_TARGET`
 pub struct OpenLeadrAdapter {
     client: Client<BusinessLogic>,
-    program_id: Mutex<Option<ProgramId>>,
+    /// Program id from config (`OPENLEADR_PROGRAM_ID`), if any.
+    configured_program_id: Option<ProgramId>,
+    /// Resolved program handle, cached so each dispatch does not re-fetch the
+    /// program from the VTN. Invalidated when event creation fails (e.g. the
+    /// program was deleted on the VTN) so the next dispatch re-resolves.
+    program: Mutex<Option<openleadr_client::ProgramClient<BusinessLogic>>>,
     program_name: String,
     target: Option<Target>,
     event_duration_hours: f32,
@@ -77,7 +82,8 @@ impl OpenLeadrAdapter {
 
         Ok(Self {
             client: Client::<BusinessLogic>::with_url(vtn_url, credentials),
-            program_id: Mutex::new(program_id),
+            configured_program_id: program_id,
+            program: Mutex::new(None),
             program_name,
             target,
             event_duration_hours,
@@ -85,7 +91,14 @@ impl OpenLeadrAdapter {
     }
 
     async fn dispatch_event(&self, action: DispatchType, capacity_kw: f64) -> Result<()> {
-        let program = self.program().await?;
+        // Resolve-once: the lock is held across the dispatch, serializing
+        // concurrent dispatches — fine, they are rare and the VTN call
+        // dominates anyway.
+        let mut cache = self.program.lock().await;
+        if cache.is_none() {
+            *cache = Some(self.resolve_program().await?);
+        }
+        let program = cache.as_ref().expect("program cache populated above");
 
         let setpoint_kw = match action {
             DispatchType::FLEX_UP => capacity_kw,
@@ -119,10 +132,16 @@ impl OpenLeadrAdapter {
             event.targets = vec![target.clone()];
         }
 
-        let event = program
-            .create_event(event)
-            .await
-            .map_err(|e| anyhow!("OpenADR event creation failed: {e}"))?;
+        let event = match program.create_event(event).await {
+            Ok(event) => event,
+            Err(e) => {
+                // The program may have been deleted/recreated on the VTN:
+                // drop the cache so the next dispatch re-resolves instead of
+                // failing forever against a stale handle.
+                *cache = None;
+                return Err(anyhow!("OpenADR event creation failed: {e}"));
+            }
+        };
 
         info!(
             "OpenADR dispatch event created: event_id={} action={} capacity_kw={}",
@@ -133,11 +152,11 @@ impl OpenLeadrAdapter {
         Ok(())
     }
 
-    async fn program(&self) -> Result<openleadr_client::ProgramClient<BusinessLogic>> {
-        if let Some(program_id) = self.program_id.lock().await.clone() {
+    async fn resolve_program(&self) -> Result<openleadr_client::ProgramClient<BusinessLogic>> {
+        if let Some(program_id) = &self.configured_program_id {
             return self
                 .client
-                .get_program_by_id(&program_id)
+                .get_program_by_id(program_id)
                 .await
                 .map_err(|e| anyhow!("OpenADR program lookup failed: {e}"));
         }
@@ -153,16 +172,14 @@ impl OpenLeadrAdapter {
             .into_iter()
             .find(|p| p.content().program_name == self.program_name);
 
-        let program = match existing {
-            Some(program) => program,
+        match existing {
+            Some(program) => Ok(program),
             None => self
                 .client
                 .create_program(ProgramRequest::new(self.program_name.clone()))
                 .await
-                .map_err(|e| anyhow!("OpenADR program creation failed: {e}"))?,
-        };
-        *self.program_id.lock().await = Some(program.id().clone());
-        Ok(program)
+                .map_err(|e| anyhow!("OpenADR program creation failed: {e}")),
+        }
     }
 }
 
