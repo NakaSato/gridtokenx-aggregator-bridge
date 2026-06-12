@@ -4,13 +4,14 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use openleadr_client::{Client, ClientCredentials, Filter, VirtualEndNode};
+use openleadr_client::{Client, ClientCredentials, EventClient, Filter, VirtualEndNode};
 use openleadr_wire::{
     event::{EventRequest, EventType},
-    interval::IntervalPeriod,
+    interval::{Interval, IntervalPeriod},
     program::ProgramId,
+    report::{ReportResource, ResourceName},
     target::Target,
-    values_map::Value,
+    values_map::{Value, ValueType, ValuesMap},
 };
 use redis::aio::ConnectionManager;
 use tracing::{debug, info, warn};
@@ -38,6 +39,9 @@ const SEEN_KEY: &str = "gridtokenx:openleadr:ven:executed";
 /// - optional `OPENLEADR_VEN_PROGRAM_ID` (filter events to one program)
 /// - optional `OPENLEADR_VEN_TARGET` (only events carrying this target)
 /// - optional `OPENLEADR_VEN_POLL_SECS` (default 30)
+/// - optional `OPENLEADR_VEN_REPORTS=false` (disable execution reports)
+/// - optional `OPENLEADR_VEN_CLIENT_NAME` (report clientName, default
+///   `gridtokenx-aggregator-bridge`)
 /// - `REDIS_URL` (persists executed-event dedup across restarts; RAM-only if absent)
 pub struct OpenLeadrVenListener {
     client: Client<VirtualEndNode>,
@@ -52,6 +56,10 @@ pub struct OpenLeadrVenListener {
     executed_active: HashMap<String, DateTime<Utc>>,
     redis: Option<RedisSeenStore>,
     seen_loaded: bool,
+    /// Post an execution report back to the VTN after each dispatch.
+    reports_enabled: bool,
+    /// `clientName` stamped on execution reports.
+    client_name: String,
 }
 
 /// What to do with one polled event, given "now".
@@ -85,7 +93,7 @@ impl OpenLeadrVenListener {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
-        Ok(Some(Self::new(
+        let mut listener = Self::new(
             &vtn_url,
             credentials,
             std::env::var("OPENLEADR_VEN_PROGRAM_ID").ok(),
@@ -93,7 +101,14 @@ impl OpenLeadrVenListener {
             poll_secs,
             adapter,
             std::env::var("REDIS_URL").ok(),
-        )?))
+        )?;
+        listener.reports_enabled = std::env::var("OPENLEADR_VEN_REPORTS")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        if let Ok(name) = std::env::var("OPENLEADR_VEN_CLIENT_NAME") {
+            listener.client_name = name;
+        }
+        Ok(Some(listener))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -133,6 +148,8 @@ impl OpenLeadrVenListener {
             executed_active: HashMap::new(),
             redis: redis_url.map(RedisSeenStore::new),
             seen_loaded: false,
+            reports_enabled: true,
+            client_name: "gridtokenx-aggregator-bridge".to_string(),
         })
     }
 
@@ -211,6 +228,19 @@ impl OpenLeadrVenListener {
                                 .insert(id.clone(), active_window_end(event.content(), now));
                             self.mark_seen(id, modified).await;
                             dispatched += 1;
+                            // Best-effort: the dispatch already happened, so a
+                            // report failure must not fail (or retry) it.
+                            if self.reports_enabled {
+                                if let Err(e) =
+                                    self.post_execution_report(&event, setpoint_kw, now).await
+                                {
+                                    warn!(
+                                        "OpenADR VEN execution report failed for event {}: {}",
+                                        event.id().as_str(),
+                                        e
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             // Leave it out of `seen` so the next cycle retries.
@@ -239,6 +269,42 @@ impl OpenLeadrVenListener {
         });
 
         Ok(dispatched)
+    }
+
+    /// Confirm an executed dispatch back to the VTN as an OpenADR report: one
+    /// AGGREGATED_REPORT resource with a single SETPOINT interval carrying the
+    /// setpoint we acted on, stamped with the execution time.
+    async fn post_execution_report(
+        &self,
+        event: &EventClient<VirtualEndNode>,
+        setpoint_kw: f64,
+        executed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut report = event.new_report(self.client_name.clone());
+        report.report_name = Some(format!("gridtokenx-execution-{}", event.id().as_str()));
+        report.resources = vec![ReportResource {
+            resource_name: ResourceName::AggregatedReport,
+            interval_period: Some(IntervalPeriod::new(executed_at)),
+            intervals: vec![Interval::new(
+                0,
+                vec![ValuesMap {
+                    value_type: ValueType("SETPOINT".to_string()),
+                    values: vec![Value::Number(setpoint_kw)],
+                }],
+            )],
+        }];
+
+        let report = event
+            .create_report(report)
+            .await
+            .map_err(|e| anyhow!("report creation failed: {e}"))?;
+        info!(
+            "OpenADR VEN execution report posted: report_id={} event_id={} setpoint_kw={}",
+            report.id().as_str(),
+            event.id().as_str(),
+            setpoint_kw
+        );
+        Ok(())
     }
 
     async fn mark_seen(&mut self, id: String, modified: DateTime<Utc>) {

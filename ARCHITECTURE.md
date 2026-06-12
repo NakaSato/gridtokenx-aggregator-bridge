@@ -103,7 +103,11 @@ no external SCADA feed:
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:145`). Optional
   `OPENLEADR_VEN_TARGET` restricts polling to events carrying that target. An
   executed event that vanishes from the VTN while still active is flagged loud
-  (cancellation visibility) — no automatic revert, by design.
+  (cancellation visibility) — no automatic revert, by design. Each executed
+  dispatch is confirmed back to the VTN as an OpenADR report (AGGREGATED_REPORT
+  resource, SETPOINT payload; best-effort — a report failure never fails or
+  retries the dispatch; `post_execution_report`, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:277`).
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
