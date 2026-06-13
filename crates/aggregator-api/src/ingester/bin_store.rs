@@ -18,6 +18,12 @@ use tracing::{debug, warn};
 /// Redis hash holding all unsettled billing bins. Field = `{meter_id}:{start_ms}`.
 const BINS_HASH: &str = "gridtokenx:settlement:bins";
 
+/// Redis set of bin fields whose mint was already submitted to Chain Bridge but not
+/// yet evicted. It guards the crash window between a successful submit and eviction:
+/// on restart, a bin present here is treated as already minted and is NOT rehydrated,
+/// so its mint is never replayed. Members use the same `{meter_id}:{start_ms}` field.
+const MINTED_SET: &str = "gridtokenx:settlement:minted";
+
 /// Cloneable handle to the durable bin store. `ConnectionManager` auto-reconnects
 /// internally, so a Redis blip degrades to a warn rather than a freeze.
 #[derive(Clone)]
@@ -48,35 +54,90 @@ impl BinStore {
         Ok(())
     }
 
+    /// Mark bins as minted-but-not-yet-evicted. Written after a successful Chain Bridge
+    /// submit and before eviction so a crash in that window does not replay the mint on
+    /// rehydrate. Best-effort at the call site: a failed mark only shrinks the guard.
+    pub async fn mark_minted(&self, keys: &[BinKey]) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let fields: Vec<String> = keys.iter().map(Self::field).collect();
+        let mut conn = self.conn.clone();
+        conn.sadd::<_, _, ()>(MINTED_SET, fields)
+            .await
+            .context("SADD minted markers")?;
+        Ok(())
+    }
+
     /// Evict settled bins from the durable store (called only after the mint is
-    /// confirmed submitted, so we never drop unsettled energy).
+    /// confirmed submitted, so we never drop unsettled energy). Also clears the replay
+    /// marker for the same bins; a leftover marker is harmless (`load_all` prunes
+    /// orphans) but dropping it here keeps the set bounded.
     pub async fn remove(&self, keys: &[BinKey]) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
         let fields: Vec<String> = keys.iter().map(Self::field).collect();
         let mut conn = self.conn.clone();
-        conn.hdel::<_, _, ()>(BINS_HASH, fields)
+        conn.hdel::<_, _, ()>(BINS_HASH, &fields)
             .await
             .context("HDEL settled bins")?;
+        // Best-effort: a stale marker is reconciled on the next boot, so never fail
+        // eviction on it.
+        let _: std::result::Result<(), _> = conn.srem::<_, _, ()>(MINTED_SET, &fields).await;
         Ok(())
     }
 
-    /// Load all persisted bins on boot. Corrupt entries are skipped (logged), never
-    /// fatal — a partial restore beats refusing to start.
+    /// Load persisted bins on boot, skipping any already minted (crash-window replay
+    /// guard) and corrupt entries (logged, never fatal — partial restore beats refusing
+    /// to start). A bin present in [`MINTED_SET`] was submitted to Chain Bridge before
+    /// the crash; rehydrating it would replay the mint, so it is dropped and its hash +
+    /// marker entries are reconciled away. Orphan markers (bin already evicted, `SREM`
+    /// lost to a crash) are pruned in the same pass to keep the set bounded.
     pub async fn load_all(&self) -> Result<Vec<BillingBin>> {
         let mut conn = self.conn.clone();
         let raw: std::collections::HashMap<String, String> = conn
             .hgetall(BINS_HASH)
             .await
             .context("HGETALL billing bins")?;
+        // Fail closed: if the marker set is unreadable we must NOT rehydrate, because
+        // rehydrating an already-minted bin replays an irreversible on-chain mint.
+        // Erroring here just skips this boot's restore (main.rs logs and starts empty);
+        // the bins stay in the hash and are restored on the next boot once Redis is
+        // healthy — delayed retry beats double-mint.
+        let minted: std::collections::HashSet<String> = conn
+            .smembers(MINTED_SET)
+            .await
+            .context("SMEMBERS minted markers")?;
 
         let mut bins = Vec::with_capacity(raw.len());
-        for (field, value) in raw {
-            match serde_json::from_str::<BillingBin>(&value) {
+        let mut to_clean: Vec<String> = Vec::new();
+        for (field, value) in &raw {
+            if minted.contains(field) {
+                // Minted before the crash, never evicted — do not replay.
+                to_clean.push(field.clone());
+                continue;
+            }
+            match serde_json::from_str::<BillingBin>(value) {
                 Ok(bin) => bins.push(bin),
                 Err(e) => warn!("⚠️ Skipping corrupt persisted bin {}: {}", field, e),
             }
+        }
+        // Orphan markers: a marker whose bin is already gone from the hash.
+        for m in &minted {
+            if !raw.contains_key(m) {
+                to_clean.push(m.clone());
+            }
+        }
+        if !to_clean.is_empty() {
+            warn!(
+                "♻️ Reconciling {} already-minted/orphan bin marker(s) on rehydrate",
+                to_clean.len()
+            );
+            let _: std::result::Result<(), _> =
+                conn.hdel::<_, _, ()>(BINS_HASH, &to_clean).await;
+            let _: std::result::Result<(), _> =
+                conn.srem::<_, _, ()>(MINTED_SET, &to_clean).await;
         }
         Ok(bins)
     }

@@ -291,7 +291,7 @@ impl SettlementEngine {
                 // NOTE: "submitted" ≠ on-chain finalized; a crash between submit and
                 // eviction can replay a mint. True exactly-once needs chain-side
                 // idempotency on (meter, window).
-                let submitted: HashSet<usize> = outcome.submitted_indices.into_iter().collect();
+                let submitted = outcome.submitted_indices;
                 if let Some(e) = &outcome.error {
                     error!(
                         "❌ Generation mint batch partially failed ({}/{count} recipient(s) \
@@ -305,13 +305,23 @@ impl SettlementEngine {
                         outcome.signatures
                     );
                 }
-                // Evict submitted bins; retained (unsubmitted) keys are simply dropped,
-                // leaving their bins in the store for the next tick.
-                for (i, key) in minted_keys.into_iter().enumerate() {
-                    if submitted.contains(&i) {
-                        zero_keys.push(key);
+                // The bins whose mint actually went out this tick.
+                let minted_now = evict_submitted(minted_keys, &submitted);
+                // Durably mark them BEFORE eviction so a crash in the submit→evict
+                // window does not replay the mint on rehydrate. Best-effort: a failed
+                // mark only shrinks the guard, it never blocks settlement.
+                if let Some(store) = &self.bin_store {
+                    if let Err(e) = store.mark_minted(&minted_now).await {
+                        warn!(
+                            "⚠️ Failed to mark {} minted bin(s) — replay guard degraded: {}",
+                            minted_now.len(),
+                            e
+                        );
                     }
                 }
+                // Evict submitted bins; retained (unsubmitted) keys are dropped here,
+                // leaving their bins in the store for the next tick.
+                zero_keys.extend(minted_now);
                 Ok(zero_keys)
             }
             Err(e) => {
@@ -352,5 +362,67 @@ impl SettlementEngine {
                 String::new()
             }
         }))
+    }
+}
+
+/// Select the minted-bin keys the batch actually submitted (by index into the lockstep
+/// `minted_keys`/`inputs` lists) for eviction; unsubmitted keys are retained for retry.
+/// Pure and order-independent so a split/out-of-order index set works, and any index
+/// out of range is ignored rather than panicking.
+fn evict_submitted(minted_keys: Vec<BinKey>, submitted_indices: &[usize]) -> Vec<BinKey> {
+    let submitted: HashSet<usize> = submitted_indices.iter().copied().collect();
+    minted_keys
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, key)| submitted.contains(&i).then_some(key))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
+
+    fn key(n: u128) -> BinKey {
+        let ts: DateTime<Utc> = DateTime::from_timestamp(0, 0).unwrap();
+        (Uuid::from_u128(n), ts)
+    }
+
+    #[test]
+    fn evicts_all_when_every_index_submitted() {
+        let keys = vec![key(0), key(1), key(2)];
+        let evicted = evict_submitted(keys.clone(), &[0, 1, 2]);
+        assert_eq!(evicted, keys);
+    }
+
+    #[test]
+    fn evicts_none_when_nothing_submitted() {
+        let keys = vec![key(0), key(1), key(2)];
+        assert!(evict_submitted(keys, &[]).is_empty());
+    }
+
+    #[test]
+    fn evicts_only_submitted_subset() {
+        // A poison chunk at index 1 left unsubmitted: indices 0 and 2 evicted, 1 retained.
+        let keys = vec![key(10), key(11), key(12)];
+        let evicted = evict_submitted(keys, &[0, 2]);
+        assert_eq!(evicted, vec![key(10), key(12)]);
+    }
+
+    #[test]
+    fn index_order_does_not_matter() {
+        // The adaptive split can submit ranges out of order (e.g. high half first).
+        let keys = vec![key(0), key(1), key(2), key(3)];
+        let evicted = evict_submitted(keys, &[3, 0, 2]);
+        assert_eq!(evicted, vec![key(0), key(2), key(3)]);
+    }
+
+    #[test]
+    fn out_of_range_index_is_ignored() {
+        let keys = vec![key(0), key(1)];
+        // Index 5 has no corresponding key — must not panic, just evict the valid one.
+        let evicted = evict_submitted(keys, &[0, 5]);
+        assert_eq!(evicted, vec![key(0)]);
     }
 }
