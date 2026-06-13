@@ -502,6 +502,31 @@ async fn main() -> Result<()> {
         warn!("⚠️ MINT_VIA_CHAIN_BRIDGE requested but prerequisites missing (blockchain/IAM) — using HTTP settlement path");
     }
 
+    // Settlement-path observability (G2). Three mutually exclusive paths:
+    //   nats — mint via Chain Bridge, durable async submit over NATS JetStream;
+    //   grpc — mint via Chain Bridge but NATS_URL unset, so blockchain-core
+    //          silently falls back to gRPC-only submit (see
+    //          gridtokenx-blockchain-core/src/rpc.rs);
+    //   http — HTTP settle-to-trading-service (mint path off or prereqs missing).
+    // The grpc case is a silent degradation of the intended nats path — warn loud
+    // and export the active path as a labelled gauge so it is observable.
+    let nats_url_set = std::env::var("NATS_URL")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let settlement_path = if mint_via_chain_bridge {
+        if nats_url_set { "nats" } else { "grpc" }
+    } else {
+        "http"
+    };
+    if mint_via_chain_bridge && !nats_url_set {
+        warn!(
+            "⚠️ MINT_VIA_CHAIN_BRIDGE=true but NATS_URL is unset — Chain Bridge writes \
+             silently degrade to gRPC-only (no durable async submit). Set NATS_URL for \
+             the intended settlement path."
+        );
+    }
+    info!("📊 Active settlement path: {}", settlement_path);
+
     let settlement_signer_task = settlement_signer.clone();
     let settlement_identity_client = identity_client.clone();
     let settlement_bin_store = bin_store.clone();
@@ -526,6 +551,9 @@ async fn main() -> Result<()> {
     let metrics_handle = metrics_recorder.handle();
     ::metrics::set_global_recorder(metrics_recorder).context("Failed to set metrics recorder")?;
     info!("✅ Prometheus metrics exporter initialized");
+
+    // Export the active settlement path (G2) now that the recorder is live.
+    ::metrics::gauge!("settlement_path", "path" => settlement_path).set(1.0);
 
     let app_state = AppState {
         router: iot_router,

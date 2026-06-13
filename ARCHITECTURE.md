@@ -157,6 +157,23 @@ by the app-side marker:
   (`submitted_indices` → `evict_submitted`, verified
   `crates/aggregator-api/src/ingester/settlement_engine.rs:386`).
 
+### Settlement path selection (3 paths, env-gated — make degradation loud)
+
+At startup `src/main.rs` resolves exactly one settlement path and exports it as
+the gauge `settlement_path{path="nats|grpc|http"}` (set to `1`). The `grpc` path
+is a **silent degradation** of the intended `nats` path, so main.rs `warn!`s loudly
+when it lands there.
+
+| `path` label | Condition | Behaviour |
+| :--- | :--- | :--- |
+| `nats` | `MINT_VIA_CHAIN_BRIDGE=true` **and** prereqs (BlockchainService + IAM client) wired **and** `NATS_URL` set | Mint GRID via Chain Bridge; durable async submit over NATS JetStream (`chain.tx.submit`). The intended prod path. |
+| `grpc` | `MINT_VIA_CHAIN_BRIDGE=true` + prereqs wired but `NATS_URL` **unset** | Mint via Chain Bridge, but `gridtokenx-blockchain-core/src/rpc.rs` falls back to gRPC-only submit (no JetStream). **Degraded — main.rs warns.** |
+| `http` | `MINT_VIA_CHAIN_BRIDGE` off, or prereqs missing | HTTP settle-to-trading-service (`SETTLEMENT_API_URL` / `TRADING_HTTP_URL`). |
+
+Env gates: `MINT_VIA_CHAIN_BRIDGE` (route to Chain Bridge), `NATS_URL` (nats vs
+grpc within that route), `SETTLEMENT_API_URL`/`TRADING_HTTP_URL` (http target).
+Watch the `settlement_path` gauge to confirm the active path in any environment.
+
 ## 4. Market Layer
 - **Settlement:** HyperEVM.
 - **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
