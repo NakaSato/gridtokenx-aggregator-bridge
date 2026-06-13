@@ -122,6 +122,41 @@ no external SCADA feed:
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
   → dispatch → VTN event → VEN execution.
 
+### Settlement (Path B generation mint — exactly-once on-chain)
+
+Completed 15-minute billing bins mint GRX to each meter's wallet through Chain
+Bridge (Vault signs the unsigned txs). Exactly-once is enforced **on-chain**, not
+by the app-side marker:
+
+- **Per-`(meter, window)` mint record.** Each recipient carries its identity into
+  the mint: `MintRecipient { wallet, amount, meter_id, window_start_ms }`, built
+  from the bin key (`meter_id = *key.0.as_bytes()`,
+  `window_start_ms = key.1.timestamp_millis()`, verified
+  `crates/aggregator-api/src/ingester/settlement_engine.rs:277`). The Chain-Bridge
+  instruction builder (`build_generation_mint_instructions` in
+  `gridtokenx-blockchain-core`) derives a PDA `[b"gen_mint", meter_id,
+  window_start_ms.to_le_bytes()]` and targets `energy_token::mint_generation`
+  instead of the unconditional `mint_to_wallet`.
+- **The chain is the guard.** `mint_generation` checks `mint_record.minted`
+  **first** and returns `Ok(())` on a replay before running the mint CPI; the
+  record is stamped only **after** a successful mint, so a failed mint leaves the
+  window retryable. The PDA uses `init_if_needed` (no-op, **not** `init`-abort) so
+  a regrouped retry that batches an already-landed recipient with fresh ones
+  no-ops the landed one without poisoning its chunk-mates. (On-chain detail +
+  citations: `gridtokenx-anchor/ARCHITECTURE.md` §2, §5.)
+- **MINTED_SET is now a fast path, not the correctness guard.** The Redis
+  `MINTED_SET` marker only avoids re-submitting a tx that would no-op anyway; the
+  authoritative exactly-once is the on-chain record (verified
+  `crates/aggregator-api/src/ingester/settlement_engine.rs:305`). This closes the
+  residual the marker alone could not: a crash between submit and eviction, or a
+  Redis outage that defeats the marker, re-runs as a harmless on-chain no-op.
+- **Adaptive chunk split, submit-safe.** The batch splits into chunks (4
+  recipients/tx) against Solana's 1232-byte packet limit; a chunk that fails
+  **before** send is halved and retried, but a submit error is **never** resent
+  (double-mint risk). Only submitted chunks are evicted from the bin store
+  (`submitted_indices` → `evict_submitted`, verified
+  `crates/aggregator-api/src/ingester/settlement_engine.rs:386`).
+
 ## 4. Market Layer
 - **Settlement:** HyperEVM.
 - **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
