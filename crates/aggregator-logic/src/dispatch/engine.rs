@@ -193,8 +193,10 @@ impl DispatchEngine {
         capacity_kw: f64,
     ) -> Result<()> {
         // Query aggregator state (read-only: dispatch must NOT drain settlement's bins).
+        // Zero grace: dispatch only reads completed-window capacity and never mints,
+        // so the TD-002 partial-settle guard (settlement's grace) does not apply here.
         let aggregator = self.aggregator.lock().await;
-        let bins = aggregator.peek_completed_bins();
+        let bins = aggregator.peek_completed_bins(chrono::Duration::zero());
 
         // Calculate total capacity
         let total_capacity: rust_decimal::Decimal = bins.iter().map(|b| b.energy_generated).sum();

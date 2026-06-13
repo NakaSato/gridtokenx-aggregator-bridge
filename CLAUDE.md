@@ -73,7 +73,11 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `IOT_GATEWAY_PORT`, `GRPC_PORT`, `GRIDTOKENX_API_KEYS`,
 `IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `AGGREGATOR_BRIDGE_SIGNING_KEY`,
 `SETTLEMENT_API_URL`, `IOT_NUM_ZONES` (default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS
-decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow plaintext v4 frames when a device has no `enckey`).
+decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow plaintext v4 frames when a device has no `enckey`),
+`SETTLEMENT_GRACE_SECS` (default 120) — grace delay after a 15-min window closes before its bin is
+eligible to settle. Lets a late / briefly-buffered reading land in a just-closed window so a **partial**
+bin isn't minted: minting one creates the on-chain `(meter, window)` `gen_mint` PDA and strands every
+later reading for that window (TD-002). `0` restores the old "settle as soon as `end_time` passes".
 
 OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
 (`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.

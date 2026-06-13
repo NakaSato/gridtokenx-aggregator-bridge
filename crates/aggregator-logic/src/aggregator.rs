@@ -84,15 +84,22 @@ impl Aggregator {
         bin.clone()
     }
 
-    /// Returns clones of all billing bins past their end time WITHOUT removing them.
-    /// Non-destructive on purpose: the settlement engine evicts a bin only after the
-    /// mint is confirmed submitted (see `remove_bins`), so a failed/crashed mint
-    /// retries on the next tick instead of silently losing the energy.
-    pub fn peek_completed_bins(&self) -> Vec<BillingBin> {
-        let now = Utc::now();
+    /// Returns clones of all billing bins whose window closed at least `grace`
+    /// ago, WITHOUT removing them. The `grace` delay lets late / briefly-buffered
+    /// readings for a just-closed window still land in it before it settles:
+    /// minting a *partial* bin would create the on-chain `(meter, window)`
+    /// `gen_mint` PDA and strand every reading that arrives afterward (TD-002).
+    /// Pass `Duration::zero()` for the strict `end_time <= now` semantics (e.g.
+    /// dispatch capacity, which only reads bins and never mints).
+    ///
+    /// Non-destructive on purpose: the settlement engine evicts a bin only after
+    /// the mint is confirmed submitted (see `remove_bins`), so a failed/crashed
+    /// mint retries on the next tick instead of silently losing the energy.
+    pub fn peek_completed_bins(&self, grace: chrono::Duration) -> Vec<BillingBin> {
+        let cutoff = Utc::now() - grace;
         self.active_bins
             .values()
-            .filter(|bin| bin.end_time <= now)
+            .filter(|bin| bin.end_time <= cutoff)
             .cloned()
             .collect()
     }
@@ -211,7 +218,7 @@ mod tests {
         reading(&mut agg, 30, 0, past);
         reading(&mut agg, 9, 0, Utc::now()); // current window end is in the future
 
-        let done = agg.peek_completed_bins();
+        let done = agg.peek_completed_bins(chrono::Duration::zero());
         assert_eq!(done.len(), 1, "only the closed window is completed");
         assert_eq!(done[0].energy_generated, Decimal::from(30));
     }
@@ -222,13 +229,40 @@ mod tests {
         let past = Utc::now() - chrono::Duration::minutes(25);
         reading(&mut agg, 30, 0, past);
 
-        assert_eq!(agg.peek_completed_bins().len(), 1);
+        assert_eq!(agg.peek_completed_bins(chrono::Duration::zero()).len(), 1);
         // A second peek still sees it — eviction only happens via remove_bins,
         // so a crashed/failed mint retries next tick instead of losing energy.
-        let again = agg.peek_completed_bins();
+        let again = agg.peek_completed_bins(chrono::Duration::zero());
         assert_eq!(again.len(), 1, "peek must not evict");
 
         agg.remove_bins(&[again[0].key()]);
-        assert!(agg.peek_completed_bins().is_empty(), "remove_bins evicts");
+        assert!(agg.peek_completed_bins(chrono::Duration::zero()).is_empty(), "remove_bins evicts");
+    }
+
+    #[test]
+    fn peek_grace_delays_recently_closed_window() {
+        // TD-002 guard: a window that closed only moments ago must not settle yet —
+        // a late/buffered reading could still land in it, and minting the partial
+        // bin would lock the (meter, window) gen_mint PDA and strand the rest.
+        let mut agg = Aggregator::new();
+        let now = Utc::now();
+        let bin = BillingBin {
+            meter_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            meter_serial: "M".to_string(),
+            start_time: now - chrono::Duration::minutes(15) - chrono::Duration::seconds(30),
+            end_time: now - chrono::Duration::seconds(30), // closed 30s ago
+            energy_generated: Decimal::from(10),
+            energy_consumed: Decimal::ZERO,
+            reading_count: 1,
+        };
+        agg.active_bins.insert(bin.key(), bin);
+
+        // Strict (zero grace): the just-closed window is eligible.
+        assert_eq!(agg.peek_completed_bins(chrono::Duration::zero()).len(), 1);
+        // 120s grace: closed only 30s ago → NOT yet eligible (hold for stragglers).
+        assert!(agg.peek_completed_bins(chrono::Duration::seconds(120)).is_empty());
+        // 20s grace: closed 30s ago > grace → now eligible.
+        assert_eq!(agg.peek_completed_bins(chrono::Duration::seconds(20)).len(), 1);
     }
 }

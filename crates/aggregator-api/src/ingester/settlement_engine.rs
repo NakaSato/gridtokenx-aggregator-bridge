@@ -61,6 +61,11 @@ pub struct SettlementEngine {
     identity_client: Option<Arc<IdentityServiceClient<SharedHttp2Connection>>>,
     /// Durable bin store; settled bins are evicted here only after confirmed submit.
     bin_store: Option<BinStore>,
+    /// Grace delay after a window closes before its bin is eligible to settle.
+    /// Lets late / briefly-buffered readings land so a partial bin isn't minted
+    /// (which would lock the (meter, window) gen_mint PDA and strand the rest —
+    /// TD-002). From `SETTLEMENT_GRACE_SECS` (default 120s).
+    settle_grace: chrono::Duration,
 }
 
 impl SettlementEngine {
@@ -83,6 +88,13 @@ impl SettlementEngine {
             blockchain,
             identity_client,
             bin_store,
+            settle_grace: chrono::Duration::seconds(
+                std::env::var("SETTLEMENT_GRACE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|v| *v >= 0)
+                    .unwrap_or(120),
+            ),
         }
     }
 
@@ -117,7 +129,7 @@ impl SettlementEngine {
     async fn process_completed_bins(&self) -> anyhow::Result<()> {
         let bins = {
             let agg = self.aggregator.lock().await;
-            agg.peek_completed_bins()
+            agg.peek_completed_bins(self.settle_grace)
         };
 
         if bins.is_empty() {
