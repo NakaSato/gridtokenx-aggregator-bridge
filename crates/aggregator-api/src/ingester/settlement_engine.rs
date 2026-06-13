@@ -5,7 +5,9 @@ use crate::ingester::bin_store::BinStore;
 use crate::state::{identity, IdentityServiceClient};
 use crate::zk::prover::ZkProver;
 use connectrpc::client::SharedHttp2Connection;
-use gridtokenx_blockchain_core::{BlockchainService, NoopMetrics, Pubkey, SolanaProgramsConfig};
+use gridtokenx_blockchain_core::{
+    BlockchainService, MintRecipient, NoopMetrics, SolanaProgramsConfig,
+};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::HashSet;
@@ -220,7 +222,7 @@ impl SettlementEngine {
 
         // 1e9 = GRID has 9 decimals (atomic units).
         let scale = Decimal::from(1_000_000_000i64);
-        let mut inputs: Vec<(Pubkey, u64)> = Vec::with_capacity(bins.len());
+        let mut inputs: Vec<MintRecipient> = Vec::with_capacity(bins.len());
         // Bins included in the mint batch — evicted only after a confirmed submit.
         let mut minted_keys: Vec<BinKey> = Vec::with_capacity(bins.len());
         // Zero-generation bins — nothing to mint, safe to evict regardless of outcome.
@@ -268,7 +270,16 @@ impl SettlementEngine {
                 }
             };
 
-            inputs.push((wallet, amount_atomic));
+            // Carry the (meter, window) identity so the mint is idempotent on-chain:
+            // key.0 = meter UUID, key.1 = 15-min window start. The energy-token
+            // `gen_mint` record PDA is keyed by these, so a replay of this window is a
+            // no-op mint regardless of bridge-side state.
+            inputs.push(MintRecipient {
+                wallet,
+                amount: amount_atomic,
+                meter_id: *key.0.as_bytes(),
+                window_start_ms: key.1.timestamp_millis(),
+            });
             minted_keys.push(key);
         }
 
@@ -288,9 +299,12 @@ impl SettlementEngine {
                 // submitted chunks (`submitted_indices` into `minted_keys`, which is
                 // lockstep with `inputs`) and retain the rest for retry — a poison
                 // chunk no longer stalls the bins behind it.
-                // NOTE: "submitted" ≠ on-chain finalized; a crash between submit and
-                // eviction can replay a mint. True exactly-once needs chain-side
-                // idempotency on (meter, window).
+                // Exactly-once is enforced ON-CHAIN: each recipient carries its
+                // (meter, window) identity, which keys the energy-token `gen_mint`
+                // record PDA, so a replay (crash between submit and eviction, or a
+                // Redis outage that defeats the MINTED_SET marker) re-runs as a no-op
+                // mint. The MINTED_SET guard below is now only a fast path that avoids
+                // re-submitting a tx that would no-op anyway.
                 let submitted = outcome.submitted_indices;
                 if let Some(e) = &outcome.error {
                     error!(
