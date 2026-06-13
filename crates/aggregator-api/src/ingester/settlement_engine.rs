@@ -129,6 +129,29 @@ impl SettlementEngine {
             bins.len()
         );
 
+        // Quarantine bins from unregistered meters (nil owner). There is no wallet
+        // to mint GRID to, so these can NEVER settle — resolving their wallet via IAM
+        // always returns `not_found`. Previously they were treated as a transient
+        // failure and retried every tick (logging a wallet-not-found flood) and, on
+        // the HTTP path, POSTed to the gateway with no JWT (a stream of 401s). Evict
+        // them up front (dropping the unattributable energy) and warn once per window.
+        let (orphan_bins, bins): (Vec<BillingBin>, Vec<BillingBin>) =
+            bins.into_iter().partition(|b| b.user_id.is_nil());
+        if !orphan_bins.is_empty() {
+            let orphan_keys: Vec<BinKey> = orphan_bins.iter().map(|b| b.key()).collect();
+            for b in &orphan_bins {
+                warn!(
+                    "🚫 Quarantining settlement bin for meter {} — no registered owner (nil user); \
+                     dropping {} kWh generated. Register the meter (gridtokenx:meters:{}:user_id) to settle its energy.",
+                    b.meter_serial, b.energy_generated, b.meter_serial
+                );
+            }
+            self.evict_settled(&orphan_keys).await;
+        }
+        if bins.is_empty() {
+            return Ok(());
+        }
+
         // Generation-mint path: aggregator owns issuance — build + submit the GRID
         // mint tx directly via Chain Bridge (Vault signs), bypassing trading-service.
         let evict: Vec<BinKey> = if self.mint_via_chain_bridge {

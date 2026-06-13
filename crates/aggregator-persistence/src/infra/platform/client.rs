@@ -63,6 +63,27 @@ impl PlatformClient {
         }
     }
 
+    /// Attach the internal service-mesh auth headers trading-service requires.
+    ///
+    /// Trading authorizes service-to-service callers as `ServiceRole::ApiGateway`,
+    /// which needs the role header *and* a matching gateway secret (the source of
+    /// truth is `gridtokenx_blockchain_core::auth::{INTERNAL_ROLE_HEADER,
+    /// GATEWAY_SECRET_HEADER}` consumed by `ServiceRole::from_headers`). The header
+    /// names are inlined here so this crate need not depend on blockchain-core. The
+    /// secret comes from `GATEWAY_SECRET`, falling back to the dev default honored
+    /// when `CHAIN_BRIDGE_INSECURE=true`.
+    ///
+    /// IMPORTANT: this path must target **trading-service directly** (the mesh),
+    /// not the apisix user-facing gateway — apisix enforces jwt-auth and would 401
+    /// these headers regardless. `SETTLEMENT_API_URL` must point at trading-service.
+    fn with_gateway_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let secret = std::env::var("GATEWAY_SECRET")
+            .unwrap_or_else(|_| "gridtokenx-gateway-secret-2025".to_string());
+        builder
+            .header("x-gridtokenx-role", "api-gateway")
+            .header("x-gridtokenx-gateway-secret", secret)
+    }
+
     /// Execute Generation Mint for a verified billing bin via REST API
     pub async fn settle_generation_mint(
         &self,
@@ -88,7 +109,7 @@ impl PlatformClient {
                 .unwrap_or("?")
         );
 
-        let request_builder = client.post(&url).json(payload);
+        let request_builder = Self::with_gateway_auth(client.post(&url).json(payload));
         let response = request_builder.send().await?;
 
         if !response.status().is_success() {
@@ -124,7 +145,7 @@ impl PlatformClient {
             "requests": payloads
         });
 
-        let request_builder = client.post(&url).json(&batch_payload);
+        let request_builder = Self::with_gateway_auth(client.post(&url).json(&batch_payload));
         let response = request_builder.send().await?;
 
         if !response.status().is_success() {
