@@ -63,6 +63,38 @@ fn canonical_sign_value(_protocol: &str, payload: &serde_json::Value) -> String 
     value.to_string()
 }
 
+/// The ordered set of `(label, bytes)` a REST telemetry signature is checked
+/// against — newest canonical form first, legacy forms after. Extracted from
+/// `verify_rest_signature` so the fallback ladder is unit-testable without a
+/// live Ed25519 verifier (the verifier needs a device pubkey in Redis; that
+/// fetch path is covered by e2e, the candidate construction is covered here).
+///
+/// 1. canonical `{device_id}:{kwh}:{timestamp_ms}` (ms-scale, current signers)
+/// 2. second-scale `{device_id}:{kwh}:{timestamp_ms / 1000}` (legacy signers)
+/// 3. the serialized JSON object with `signature` removed (keys sorted by
+///    serde_json's default `BTreeMap`); only emitted for object payloads.
+///
+/// An empty label means "no extra log on match" (the caller logs the headline).
+fn rest_sign_candidates(
+    device_id: &str,
+    kwh: &str,
+    timestamp_ms: i64,
+    payload_val: &serde_json::Value,
+) -> Vec<(&'static str, Vec<u8>)> {
+    let mut out = vec![
+        ("", format!("{}:{}:{}", device_id, kwh, timestamp_ms).into_bytes()),
+        ("second-scale", format!("{}:{}:{}", device_id, kwh, timestamp_ms / 1000).into_bytes()),
+    ];
+    if let serde_json::Value::Object(map) = payload_val {
+        let mut sorted = map.clone();
+        sorted.remove("signature");
+        if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(sorted)) {
+            out.push(("serialized JSON", bytes));
+        }
+    }
+    out
+}
+
 async fn verify_rest_signature(
     state: &AppState,
     device_id: &str,
@@ -71,51 +103,22 @@ async fn verify_rest_signature(
     kwh: &str,
     timestamp_ms: i64,
 ) -> anyhow::Result<bool> {
-    // 1. Standard verification against device_id:kwh:timestamp_ms
-    let sign_target = format!("{}:{}:{}", device_id, kwh, timestamp_ms);
-    match state
-        .signature_verifier
-        .verify_telemetry_signature(device_id, sign_target.as_bytes(), signature)
-        .await
-    {
-        Ok(true) => return Ok(true),
-        Err(e) => return Err(e),
-        _ => {}
-    }
-
-    // Fallback 1: Try with second-scale timestamp (timestamp_ms / 1000)
-    let timestamp_s = timestamp_ms / 1000;
-    let sign_target_s = format!("{}:{}:{}", device_id, kwh, timestamp_s);
-    match state
-        .signature_verifier
-        .verify_telemetry_signature(device_id, sign_target_s.as_bytes(), signature)
-        .await
-    {
-        Ok(true) => {
-            info!("✅ Telemetry signature verified (REST, second-scale) for {}", device_id);
-            return Ok(true);
-        }
-        Err(e) => return Err(e),
-        _ => {}
-    }
-
-    // Fallback 2: Try directly against the serialized JSON bytes after removing signature and sorting keys alphabetically
-    let mut sorted_payload = payload_val.clone();
-    if let serde_json::Value::Object(ref mut map) = sorted_payload {
-        map.remove("signature");
-        if let Ok(raw_payload_bytes) = serde_json::to_vec(&sorted_payload) {
-            match state
-                .signature_verifier
-                .verify_telemetry_signature(device_id, &raw_payload_bytes, signature)
-                .await
-            {
-                Ok(true) => {
-                    info!("✅ Telemetry signature verified (REST, serialized JSON) for {}", device_id);
-                    return Ok(true);
+    // Try each canonical form in order; a verifier error is fatal (fail-closed),
+    // a non-match falls through to the next candidate.
+    for (label, target) in rest_sign_candidates(device_id, kwh, timestamp_ms, payload_val) {
+        match state
+            .signature_verifier
+            .verify_telemetry_signature(device_id, &target, signature)
+            .await
+        {
+            Ok(true) => {
+                if !label.is_empty() {
+                    info!("✅ Telemetry signature verified (REST, {}) for {}", label, device_id);
                 }
-                Err(e) => return Err(e),
-                _ => {}
+                return Ok(true);
             }
+            Err(e) => return Err(e),
+            _ => {}
         }
     }
 
@@ -496,8 +499,55 @@ pub async fn ingest_private_network_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_sign_value;
+    use super::{canonical_sign_value, rest_sign_candidates};
     use serde_json::json;
+
+    // --- REST signature fallback ladder (canonical / sec-scale ts / JSON) ---
+
+    #[test]
+    fn sign_candidates_order_and_forms() {
+        let payload = json!({"kwh": 10.0, "timestamp": "x", "signature": "SIG"});
+        let cands = rest_sign_candidates("METER-1", "10", 1_700_000_000_000, &payload);
+
+        assert_eq!(cands.len(), 3, "object payload yields all 3 forms");
+        // 1. canonical ms-scale, no log label (caller logs the headline).
+        assert_eq!(cands[0].0, "");
+        assert_eq!(cands[0].1, b"METER-1:10:1700000000000");
+        // 2. second-scale = ms / 1000.
+        assert_eq!(cands[1].0, "second-scale");
+        assert_eq!(cands[1].1, b"METER-1:10:1700000000");
+        // 3. serialized JSON, signature stripped.
+        assert_eq!(cands[2].0, "serialized JSON");
+    }
+
+    #[test]
+    fn sign_candidates_json_strips_signature_keeps_rest() {
+        let payload = json!({"kwh": 10.0, "signature": "SIG", "zone_code": "Z1"});
+        let cands = rest_sign_candidates("M", "10", 1000, &payload);
+        let json_bytes = &cands[2].1;
+        let parsed: serde_json::Value = serde_json::from_slice(json_bytes).unwrap();
+        assert!(parsed.get("signature").is_none(), "signature must be removed from signed bytes");
+        assert_eq!(parsed.get("kwh"), Some(&json!(10.0)), "other fields preserved");
+        assert_eq!(parsed.get("zone_code"), Some(&json!("Z1")));
+    }
+
+    #[test]
+    fn sign_candidates_non_object_payload_omits_json_form() {
+        // A non-object payload (e.g. bare array) has no signature to strip — only
+        // the two string forms are emitted, never a panic.
+        let payload = json!([1, 2, 3]);
+        let cands = rest_sign_candidates("M", "10", 2000, &payload);
+        assert_eq!(cands.len(), 2, "non-object payload yields only the 2 string forms");
+        assert_eq!(cands[0].1, b"M:10:2000");
+        assert_eq!(cands[1].1, b"M:10:2");
+    }
+
+    #[test]
+    fn sign_candidates_sub_second_ts_floors_to_zero() {
+        // timestamp_ms < 1000 → second-scale floors to :0 (parity with i64 /1000).
+        let cands = rest_sign_candidates("M", "5", 999, &json!({}));
+        assert_eq!(cands[1].1, b"M:5:0");
+    }
 
     #[test]
     fn dlms_signs_kwh() {

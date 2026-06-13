@@ -129,3 +129,106 @@ impl Default for Aggregator {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(h: u32, m: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 1, h, m, s).unwrap()
+    }
+
+    fn reading(agg: &mut Aggregator, gen: i64, con: i64, ts: DateTime<Utc>) -> BillingBin {
+        agg.handle_reading(
+            Uuid::nil(),
+            Uuid::nil(),
+            "M1".to_string(),
+            Decimal::from(gen),
+            Decimal::from(con),
+            ts,
+        )
+    }
+
+    // --- window floor: timestamp snaps down to the 15-min window start ---
+
+    #[test]
+    fn window_floors_to_quarter_hour() {
+        let mut agg = Aggregator::new();
+        // 10:07:42 → window [10:00, 10:15)
+        let bin = reading(&mut agg, 1, 0, at(10, 7, 42));
+        assert_eq!(bin.start_time, at(10, 0, 0), "07 min floors to :00");
+        assert_eq!(bin.end_time, at(10, 15, 0), "end is start + 15 min");
+    }
+
+    #[test]
+    fn window_floor_covers_all_four_quarters() {
+        let mut agg = Aggregator::new();
+        for (min, want) in [(0, 0), (14, 0), (15, 15), (29, 15), (30, 30), (44, 30), (45, 45), (59, 45)] {
+            let bin = reading(&mut agg, 1, 0, at(10, min, 30));
+            assert_eq!(bin.start_time, at(10, want, 0), "minute {min} floors to :{want:02}");
+        }
+    }
+
+    #[test]
+    fn window_start_strips_sub_minute() {
+        let mut agg = Aggregator::new();
+        // :14:59.999 must still floor to :00 (boundary just below the next window).
+        let bin = reading(&mut agg, 1, 0, at(10, 14, 59));
+        assert_eq!(bin.start_time, at(10, 0, 0));
+        assert_eq!(bin.start_time.second(), 0, "seconds zeroed");
+        assert_eq!(bin.start_time.nanosecond(), 0, "nanos zeroed");
+    }
+
+    // --- bin accumulate: readings in the same window+meter fold together ---
+
+    #[test]
+    fn readings_in_same_window_accumulate() {
+        let mut agg = Aggregator::new();
+        reading(&mut agg, 10, 2, at(10, 1, 0));
+        let bin = reading(&mut agg, 5, 3, at(10, 13, 0)); // same [10:00,10:15) window
+        assert_eq!(bin.energy_generated, Decimal::from(15), "generation sums");
+        assert_eq!(bin.energy_consumed, Decimal::from(5), "consumption sums");
+        assert_eq!(bin.reading_count, 2, "both readings counted in one bin");
+    }
+
+    #[test]
+    fn readings_in_different_windows_are_separate_bins() {
+        let mut agg = Aggregator::new();
+        reading(&mut agg, 10, 0, at(10, 1, 0)); // [10:00,10:15)
+        let later = reading(&mut agg, 7, 0, at(10, 20, 0)); // [10:15,10:30)
+        // The second window's bin holds only its own reading — no carry-over.
+        assert_eq!(later.energy_generated, Decimal::from(7));
+        assert_eq!(later.reading_count, 1);
+    }
+
+    // --- peek_completed_bins: returns only bins past end_time, non-destructively ---
+
+    #[test]
+    fn peek_returns_only_closed_windows() {
+        let mut agg = Aggregator::new();
+        let past = Utc::now() - chrono::Duration::minutes(25); // window closed ~10 min ago
+        reading(&mut agg, 30, 0, past);
+        reading(&mut agg, 9, 0, Utc::now()); // current window end is in the future
+
+        let done = agg.peek_completed_bins();
+        assert_eq!(done.len(), 1, "only the closed window is completed");
+        assert_eq!(done[0].energy_generated, Decimal::from(30));
+    }
+
+    #[test]
+    fn peek_is_non_destructive() {
+        let mut agg = Aggregator::new();
+        let past = Utc::now() - chrono::Duration::minutes(25);
+        reading(&mut agg, 30, 0, past);
+
+        assert_eq!(agg.peek_completed_bins().len(), 1);
+        // A second peek still sees it — eviction only happens via remove_bins,
+        // so a crashed/failed mint retries next tick instead of losing energy.
+        let again = agg.peek_completed_bins();
+        assert_eq!(again.len(), 1, "peek must not evict");
+
+        agg.remove_bins(&[again[0].key()]);
+        assert!(agg.peek_completed_bins().is_empty(), "remove_bins evicts");
+    }
+}
