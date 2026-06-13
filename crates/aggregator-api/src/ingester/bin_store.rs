@@ -24,6 +24,12 @@ const BINS_HASH: &str = "gridtokenx:settlement:bins";
 /// so its mint is never replayed. Members use the same `{meter_id}:{start_ms}` field.
 const MINTED_SET: &str = "gridtokenx:settlement:minted";
 
+/// Dead-letter hash for bins that failed to deserialize on rehydrate. A corrupt entry
+/// is unsettled energy we cannot parse, so we never silently drop it — we copy the raw
+/// value here (for manual recovery) and remove it from [`BINS_HASH`] so it stops being
+/// re-read and re-logged on every boot. Field = the original `{meter_id}:{start_ms}`.
+const CORRUPT_HASH: &str = "gridtokenx:settlement:bins:corrupt";
+
 /// Cloneable handle to the durable bin store. `ConnectionManager` auto-reconnects
 /// internally, so a Redis blip degrades to a warn rather than a freeze.
 #[derive(Clone)]
@@ -112,6 +118,8 @@ impl BinStore {
 
         let mut bins = Vec::with_capacity(raw.len());
         let mut to_clean: Vec<String> = Vec::new();
+        // Corrupt bins to dead-letter: (field, raw value) preserved before deletion.
+        let mut to_quarantine: Vec<(String, String)> = Vec::new();
         for (field, value) in &raw {
             if minted.contains(field) {
                 // Minted before the crash, never evicted — do not replay.
@@ -120,7 +128,35 @@ impl BinStore {
             }
             match serde_json::from_str::<BillingBin>(value) {
                 Ok(bin) => bins.push(bin),
-                Err(e) => warn!("⚠️ Skipping corrupt persisted bin {}: {}", field, e),
+                Err(e) => {
+                    warn!(
+                        "⚠️ Quarantining corrupt persisted bin {} (unsettled energy preserved \
+                         in {}): {}",
+                        field, CORRUPT_HASH, e
+                    );
+                    to_quarantine.push((field.clone(), value.clone()));
+                }
+            }
+        }
+        // Move corrupt bins to the dead-letter hash, then drop them from the live hash so
+        // they stop being re-read every boot. Copy-before-delete: if the copy fails we
+        // leave them in the live hash for the next boot rather than lose the raw value.
+        if !to_quarantine.is_empty() {
+            match conn
+                .hset_multiple::<_, _, _, ()>(CORRUPT_HASH, &to_quarantine)
+                .await
+            {
+                Ok(()) => {
+                    let fields: Vec<&String> = to_quarantine.iter().map(|(f, _)| f).collect();
+                    let _: std::result::Result<(), _> =
+                        conn.hdel::<_, _, ()>(BINS_HASH, &fields).await;
+                }
+                Err(e) => warn!(
+                    "⚠️ Could not dead-letter {} corrupt bin(s); leaving in live hash for \
+                     next boot: {}",
+                    to_quarantine.len(),
+                    e
+                ),
             }
         }
         // Orphan markers: a marker whose bin is already gone from the hash.
