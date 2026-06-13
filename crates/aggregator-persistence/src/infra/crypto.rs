@@ -525,6 +525,34 @@ mod tests {
             .is_err());
     }
 
+    /// Device Ed25519 primitive — the exact checks `verify_telemetry_signature`
+    /// performs once it has the pubkey: a 64-byte signature guard, key load, and
+    /// verify against the right vs wrong key. Pure (no Redis): the
+    /// pubkey-fetch-then-verify path is exercised end-to-end in the e2e suite;
+    /// the Redis-unreachable fail-closed case is `verify_errors_loud_*` above.
+    #[test]
+    fn device_ed25519_primitive_valid_wrong_key_and_bad_len() {
+        let signing = SigningKey::from_bytes(&[3u8; 32]);
+        let vk = signing.verifying_key();
+        let payload = b"E2E-METER:50:1750000000000";
+        let sig = signing.sign(payload);
+
+        // valid — correct key over the signed payload verifies.
+        assert!(vk.verify(payload, &sig).is_ok());
+
+        // wrong-key — a different device's pubkey must reject (forgery guard).
+        let other_vk = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert!(other_vk.verify(payload, &sig).is_err());
+
+        // tampered payload under the right key must reject.
+        assert!(vk.verify(b"E2E-METER:9999:1750000000000", &sig).is_err());
+
+        // bad-len — a signature that is not exactly 64 bytes is rejected before
+        // any verify (mirrors the `signature_bytes.len() != 64` guard).
+        assert!(Signature::from_slice(&[0u8; 63]).is_err());
+        assert!(Signature::from_slice(&[0u8; 65]).is_err());
+    }
+
     /// Fail-closed-loud guard for the AES key path, mirroring
     /// `verify_errors_loud_when_no_redis_url`: no Redis URL ⇒ `Err`, never a
     /// silent `Ok(None)` (a dead connection must not look like an absent key).
