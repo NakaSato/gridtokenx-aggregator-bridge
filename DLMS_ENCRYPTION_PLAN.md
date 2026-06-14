@@ -4,7 +4,7 @@
 
 The secure UTT-S+ v4 binary frame ([PROTOCOL.md](PROTOCOL.md)) is **AES-256-GCM encrypted**, and
 `DlmsBinaryFrame::parse(payload, encryption_key)` already implements decryption
-(`crates/aggregator-stacks/src/binary_decoder.rs:79`). But every production caller passes `None`:
+(`crates/aggregator-stacks/src/binary_decoder.rs:98`). But every production caller passes `None`:
 
 | Call site | Current |
 | --- | --- |
@@ -12,13 +12,13 @@ The secure UTT-S+ v4 binary frame ([PROTOCOL.md](PROTOCOL.md)) is **AES-256-GCM 
 | `crates/aggregator-api/src/grpc/service.rs:230` (`ingest`) | `parse(&request.raw_payload, None)` |
 | `crates/aggregator-api/src/grpc/service.rs:332` (`ingest_stream` / telemetry) | `parse(&tel.raw_payload, None)` |
 
-`None` ⇒ plaintext fallback (`binary_decoder.rs:92`). **Encrypted frames cannot be decoded in
+`None` ⇒ plaintext fallback (`binary_decoder.rs:128`). **Encrypted frames cannot be decoded in
 production.** The crypto exists but is unreachable — no per-device key is ever plumbed in.
 
 ## Design
 
 Frame header (version, manuf ID, LDN, timestamp) is **plaintext** and precedes the encrypted TLV block
-(`binary_decoder.rs:63-75`). So the resolve order is:
+(`binary_decoder.rs:73-82`). So the resolve order is:
 
 ```
 parse_header(bytes) → meter_id (LDN) → fetch device AES key from Redis → parse(bytes, Some(key))
@@ -51,8 +51,8 @@ fallback. Gate dev bypass behind the existing `SKIP_SIG_VERIFY`-style flag or a 
 - [x] Add `pub struct DlmsHeader { version, manufacturer_id, logical_device_name, timestamp }`.
 - [x] Add `DlmsBinaryFrame::parse_header(payload: &[u8]) -> Result<DlmsHeader>` — runs CRC-32 + version
       check + plaintext header extraction only, **no decryption**. Note: CRC-32 is over the *whole* frame
-      (`binary_decoder.rs:44-52`), so `parse_header` still validates the full payload, then reads only the
-      plaintext header bytes (`:63-75`) and returns before the decrypt step.
+      (`binary_decoder.rs:53-65`), so `parse_header` still validates the full payload, then reads only the
+      plaintext header bytes (`:73-82`) and returns before the decrypt step.
 - [x] **Min-size floor differs from `parse`.** `parse_header` floor = 25B (`ver1+totlen1+manuf3+ldn8+ts8 =
       21B` + 4B CRC). Latent bug fixed: the unconditional `len < 41` plaintext-reject guard removed from
       `parse` — plaintext frames no longer wrongly rejected.

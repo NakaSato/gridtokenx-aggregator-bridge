@@ -12,8 +12,8 @@ use uuid::Uuid;
 /// 1. Local in-memory HashMap (fastest)
 /// 2. Redis lookup at `gridtokenx:meters:{serial}:user_id` (shared across instances)
 ///
-/// If neither has the mapping, returns None and the settlement worker
-/// will skip that bin (prosumer must register their meter first).
+/// If neither has the mapping, returns None and the reading is attributed to the
+/// nil user (prosumer must register their meter first to be attributable).
 pub struct MeterRegistry {
     redis: Option<ConnectionManager>,
     local_cache: RwLock<HashMap<String, Uuid>>,

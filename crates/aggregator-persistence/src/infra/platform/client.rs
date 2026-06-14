@@ -26,7 +26,7 @@ impl PlatformClient {
         Ok(Self { client })
     }
 
-    /// Submit a batch of verified meter readings (UTT Path A/B)
+    /// Submit a batch of verified meter readings (operational telemetry path)
     pub async fn submit_meter_reading_batch(
         &self,
         requests: Vec<MeterReading>,
@@ -63,99 +63,4 @@ impl PlatformClient {
         }
     }
 
-    /// Attach the internal service-mesh auth headers trading-service requires.
-    ///
-    /// Trading authorizes service-to-service callers as `ServiceRole::ApiGateway`,
-    /// which needs the role header *and* a matching gateway secret (the source of
-    /// truth is `gridtokenx_blockchain_core::auth::{INTERNAL_ROLE_HEADER,
-    /// GATEWAY_SECRET_HEADER}` consumed by `ServiceRole::from_headers`). The header
-    /// names are inlined here so this crate need not depend on blockchain-core. The
-    /// secret comes from `GATEWAY_SECRET`, falling back to the dev default honored
-    /// when `CHAIN_BRIDGE_INSECURE=true`.
-    ///
-    /// IMPORTANT: this path must target **trading-service directly** (the mesh),
-    /// not the apisix user-facing gateway — apisix enforces jwt-auth and would 401
-    /// these headers regardless. `SETTLEMENT_API_URL` must point at trading-service.
-    fn with_gateway_auth(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let secret = std::env::var("GATEWAY_SECRET")
-            .unwrap_or_else(|_| "gridtokenx-gateway-secret-2025".to_string());
-        builder
-            .header("x-gridtokenx-role", "api-gateway")
-            .header("x-gridtokenx-gateway-secret", secret)
-    }
-
-    /// Execute Generation Mint for a verified billing bin via REST API
-    pub async fn settle_generation_mint(
-        &self,
-        base_url: &str,
-        payload: &serde_json::Value,
-    ) -> Result<()> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/api/v1/settlement/generation-mint", base_url);
-
-        info!(
-            "💰 [REST] Submitting settlement for {} ({} - {})",
-            payload
-                .get("meter_serial")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown"),
-            payload
-                .get("start_time")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?"),
-            payload
-                .get("end_time")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-        );
-
-        let request_builder = Self::with_gateway_auth(client.post(&url).json(payload));
-        let response = request_builder.send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            error!("❌ Settlement failed with status {}: {}", status, error_text);
-            return Err(anyhow::anyhow!("Settlement failed: {}", error_text));
-        }
-
-        info!("✅ Settlement successful for {}", payload.get("meter_serial").and_then(|v| v.as_str()).unwrap_or(""));
-        Ok(())
-    }
-
-    /// Execute Batched Generation Mint for verified billing bins via REST API
-    pub async fn settle_generation_mint_batch(
-        &self,
-        base_url: &str,
-        payloads: Vec<serde_json::Value>,
-    ) -> Result<()> {
-        if payloads.is_empty() {
-            return Ok(());
-        }
-
-        let client = reqwest::Client::new();
-        let url = format!("{}/api/v1/settlement/generation-mint/batch", base_url);
-
-        info!(
-            "💰 [REST] Submitting batched settlement for {} records",
-            payloads.len()
-        );
-
-        let batch_payload = serde_json::json!({
-            "requests": payloads
-        });
-
-        let request_builder = Self::with_gateway_auth(client.post(&url).json(&batch_payload));
-        let response = request_builder.send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            error!("❌ Batched settlement failed with status {}: {}", status, error_text);
-            return Err(anyhow::anyhow!("Batched settlement failed: {}", error_text));
-        }
-
-        info!("✅ Batched settlement successful");
-        Ok(())
-    }
 }

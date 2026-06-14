@@ -32,7 +32,7 @@ impl DispatchAdapter for Ieee2030_5Adapter {
         let payload = DerControlPayload {
             control_type: control_type.to_string(),
             capacity_kw,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: gridtokenx_telemetry::time::now().timestamp(),
         };
 
         info!("Sending IEEE 2030.5 payload: {:?}", payload);

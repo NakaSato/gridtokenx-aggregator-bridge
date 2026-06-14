@@ -4,7 +4,7 @@ package gridtokenx.oracle.v1;
 
 // Service for high-performance unified oracle ingestion (UTT)
 service OracleService {
-  // Unified Ingestion: Verified telemetry for both VPP operations (Path A) and Settlement (Path B)
+  // Unified Ingestion: Verified telemetry for VPP operations (forecast, optimization, dispatch)
   rpc Ingest (MeterReading) returns (IngestResponse);
 
   // Batch Ingestion: Optimized for high-throughput aggregators

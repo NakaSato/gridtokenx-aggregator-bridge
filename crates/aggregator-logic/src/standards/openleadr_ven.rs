@@ -255,7 +255,7 @@ impl OpenLeadrVenListener {
         }
         .map_err(|e| anyhow!("OpenADR VEN event poll failed: {e}"))?;
 
-        let now = Utc::now();
+        let now = gridtokenx_telemetry::time::now();
         let mut present: HashSet<String> = HashSet::new();
         let mut dispatched = 0;
 
@@ -664,7 +664,7 @@ mod tests {
         let mut event =
             event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
         let mut period =
-            IntervalPeriod::new(Utc::now() + chrono::Duration::minutes(start_offset_mins));
+            IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins));
         period.duration = Some(WireDuration::hours(duration_hours));
         event.interval_period = Some(period);
         event
@@ -704,7 +704,7 @@ mod tests {
         let event =
             event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::Execute {
                 setpoint_kw: 42.0,
                 interval_id: 0,
@@ -718,7 +718,7 @@ mod tests {
         // Started 10 min ago, lasts 1h.
         let event = setpoint_event(-10, 1.0);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::Execute {
                 setpoint_kw: 42.0,
                 interval_id: 0,
@@ -731,7 +731,7 @@ mod tests {
     fn future_event_waits() {
         let event = setpoint_event(30, 1.0);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::NotYetActive
         );
     }
@@ -741,7 +741,7 @@ mod tests {
         // Started 3h ago, lasted 1h.
         let event = setpoint_event(-180, 1.0);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::Expired
         );
     }
@@ -750,10 +750,10 @@ mod tests {
     fn interval_period_wins_over_event_period() {
         // Event-level period says active; interval-level says future.
         let mut event = setpoint_event(-10, 1.0);
-        let future = IntervalPeriod::new(Utc::now() + chrono::Duration::minutes(30));
+        let future = IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(30));
         event.intervals.as_mut().unwrap()[0].interval_period = Some(future);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::NotYetActive
         );
     }
@@ -762,7 +762,7 @@ mod tests {
     fn non_setpoint_event_is_not_dispatch() {
         let event = event_with_payload(EventType::Price, vec![Value::Number(1.0)]);
         assert_eq!(
-            decide(&event, Utc::now(), &no_executed()),
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::NotDispatch
         );
         let text = event_with_payload(
@@ -770,7 +770,7 @@ mod tests {
             vec![Value::String("oops".to_string())],
         );
         assert_eq!(
-            decide(&text, Utc::now(), &no_executed()),
+            decide(&text, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::NotDispatch
         );
     }
@@ -783,7 +783,7 @@ mod tests {
     fn multi_interval_schedule_executes_each_window() {
         fn interval(id: i32, setpoint: f64, start_offset_mins: i64) -> EventInterval {
             let mut period =
-                IntervalPeriod::new(Utc::now() + chrono::Duration::minutes(start_offset_mins));
+                IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins));
             period.duration = Some(WireDuration::hours(1.0));
             EventInterval {
                 id,
@@ -797,7 +797,7 @@ mod tests {
         let mut event = EventRequest::new(ProgramId::new("test-program").unwrap());
         event.intervals = Some(vec![interval(0, 10.0, -10), interval(1, -20.0, 120)]);
 
-        let now = Utc::now();
+        let now = gridtokenx_telemetry::time::now();
         // First poll: interval 0 active, interval 1 future.
         assert_eq!(
             decide(&event, now, &no_executed()),

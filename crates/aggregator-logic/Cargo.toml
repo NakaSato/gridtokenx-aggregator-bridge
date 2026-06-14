@@ -8,7 +8,8 @@ description = "GridTokenX Aggregator Bridge - domain services & orchestration (a
 aggregator-core = { path = "../aggregator-core" }
 aggregator-stacks = { path = "../aggregator-stacks" }
 aggregator-protocol = { path = "../aggregator-protocol" }
-gridtokenx-blockchain-core = { version = "0.1.0", path = "../../../gridtokenx-blockchain-core" }
+aggregator-persistence = { path = "../aggregator-persistence" }
+gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
 
 # Messaging / cache / http client
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }

@@ -5,3 +5,6 @@
 //! sites keep resolving after the per-service copies were unified.
 
 pub use gridtokenx_telemetry::{init_telemetry, shutdown_telemetry, TelemetryGuard};
+
+/// NTP time source (Cloudflare/Google primary) — see [`gridtokenx_telemetry::time`].
+pub use gridtokenx_telemetry::time;

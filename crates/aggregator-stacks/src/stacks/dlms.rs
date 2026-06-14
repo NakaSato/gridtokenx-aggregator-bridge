@@ -200,7 +200,7 @@ impl ProtocolStack for DlmsStack {
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(|| gridtokenx_telemetry::time::now());
 
         Ok(Some(DeviceReading {
             reading_id: Uuid::new_v4(),

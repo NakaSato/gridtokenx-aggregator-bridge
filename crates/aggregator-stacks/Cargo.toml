@@ -6,6 +6,7 @@ description = "Aggregator Bridge device protocol stack (DLMS/COSEM + secure bina
 
 [dependencies]
 aggregator-core = { path = "../aggregator-core" }
+gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
 anyhow = "1.0"
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }

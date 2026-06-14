@@ -253,7 +253,7 @@ impl OracleService for AggregatorServiceImpl {
         ))
     }
 
-    /// Unified Ingest: Handles verified telemetry for both VPP and Settlement
+    /// Unified Ingest: Handles verified telemetry for VPP operations
     async fn ingest(
         &self,
         ctx: Context,
@@ -321,7 +321,7 @@ impl OracleService for AggregatorServiceImpl {
         let mut timestamp = Utc
             .timestamp_opt(request.timestamp, 0)
             .single()
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(|| gridtokenx_telemetry::time::now());
         let mut metadata = HashMap::new();
 
         // DLMS/COSEM (IEC 62056) Decoding
@@ -369,7 +369,7 @@ impl OracleService for AggregatorServiceImpl {
             metadata,
         };
 
-        // Dissemination: Triggers both Path A (VPP/Kafka) and Path B (Aggregation/Settlement)
+        // Dissemination: fan out to VPP streams (Redis/Kafka) and local aggregation
         let res = disseminate_reading(&self.state, reading, sig_verified).await;
 
         if res.status().is_success() {
@@ -428,7 +428,7 @@ impl OracleService for AggregatorServiceImpl {
 
             let mut generated_kwh = tel.energy_generated.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
             let mut consumed_kwh = tel.energy_consumed.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let mut timestamp = Utc.timestamp_opt(tel.timestamp, 0).single().unwrap_or_else(Utc::now);
+            let mut timestamp = Utc.timestamp_opt(tel.timestamp, 0).single().unwrap_or_else(|| gridtokenx_telemetry::time::now());
             let mut metadata = HashMap::new();
 
             if !tel.raw_payload.is_empty() {

@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
@@ -416,53 +415,13 @@ impl DeviceKeyRegistry {
     }
 }
 
-pub struct SettlementSigner {
-    signing_key: SigningKey,
-}
-
-impl SettlementSigner {
-    pub fn new(private_key_bytes: &[u8]) -> Result<Self> {
-        let bytes: [u8; 32] = private_key_bytes
-            .try_into()
-            .map_err(|_| anyhow!("Invalid private key length"))?;
-        let signing_key = SigningKey::from_bytes(&bytes);
-        Ok(Self { signing_key })
-    }
-
-    pub fn sign_settlement<T: Serialize>(&self, data: &T) -> Result<String> {
-        let payload = serde_json::to_vec(data)?;
-        let signature = self.signing_key.sign(&payload);
-        Ok(bs58::encode(signature.to_bytes()).into_string())
-    }
-
-    /// Sign a canonical message string matching the Trading Service's verification format:
-    /// "{user_id}:{meter_serial}:{energy_generated_kwh}:{start_time}:{end_time}"
-    pub fn sign_canonical(&self, message: &str) -> String {
-        let signature = self.signing_key.sign(message.as_bytes());
-        bs58::encode(signature.to_bytes()).into_string()
-    }
-
-    /// Get the public key as a bs58-encoded string (for AGGREGATOR_BRIDGE_PUBLIC_KEY config)
-    pub fn public_key_bs58(&self) -> String {
-        let verifying_key = self.signing_key.verifying_key();
-        bs58::encode(verifying_key.as_bytes()).into_string()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettlementData {
-    pub meter_serial: String,
-    pub window_start: i64, // 15-min window start (ms)
-    pub window_end: i64,   // 15-min window end (ms)
-    pub energy_generated: f64,
-    pub energy_consumed: f64,
-    pub net_energy: f64,
-    pub timestamp: i64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Signing primitives used only by the device-key test below; the production
+    // verifier path needs verify-only (`Verifier`/`VerifyingKey`), so these are
+    // scoped here rather than at crate level.
+    use ed25519_dalek::{Signer, SigningKey};
 
     // A syntactically valid 64-char hex pubkey + base58 sig so the verifier
     // reaches the Redis lookup before any decode error — the lookup is what we
@@ -501,28 +460,6 @@ mod tests {
         let v = SignatureVerifier::new(None);
         let res = v.verify_telemetry_signature_batch(&[], &[], &[]).await;
         assert!(matches!(res.as_deref(), Ok(&[])), "empty batch must be Ok([]), got {:?}", res);
-    }
-
-    /// `sign_canonical` must produce a base58 Ed25519 signature that verifies
-    /// against the signer's own public key for the exact canonical string —
-    /// the contract the Trading Service relies on.
-    #[test]
-    fn settlement_signer_canonical_roundtrip() {
-        let signer = SettlementSigner::new(&[7u8; 32]).unwrap();
-        let msg = "user:meter:12.5:1000:2000";
-
-        let sig_bytes = bs58::decode(signer.sign_canonical(msg)).into_vec().unwrap();
-        let signature = Signature::from_slice(&sig_bytes).unwrap();
-
-        let pk_bytes = bs58::decode(signer.public_key_bs58()).into_vec().unwrap();
-        let pk: [u8; 32] = pk_bytes.try_into().unwrap();
-        let verifying_key = VerifyingKey::from_bytes(&pk).unwrap();
-
-        assert!(verifying_key.verify(msg.as_bytes(), &signature).is_ok());
-        // Tampered message must NOT verify.
-        assert!(verifying_key
-            .verify(b"user:meter:99.9:1000:2000", &signature)
-            .is_err());
     }
 
     /// Device Ed25519 primitive — the exact checks `verify_telemetry_signature`

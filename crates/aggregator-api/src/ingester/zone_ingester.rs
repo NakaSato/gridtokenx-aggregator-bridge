@@ -21,7 +21,6 @@ use uuid::Uuid;
 use crate::aggregator::Aggregator;
 use crate::infra::platform::PlatformClient;
 use crate::ingester::batcher::{BatchHandle, BatchWorker, BATCH_TIMEOUT_MS, FORWARD_BATCH_SIZE};
-use crate::ingester::bin_store::BinStore;
 use crate::ingester::Event;
 use crate::utils::numeric::to_positive_decimal;
 
@@ -42,8 +41,6 @@ pub struct ZoneEventIngester {
     num_zones: usize,
     /// Meter → User ID resolver
     meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
-    /// Durable billing-bin store (crash recovery). None ⇒ degraded (RAM-only) mode.
-    bin_store: Option<BinStore>,
     /// Rolling grid-frequency window fed from reading metadata. None ⇒ no
     /// frequency-driven dispatch (e.g. Kafka disabled).
     frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
@@ -57,7 +54,6 @@ impl ZoneEventIngester {
         metrics: Arc<crate::state::Metrics>,
         num_zones: usize,
         meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
-        bin_store: Option<BinStore>,
         frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
@@ -75,12 +71,12 @@ impl ZoneEventIngester {
         // Create batch forwarder with Redis connection for ACKing.
         // The platform (OracleService) client is best-effort: the live forward path is a
         // Redis-ACK bypass, so a missing/unreachable target must NOT block the ingester —
-        // local aggregation (Path B billing bins) depends only on Redis + the Aggregator.
+        // local aggregation depends only on Redis + the Aggregator.
         let platform_client = match PlatformClient::new(api_services_url).await {
             Ok(c) => Some(c),
             Err(e) => {
                 warn!(
-                    "⚠️ PlatformClient unavailable ({}): zone ingester runs without gRPC forwarding (Path B bins still fill locally).",
+                    "⚠️ PlatformClient unavailable ({}): zone ingester runs without gRPC forwarding (local aggregation continues).",
                     e
                 );
                 None
@@ -110,7 +106,6 @@ impl ZoneEventIngester {
             batch_handle,
             num_zones,
             meter_registry,
-            bin_store,
             frequency_monitor,
         })
     }
@@ -530,9 +525,9 @@ impl ZoneEventIngester {
             }
         };
 
-        // 1. Update Aggregator (local stats) + write-through to durable store.
-        // Snapshot is taken under the lock; the Redis I/O happens after release.
-        let bin_snapshot = {
+        // 1. Update Aggregator (local stats). Feeds the dispatch engine's
+        // completed-window capacity query (VPP flex dispatch).
+        {
             let mut agg = self.aggregator.lock().await;
             agg.handle_reading(
                 meter_id,
@@ -541,15 +536,7 @@ impl ZoneEventIngester {
                 energy_generated,
                 energy_consumed,
                 reading.timestamp,
-            )
-        };
-        if let Some(store) = &self.bin_store {
-            if let Err(e) = store.persist(&bin_snapshot).await {
-                warn!(
-                    "⚠️ Billing-bin persist failed for {} (in-memory only, energy at-risk on restart): {}",
-                    bin_snapshot.meter_serial, e
-                );
-            }
+            );
         }
 
         // 2. ACK in Redis to prevent redelivery. (The legacy HTTP/gRPC

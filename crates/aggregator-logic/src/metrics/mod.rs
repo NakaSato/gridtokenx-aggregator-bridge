@@ -99,28 +99,6 @@ pub fn record_aggregator_forwarding(success: bool, duration_ms: f64) {
     }
 }
 
-/// Records blockchain submission metrics
-#[allow(dead_code)]
-pub fn record_blockchain_submission(operation: &str, success: bool, duration_ms: f64) {
-    counter!("aggregator_blockchain_submissions_total",
-        "operation" => operation.to_string(),
-        "success" => success.to_string()
-    )
-    .increment(1);
-
-    histogram!("aggregator_blockchain_submission_duration_ms",
-        "operation" => operation.to_string()
-    )
-    .record(duration_ms);
-
-    if !success {
-        counter!("aggregator_blockchain_submission_failures_total",
-            "operation" => operation.to_string()
-        )
-        .increment(1);
-    }
-}
-
 /// Records device connectivity metrics
 #[allow(dead_code)]
 pub fn record_device_connection(device_type: &str, connected: bool) {

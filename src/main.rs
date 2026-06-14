@@ -53,6 +53,11 @@ async fn main() -> Result<()> {
     // Initialize OpenTelemetry tracing (sets up global subscriber)
     let _telemetry_guard = telemetry::init_telemetry("gridtokenx-aggregator-bridge");
 
+    // Make an external NTP server (Cloudflare primary, Google fallback) the primary
+    // wall-clock source. Background poller; `telemetry::time::now()` is non-blocking
+    // and degrades to the OS clock until the first sync. See gridtokenx_telemetry::time.
+    telemetry::time::init_default();
+
     info!("🚀 Starting GridTokenX Aggregator Bridge (Zone-Based Microgrid Mode)");
 
     // 2. Configuration
@@ -109,28 +114,11 @@ async fn main() -> Result<()> {
         early_redis_conn.clone(),
     ));
 
-    // 4c. Durable billing-bin store (crash recovery for unsettled energy). Restore
-    // any bins persisted before a previous restart BEFORE settlement starts, so a
-    // bounce mid-window doesn't silently drop the GRID those readings should mint.
-    let bin_store = early_redis_conn
-        .clone()
-        .map(ingester::bin_store::BinStore::new);
-    if let Some(store) = &bin_store {
-        match store.load_all().await {
-            Ok(bins) if !bins.is_empty() => {
-                let n = bins.len();
-                aggregator.lock().await.rehydrate(bins);
-                info!("♻️ Restored {} unsettled billing bins from durable store", n);
-            }
-            Ok(_) => info!("♻️ Durable bin store empty — fresh start"),
-            Err(e) => warn!(
-                "⚠️ Failed to restore billing bins from Redis: {} — starting empty",
-                e
-            ),
-        }
-    } else {
-        warn!("⚠️ No Redis — billing bins are RAM-only (energy lost on restart)");
-    }
+    // NOTE: the on-chain settlement/mint path (former "Path B") was removed. The
+    // aggregator now accumulates billing bins purely to feed the dispatch engine's
+    // completed-window capacity query. With settlement gone, nothing evicts bins —
+    // `active_bins` grows unbounded over time (known leak; acceptable for the
+    // operational/dispatch role, revisit with a time-based reaper if needed).
 
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
@@ -155,7 +143,6 @@ async fn main() -> Result<()> {
         metrics.clone(),
         num_zones,
         meter_registry.clone(),
-        bin_store.clone(),
         frequency_monitor.clone(),
     )
     .await
@@ -194,8 +181,18 @@ async fn main() -> Result<()> {
         warn!("⚠️ Could not connect to NATS. Telemetry forwarding disabled.");
     }
 
+    // Independent InfluxDB telemetry-history sink (own INFLUXDB_* connection;
+    // shared with no other service). Degrades to None when unset/unreachable.
+    let influx_writer = match infra::influxdb::InfluxWriter::connect().await {
+        Ok(w) => w.map(Arc::new),
+        Err(e) => {
+            warn!("⚠️ InfluxDB init failed: {}. Realtime history persistence disabled.", e);
+            None
+        }
+    };
+
     let iot_router = Arc::new(
-        router::Router::new(&redis_url, num_zones, nats_client)
+        router::Router::new(&redis_url, num_zones, nats_client, influx_writer)
             .await
             .context("Failed to initialize IoT router")?,
     );
@@ -276,8 +273,8 @@ async fn main() -> Result<()> {
 
     // 8. Initialize Dispatch Engine — reuses the SINGLE shared aggregator (the one
     // the zone ingester fills). Must NOT create a second instance: a separate
-    // aggregator here would never see any readings, and previously caused settlement
-    // (which clones this binding) to scan an always-empty map → zero mints.
+    // aggregator here would never see any readings, so dispatch would scan an
+    // always-empty map and report zero available capacity.
     let dispatch_grpc_url = std::env::var("DISPATCH_GRPC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
     let grpc_client = match dispatch::grpc_client::DispatchClient::new(dispatch_grpc_url.clone()).await {
@@ -416,28 +413,8 @@ async fn main() -> Result<()> {
         redis_url.clone(),
     )));
 
-    // Crypto: Settlement Signer
-    let settlement_signer = if let Ok(key_path) = std::env::var("AGGREGATOR_BRIDGE_SIGNING_KEY") {
-        match std::fs::read(&key_path) {
-            Ok(bytes) => match infra::crypto::SettlementSigner::new(&bytes) {
-                Ok(s) => Some(Arc::new(s)),
-                Err(e) => {
-                    warn!("⚠️ Failed to initialize settlement signer: {}. Settlements will use placeholders.", e);
-                    None
-                }
-            },
-            Err(e) => {
-                warn!("⚠️ Could not read Aggregator Bridge signing key at {}: {}. Settlements will use placeholders.", key_path, e);
-                None
-            }
-        }
-    } else {
-        info!("ℹ️ Settlement signer disabled (AGGREGATOR_BRIDGE_SIGNING_KEY not set)");
-        None
-    };
     // 7. Initialize IAM gRPC Client (optional - auth falls back to static API keys).
-    // Built before the Settlement Engine so the generation-mint path can resolve
-    // recipient wallets via `GetUserWallet`.
+    // Used by the ingest auth middleware to resolve API keys via IAM.
     use connectrpc::client::{ClientConfig, Http2Connection};
     use connectrpc::Protocol;
 
@@ -453,9 +430,9 @@ async fn main() -> Result<()> {
             })
             .ok()?
             .shared(1024);
-        // IAM gates GetUserWallet behind ServiceRole::AggregatorBridge. The role is
-        // derived from the `x-gridtokenx-role` header (see ServiceRole::from_headers in
-        // gridtokenx-blockchain-core); without it the call is denied as Unknown.
+        // IAM derives the caller's ServiceRole from the `x-gridtokenx-role` header
+        // (see ServiceRole::from_headers in gridtokenx-blockchain-core); without it
+        // role-gated calls are denied as Unknown.
         let config = ClientConfig::new(uri)
             .protocol(Protocol::Grpc)
             .default_header("x-gridtokenx-role", "aggregator-bridge");
@@ -465,84 +442,6 @@ async fn main() -> Result<()> {
     }
     .await;
 
-    // 7c. Start UTT Settlement Engine (Path B)
-    let settlement_agg = aggregator.clone();
-    let settlement_shutdown = shutdown_token.clone();
-    let settlement_api_url = std::env::var("SETTLEMENT_API_URL")
-        .or_else(|_| std::env::var("TRADING_HTTP_URL"))
-        .unwrap_or_else(|_| "http://trading-service:8093".to_string());
-
-    info!("💰 UTT Path B Settlement target: {}", settlement_api_url);
-
-    // Generation-mint routing: when MINT_VIA_CHAIN_BRIDGE=true the aggregator mints
-    // GRID directly via Chain Bridge (Vault signs) instead of POSTing to trading-service.
-    // Requires a working BlockchainService AND the IAM client; otherwise fall back to HTTP.
-    let mint_via_chain_bridge_requested = std::env::var("MINT_VIA_CHAIN_BRIDGE")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    let settlement_blockchain = if mint_via_chain_bridge_requested {
-        match ingester::settlement_engine::build_blockchain_service().await {
-            Ok(svc) => Some(svc),
-            Err(e) => {
-                error!(
-                    "❌ MINT_VIA_CHAIN_BRIDGE requested but BlockchainService build failed: {} — using HTTP path",
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mint_via_chain_bridge =
-        mint_via_chain_bridge_requested && settlement_blockchain.is_some() && identity_client.is_some();
-    if mint_via_chain_bridge {
-        info!("⚡ Generation mint path: Chain Bridge (Vault-signed)");
-    } else if mint_via_chain_bridge_requested {
-        warn!("⚠️ MINT_VIA_CHAIN_BRIDGE requested but prerequisites missing (blockchain/IAM) — using HTTP settlement path");
-    }
-
-    // Settlement-path observability (G2). Three mutually exclusive paths:
-    //   nats — mint via Chain Bridge, durable async submit over NATS JetStream;
-    //   grpc — mint via Chain Bridge but NATS_URL unset, so blockchain-core
-    //          silently falls back to gRPC-only submit (see
-    //          gridtokenx-blockchain-core/src/rpc.rs);
-    //   http — HTTP settle-to-trading-service (mint path off or prereqs missing).
-    // The grpc case is a silent degradation of the intended nats path — warn loud
-    // and export the active path as a labelled gauge so it is observable.
-    let nats_url_set = std::env::var("NATS_URL")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let settlement_path = if mint_via_chain_bridge {
-        if nats_url_set { "nats" } else { "grpc" }
-    } else {
-        "http"
-    };
-    if mint_via_chain_bridge && !nats_url_set {
-        warn!(
-            "⚠️ MINT_VIA_CHAIN_BRIDGE=true but NATS_URL is unset — Chain Bridge writes \
-             silently degrade to gRPC-only (no durable async submit). Set NATS_URL for \
-             the intended settlement path."
-        );
-    }
-    info!("📊 Active settlement path: {}", settlement_path);
-
-    let settlement_signer_task = settlement_signer.clone();
-    let settlement_identity_client = identity_client.clone();
-    let settlement_bin_store = bin_store.clone();
-    let _settlement_handle = tokio::spawn(async move {
-        let engine = ingester::settlement_engine::SettlementEngine::new(
-            settlement_agg,
-            settlement_api_url,
-            settlement_signer_task,
-            mint_via_chain_bridge,
-            settlement_blockchain,
-            settlement_identity_client,
-            settlement_bin_store,
-        );
-        engine.run(settlement_shutdown).await;
-    });
-
     // 7b. Initialize Prometheus metrics exporter
     let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 1.0])
@@ -551,9 +450,6 @@ async fn main() -> Result<()> {
     let metrics_handle = metrics_recorder.handle();
     ::metrics::set_global_recorder(metrics_recorder).context("Failed to set metrics recorder")?;
     info!("✅ Prometheus metrics exporter initialized");
-
-    // Export the active settlement path (G2) now that the recorder is live.
-    ::metrics::gauge!("settlement_path", "path" => settlement_path).set(1.0);
 
     let app_state = AppState {
         router: iot_router,

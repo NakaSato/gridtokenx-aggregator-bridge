@@ -6,12 +6,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use aggregator_core::models::DeviceReading;
+use aggregator_core::models::{DeviceMetrics, DeviceReading, DeviceType};
+use aggregator_persistence::infra::influxdb::{InfluxWriter, TelemetryPoint};
 
 /// Default maximum number of entries per Redis stream.
 const DEFAULT_MAX_STREAM_LEN: usize = 100_000;
 
-use gridtokenx_blockchain_core::rpc::nats_schema::MeterReadingMessage;
+use aggregator_core::models::MintForwardReading;
 
 /// Routes normalized `DeviceReading` events to zone-partitioned Redis Streams.
 pub struct Router {
@@ -24,12 +25,22 @@ pub struct Router {
     max_stream_len: usize,
     /// Number of zone partitions
     num_zones: usize,
-    /// Optional NATS client for forwarding direct chain-bridge ingestion messages
+    /// Optional NATS client for forwarding the meter reading value to
+    /// meter-service (which owns the on-chain mint decision; this service does not mint).
     nats_client: Option<async_nats::Client>,
+    /// NATS subject meter-service consumes reading values on.
+    meter_subject: String,
+    /// Optional independent InfluxDB sink for realtime telemetry history.
+    influx: Option<Arc<InfluxWriter>>,
 }
 
 impl Router {
-    pub async fn new(redis_url: &str, num_zones: usize, nats_client: Option<async_nats::Client>) -> Result<Self> {
+    pub async fn new(
+        redis_url: &str,
+        num_zones: usize,
+        nats_client: Option<async_nats::Client>,
+        influx: Option<Arc<InfluxWriter>>,
+    ) -> Result<Self> {
         let client = redis::Client::open(redis_url)?;
         let connection_manager = ConnectionManager::new(client).await?;
 
@@ -41,12 +52,17 @@ impl Router {
         info!("📏 Redis stream MAXLEN cap: ~{}", max_stream_len);
         info!("🔢 Zone partitions: {}", num_zones);
 
+        let meter_subject = std::env::var("METER_SERVICE_NATS_SUBJECT")
+            .unwrap_or_else(|_| "meter.reading".to_string());
+
         Ok(Self {
             redis_url: redis_url.to_string(),
             conn: Arc::new(Mutex::new(Some(connection_manager))),
             max_stream_len,
             num_zones,
             nats_client,
+            meter_subject,
+            influx,
         })
     }
 
@@ -146,27 +162,51 @@ impl Router {
             reading.device_type, reading.serial_number, stream_name, stream_id
         );
 
-        // Option A: Forward telemetry directly to NATS for chain-bridge ingestion
+        // Persist realtime history to the independent InfluxDB sink (async,
+        // fire-and-forget — a slow/down InfluxDB never blocks dissemination).
+        if let Some(influx) = &self.influx {
+            if let Some(point) = reading_to_point(reading) {
+                influx.record(point);
+            }
+        }
+
+        // Forward the mint reading to meter-service over NATS. EVERY reading is
+        // already persisted above (Redis zone + unified streams, InfluxDB); this
+        // step only hands off readings with mintable surplus generation
+        // (net_kwh > 0) to meter-service, which owns the on-chain mint decision —
+        // this bridge never mints or talks to the chain. Zero/consumption readings
+        // are stored but carry nothing to tokenize, so they are not forwarded.
         if let Some(nats) = &self.nats_client {
-            if reading.device_type == aggregator_core::models::DeviceType::SmartMeter {
-                let net = match reading.metrics {
-                    aggregator_core::models::DeviceMetrics::Energy { net_kwh, .. } => net_kwh,
-                    _ => 0.0,
-                };
-                let nats_payload = MeterReadingMessage {
+            let net = match reading.metrics {
+                aggregator_core::models::DeviceMetrics::Energy { net_kwh, .. } => net_kwh,
+                _ => 0.0,
+            };
+            if reading.device_type == aggregator_core::models::DeviceType::SmartMeter && net > 0.0 {
+                let nats_payload = MintForwardReading {
+                    reading_id: reading.reading_id,
                     device_id: reading.device_id.clone(),
-                    wallet_address: reading.serial_number.clone(), // using serial_number as wallet/device correlation
+                    meter_serial: reading.serial_number.clone(),
                     energy_kwh: net,
-                    timestamp_ms: reading.timestamp.timestamp_millis() as u64,
+                    timestamp_ms: reading.timestamp.timestamp_millis(),
                 };
-                
+
                 match serde_json::to_vec(&nats_payload) {
                     Ok(payload_bytes) => {
-                        if let Err(e) = nats.publish("meter.reading.mint".to_string(), payload_bytes.into()).await {
-                            tracing::error!("Failed to publish to NATS meter.reading.mint: {}", e);
+                        if let Err(e) = nats
+                            .publish(self.meter_subject.clone(), payload_bytes.into())
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to publish reading to NATS {}: {}",
+                                self.meter_subject,
+                                e
+                            );
                         } else {
                             let _ = nats.flush().await;
-                            tracing::info!("📤 Also forwarded to NATS stream: meter.reading.mint");
+                            tracing::info!(
+                                "📤 Forwarded reading value to meter-service (NATS {})",
+                                self.meter_subject
+                            );
                         }
                     }
                     Err(e) => tracing::error!("Failed to serialize NATS payload: {}", e),
@@ -184,6 +224,79 @@ impl Router {
             aggregator_core::models::DeviceType::Battery => "BatteryStateUpdate",
         }
     }
+}
+
+/// Map a normalized `DeviceReading` into a protocol-neutral InfluxDB point.
+///
+/// Measurement is keyed by device type; categorical state (EV/battery) becomes
+/// tags, numeric metrics become fields. Returns `None` only if the event time
+/// is unrepresentable as nanoseconds.
+fn reading_to_point(reading: &DeviceReading) -> Option<TelemetryPoint> {
+    let timestamp_ns = reading.timestamp.timestamp_nanos_opt()?;
+
+    let (measurement, extra_tags, fields): (&'static str, Vec<(&'static str, String)>, Vec<(&'static str, f64)>) =
+        match &reading.metrics {
+            DeviceMetrics::Energy {
+                generated_kwh,
+                consumed_kwh,
+                net_kwh,
+            } => (
+                "energy",
+                vec![],
+                vec![
+                    ("generated_kwh", *generated_kwh),
+                    ("consumed_kwh", *consumed_kwh),
+                    ("net_kwh", *net_kwh),
+                ],
+            ),
+            DeviceMetrics::EvSession {
+                energy_delivered_kwh,
+                session_id,
+                connector_id,
+                status,
+            } => (
+                "ev_session",
+                vec![
+                    ("session_id", session_id.clone()),
+                    ("status", format!("{:?}", status)),
+                ],
+                vec![
+                    ("energy_delivered_kwh", *energy_delivered_kwh),
+                    ("connector_id", *connector_id as f64),
+                ],
+            ),
+            DeviceMetrics::BatteryState {
+                soc_percent,
+                power_kw,
+                temperature_c,
+                mode,
+            } => (
+                "battery",
+                vec![("mode", format!("{:?}", mode))],
+                vec![
+                    ("soc_percent", *soc_percent),
+                    ("power_kw", *power_kw),
+                    ("temperature_c", *temperature_c),
+                ],
+            ),
+        };
+
+    let device_type = match reading.device_type {
+        DeviceType::SmartMeter => "smart_meter",
+        DeviceType::EvCharger => "ev_charger",
+        DeviceType::Battery => "battery",
+    };
+
+    Some(TelemetryPoint {
+        measurement,
+        device_id: reading.device_id.clone(),
+        device_type: device_type.to_string(),
+        serial_number: reading.serial_number.clone(),
+        zone_code: reading.zone_code.clone(),
+        extra_tags,
+        fields,
+        timestamp_ns,
+    })
 }
 
 /// Determine zone index for a reading based on zone_code or serial_number hashing
@@ -229,7 +342,7 @@ mod tests {
             device_type: DeviceType::SmartMeter,
             serial_number: "SN-999".to_string(),
             zone_code: None, // Force hashing
-            timestamp: Utc::now(),
+            timestamp: gridtokenx_telemetry::time::now(),
             metrics: DeviceMetrics::Energy {
                 generated_kwh: 10.0,
                 consumed_kwh: 5.0,
@@ -248,6 +361,58 @@ mod tests {
         // The test ensures they are within bounds.
     }
 
+    /// Live cross-service hop: drives the REAL `Router::disseminate` net_kwh
+    /// forward (surplus-only gate + `MeterReadingMessage` wire) onto NATS, where
+    /// the meter-service consumer ingests + mints it. Requires live Redis + NATS;
+    /// run alongside the meter-service binary. Ignored in normal `cargo test`.
+    ///
+    /// `TEST_METER_SERIAL` must be a serial registered to a user (so the
+    /// consumer can attribute the reading). Run:
+    ///   REDIS_URL=redis://127.0.0.1:7010 NATS_URL=nats://127.0.0.1:9020 \
+    ///   TEST_METER_SERIAL=<serial> \
+    ///   cargo test -p aggregator-logic forward_to_meter_service_e2e -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires live Redis + NATS + meter-service consumer"]
+    async fn forward_to_meter_service_e2e() {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:7010".to_string());
+        let nats_url =
+            std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:9020".to_string());
+        let serial = std::env::var("TEST_METER_SERIAL")
+            .expect("set TEST_METER_SERIAL to a registered meter serial");
+
+        let nats = async_nats::connect(&nats_url).await.expect("connect NATS");
+        let router = Router::new(&redis_url, 10, Some(nats), None)
+            .await
+            .expect("build Router");
+
+        let reading = DeviceReading {
+            reading_id: Uuid::new_v4(),
+            device_id: "E2E-DEVICE".to_string(),
+            device_type: DeviceType::SmartMeter,
+            serial_number: serial.clone(),
+            zone_code: Some("ZONE1".to_string()),
+            timestamp: gridtokenx_telemetry::time::now(),
+            metrics: DeviceMetrics::Energy {
+                generated_kwh: 7.5,
+                consumed_kwh: 0.0,
+                net_kwh: 7.5,
+            },
+            metadata: std::collections::HashMap::new(),
+        };
+
+        // Send twice with the SAME reading_id to exercise idempotency: the
+        // meter-service consumer must insert one row, not two.
+        router.disseminate(&reading).await.expect("disseminate 1");
+        router.disseminate(&reading).await.expect("disseminate 2");
+        // Let the meter-service consumer drain + persist before the test exits.
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        println!(
+            "✅ forwarded net_kwh=7.5 twice (reading_id={}) for meter {serial} to NATS",
+            reading.reading_id
+        );
+    }
+
     #[tokio::test]
     async fn test_router_explicit_zone_id() {
         let reading = DeviceReading {
@@ -256,7 +421,7 @@ mod tests {
             device_type: DeviceType::SmartMeter,
             serial_number: "SN-999".to_string(),
             zone_code: Some("ZONE5".to_string()),
-            timestamp: Utc::now(),
+            timestamp: gridtokenx_telemetry::time::now(),
             metrics: DeviceMetrics::Energy {
                 generated_kwh: 10.0,
                 consumed_kwh: 5.0,

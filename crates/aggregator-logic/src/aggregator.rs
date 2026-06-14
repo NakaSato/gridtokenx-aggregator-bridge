@@ -86,17 +86,14 @@ impl Aggregator {
 
     /// Returns clones of all billing bins whose window closed at least `grace`
     /// ago, WITHOUT removing them. The `grace` delay lets late / briefly-buffered
-    /// readings for a just-closed window still land in it before it settles:
-    /// minting a *partial* bin would create the on-chain `(meter, window)`
-    /// `gen_mint` PDA and strand every reading that arrives afterward (TD-002).
-    /// Pass `Duration::zero()` for the strict `end_time <= now` semantics (e.g.
-    /// dispatch capacity, which only reads bins and never mints).
+    /// readings for a just-closed window still land in it before it is read.
+    /// Pass `Duration::zero()` for the strict `end_time <= now` semantics used by
+    /// the dispatch engine's completed-window capacity query.
     ///
-    /// Non-destructive on purpose: the settlement engine evicts a bin only after
-    /// the mint is confirmed submitted (see `remove_bins`), so a failed/crashed
-    /// mint retries on the next tick instead of silently losing the energy.
+    /// Non-destructive on purpose: the dispatch engine only reads completed-window
+    /// capacity and never drains bins.
     pub fn peek_completed_bins(&self, grace: chrono::Duration) -> Vec<BillingBin> {
-        let cutoff = Utc::now() - grace;
+        let cutoff = gridtokenx_telemetry::time::now() - grace;
         self.active_bins
             .values()
             .filter(|bin| bin.end_time <= cutoff)
@@ -108,14 +105,6 @@ impl Aggregator {
     pub fn remove_bins(&mut self, keys: &[BinKey]) {
         for key in keys {
             self.active_bins.remove(key);
-        }
-    }
-
-    /// Reloads bins from the durable store on boot. Existing in-memory bins win
-    /// (a live reading already created them); only missing keys are inserted.
-    pub fn rehydrate(&mut self, bins: Vec<BillingBin>) {
-        for bin in bins {
-            self.active_bins.entry(bin.key()).or_insert(bin);
         }
     }
 
@@ -214,9 +203,9 @@ mod tests {
     #[test]
     fn peek_returns_only_closed_windows() {
         let mut agg = Aggregator::new();
-        let past = Utc::now() - chrono::Duration::minutes(25); // window closed ~10 min ago
+        let past = gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25); // window closed ~10 min ago
         reading(&mut agg, 30, 0, past);
-        reading(&mut agg, 9, 0, Utc::now()); // current window end is in the future
+        reading(&mut agg, 9, 0, gridtokenx_telemetry::time::now()); // current window end is in the future
 
         let done = agg.peek_completed_bins(chrono::Duration::zero());
         assert_eq!(done.len(), 1, "only the closed window is completed");
@@ -226,12 +215,12 @@ mod tests {
     #[test]
     fn peek_is_non_destructive() {
         let mut agg = Aggregator::new();
-        let past = Utc::now() - chrono::Duration::minutes(25);
+        let past = gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25);
         reading(&mut agg, 30, 0, past);
 
         assert_eq!(agg.peek_completed_bins(chrono::Duration::zero()).len(), 1);
         // A second peek still sees it — eviction only happens via remove_bins,
-        // so a crashed/failed mint retries next tick instead of losing energy.
+        // so a consumer that fails mid-read retries next tick instead of losing energy.
         let again = agg.peek_completed_bins(chrono::Duration::zero());
         assert_eq!(again.len(), 1, "peek must not evict");
 
@@ -241,11 +230,10 @@ mod tests {
 
     #[test]
     fn peek_grace_delays_recently_closed_window() {
-        // TD-002 guard: a window that closed only moments ago must not settle yet —
-        // a late/buffered reading could still land in it, and minting the partial
-        // bin would lock the (meter, window) gen_mint PDA and strand the rest.
+        // Grace guard: a window that closed only moments ago is held back so a
+        // late/buffered reading can still land in it before a consumer reads the bin.
         let mut agg = Aggregator::new();
-        let now = Utc::now();
+        let now = gridtokenx_telemetry::time::now();
         let bin = BillingBin {
             meter_id: Uuid::nil(),
             user_id: Uuid::nil(),

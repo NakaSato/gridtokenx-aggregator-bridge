@@ -10,12 +10,15 @@
 - **Streaming:** Apache Kafka (KRaft mode).
 - **Topics:**
   - `telemetry.raw`: 15-second intervals.
-  - `attestation.signed`: 15-minute intervals.
 
 ## 3. Aggregator Bridge Layer
-- **UTT Ingestion:** Verified entry point for both paths.
-- **ZK-Prover:** Plonky2 (Goldilocks field, FRI-based).
-- **Finality:** Merkle Root + Plonky2 Proof.
+
+The **central connection point for every device node** in the smart grid: it
+verifies, aggregates, and disseminates inbound telemetry, and drives VPP flex
+dispatch. It does **not** mint tokens or settle on-chain (the former Plonky2
+ZK-rollup "Path B" was removed).
+
+- **UTT Ingestion:** Verified entry point for all device telemetry.
 
 ### Ingestion pipeline
 
@@ -65,18 +68,18 @@ no external SCADA feed:
   `frequency` / `frequency_hz` metadata into a rolling window
   (`FrequencyMonitor`, verified `crates/aggregator-logic/src/grid_status.rs:19`;
   ingester hook verified
-  `crates/aggregator-api/src/ingester/zone_ingester.rs:466`, extraction `:597`).
+  `crates/aggregator-api/src/ingester/zone_ingester.rs:466`, extraction `:574`).
   Implausible samples (<40 / >70 Hz) are dropped. A publisher task in `main`
   turns the window mean into `GridStatusEvent` JSON on the Kafka dispatch topic
-  every `GRID_STATUS_PUBLISH_SECS` (default 30s; verified `src/main.rs:224`).
-- **Dispatch engine.** A Kafka listener (verified `src/main.rs:303`) feeds each
+  every `GRID_STATUS_PUBLISH_SECS` (default 30s; verified `src/main.rs:243`).
+- **Dispatch engine.** A Kafka listener (verified `src/main.rs:316`) feeds each
   grid-status frequency to `DispatchEngine::evaluate_and_dispatch` (verified
   `crates/aggregator-logic/src/dispatch/engine.rs:133`): below
   `DISPATCH_FREQ_LOW_HZ` ⇒ FLEX_UP, above `DISPATCH_FREQ_HIGH_HZ` ⇒ FLEX_DOWN,
   capacity `DISPATCH_CAPACITY_KW`. Dispatch refuses to fire with zero completed
   aggregation capacity. Repeat suppression is tracked **per action**: a
   re-dispatch of the same action waits out `DISPATCH_COOLDOWN_SECS` (default
-  900 = one settlement window); a flipped action fires immediately on its own
+  900 = one 15-minute aggregation window); a flipped action fires immediately on its own
   independent timer, so an oscillating frequency cannot reset the cooldown by
   alternating directions; a cooldown starts only on success (`cooldown_allows`,
   verified `crates/aggregator-logic/src/dispatch/engine.rs:41`).
@@ -88,19 +91,19 @@ no external SCADA feed:
   logic against a VTN (`OPENLEADR_VTN_URL`): each dispatch becomes an OpenADR
   event with a signed-kW `DISPATCH_SETPOINT` payload (up = +, down = −;
   `dispatch_event`, verified
-  `crates/aggregator-logic/src/standards/openleadr.rs:87`). The program is
+  `crates/aggregator-logic/src/standards/openleadr.rs:92`). The program is
   resolved by name before create — blind create 409s forever after a restart.
 - **OpenADR 3, VEN side (inbound).** `OpenLeadrVenListener` (verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:46`) polls a
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:47`) polls a
   (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
   `DISPATCH_SETPOINT` events and executes them through an injected adapter —
   at startup it self-registers a VEN object named `OPENLEADR_VEN_CLIENT_NAME`
   on the VTN, best-effort (`ensure_registered`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:177`) —
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:191`) —
   `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
   to a VTN. Event schedules are honored across **all** setpoint intervals
   (`decide`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:538`): each interval
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:552`): each interval
   executes as its window opens (deduped per interval), future windows wait,
   an event is done only when no pending interval remains, the interval-level
   period wins over the event-level default, and a period-less interval
@@ -109,72 +112,27 @@ no external SCADA feed:
   not re-execute still-listed events; failed dispatches retry next poll, and
   entries for events the VTN no longer lists are pruned after 7 days
   (`poll_once`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:212`). Optional
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:226`). Optional
   `OPENLEADR_VEN_TARGET` restricts polling to events carrying that target. An
   executed event that vanishes from the VTN while still active is flagged loud
   (cancellation visibility) — no automatic revert, by design. Each executed
   dispatch is confirmed back to the VTN as an OpenADR report (AGGREGATED_REPORT
   resource, SETPOINT payload; best-effort — a report failure never fails or
   retries the dispatch; `post_execution_report`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:378`).
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:392`).
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
   → dispatch → VTN event → VEN execution.
 
-### Settlement (Path B generation mint — exactly-once on-chain)
+> **No settlement here.** On-chain generation-mint / settlement (the former
+> "Path B": 15-min billing bins → Plonky2 ZK-rollup → Merkle root → HyperEVM)
+> was removed from this service. The Aggregator Bridge produces verified,
+> aggregated telemetry and drives flex dispatch only; downstream token issuance
+> and settlement are the Market Layer's concern (below), reached through other
+> platform services, not from this bridge.
 
-Completed 15-minute billing bins mint GRX to each meter's wallet through Chain
-Bridge (Vault signs the unsigned txs). Exactly-once is enforced **on-chain**, not
-by the app-side marker:
-
-- **Per-`(meter, window)` mint record.** Each recipient carries its identity into
-  the mint: `MintRecipient { wallet, amount, meter_id, window_start_ms }`, built
-  from the bin key (`meter_id = *key.0.as_bytes()`,
-  `window_start_ms = key.1.timestamp_millis()`, verified
-  `crates/aggregator-api/src/ingester/settlement_engine.rs:277`). The Chain-Bridge
-  instruction builder (`build_generation_mint_instructions` in
-  `gridtokenx-blockchain-core`) derives a PDA `[b"gen_mint", meter_id,
-  window_start_ms.to_le_bytes()]` and targets `energy_token::mint_generation`
-  instead of the unconditional `mint_to_wallet`.
-- **The chain is the guard.** `mint_generation` checks `mint_record.minted`
-  **first** and returns `Ok(())` on a replay before running the mint CPI; the
-  record is stamped only **after** a successful mint, so a failed mint leaves the
-  window retryable. The PDA uses `init_if_needed` (no-op, **not** `init`-abort) so
-  a regrouped retry that batches an already-landed recipient with fresh ones
-  no-ops the landed one without poisoning its chunk-mates. (On-chain detail +
-  citations: `gridtokenx-anchor/ARCHITECTURE.md` §2, §5.)
-- **MINTED_SET is now a fast path, not the correctness guard.** The Redis
-  `MINTED_SET` marker only avoids re-submitting a tx that would no-op anyway; the
-  authoritative exactly-once is the on-chain record (verified
-  `crates/aggregator-api/src/ingester/settlement_engine.rs:305`). This closes the
-  residual the marker alone could not: a crash between submit and eviction, or a
-  Redis outage that defeats the marker, re-runs as a harmless on-chain no-op.
-- **Adaptive chunk split, submit-safe.** The batch splits into chunks (4
-  recipients/tx) against Solana's 1232-byte packet limit; a chunk that fails
-  **before** send is halved and retried, but a submit error is **never** resent
-  (double-mint risk). Only submitted chunks are evicted from the bin store
-  (`submitted_indices` → `evict_submitted`, verified
-  `crates/aggregator-api/src/ingester/settlement_engine.rs:386`).
-
-### Settlement path selection (3 paths, env-gated — make degradation loud)
-
-At startup `src/main.rs` resolves exactly one settlement path and exports it as
-the gauge `settlement_path{path="nats|grpc|http"}` (set to `1`). The `grpc` path
-is a **silent degradation** of the intended `nats` path, so main.rs `warn!`s loudly
-when it lands there.
-
-| `path` label | Condition | Behaviour |
-| :--- | :--- | :--- |
-| `nats` | `MINT_VIA_CHAIN_BRIDGE=true` **and** prereqs (BlockchainService + IAM client) wired **and** `NATS_URL` set | Mint GRID via Chain Bridge; durable async submit over NATS JetStream (`chain.tx.submit`). The intended prod path. |
-| `grpc` | `MINT_VIA_CHAIN_BRIDGE=true` + prereqs wired but `NATS_URL` **unset** | Mint via Chain Bridge, but `gridtokenx-blockchain-core/src/rpc.rs` falls back to gRPC-only submit (no JetStream). **Degraded — main.rs warns.** |
-| `http` | `MINT_VIA_CHAIN_BRIDGE` off, or prereqs missing | HTTP settle-to-trading-service (`SETTLEMENT_API_URL` / `TRADING_HTTP_URL`). |
-
-Env gates: `MINT_VIA_CHAIN_BRIDGE` (route to Chain Bridge), `NATS_URL` (nats vs
-grpc within that route), `SETTLEMENT_API_URL`/`TRADING_HTTP_URL` (http target).
-Watch the `settlement_path` gauge to confirm the active path in any environment.
-
-## 4. Market Layer
+## 4. Market Layer (downstream — external to this service)
 - **Settlement:** HyperEVM.
 - **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
 - **Market Engines:** P2P Order Book, I-REC Minting, HIP-3 Derivatives.

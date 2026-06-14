@@ -2,7 +2,6 @@ use crate::dispatch::grpc_client::DispatchType;
 use crate::dispatch::DispatchAdapter;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::Utc;
 use openleadr_client::{BusinessLogic, Client, ClientCredentials};
 use openleadr_wire::{
     event::{EventInterval, EventPayloadDescriptor, EventType, EventValuesMap, Priority},
@@ -105,7 +104,7 @@ impl OpenLeadrAdapter {
             DispatchType::FLEX_DOWN => -capacity_kw,
         };
 
-        let mut interval_period = IntervalPeriod::new(Utc::now());
+        let mut interval_period = IntervalPeriod::new(gridtokenx_telemetry::time::now());
         interval_period.duration = Some(Duration::hours(self.event_duration_hours));
 
         let interval = EventInterval {

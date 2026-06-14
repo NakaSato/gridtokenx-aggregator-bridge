@@ -121,7 +121,7 @@ impl CircularBuffer {
 
     /// Cleanup old data beyond retention period (default 24h).
     fn cleanup(&mut self) -> Result<()> {
-        let cutoff = Utc::now() - chrono::Duration::hours(self.retention_hours as i64);
+        let cutoff = gridtokenx_telemetry::time::now() - chrono::Duration::hours(self.retention_hours as i64);
         let deleted = self.conn.execute(
             "DELETE FROM telemetry WHERE timestamp < ?1 AND synced = 1",
             params![cutoff],

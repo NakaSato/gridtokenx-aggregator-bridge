@@ -11,9 +11,6 @@ aggregator-protocol = { path = "../aggregator-protocol" }
 aggregator-persistence = { path = "../aggregator-persistence" }
 aggregator-logic = { path = "../aggregator-logic" }
 gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
-# Generation-mint issuance (moved here from trading-service): build + submit the
-# energy-token mint tx UNSIGNED via Chain Bridge (Vault signs). See settlement_engine.
-gridtokenx-blockchain-core = { version = "0.1.0", path = "../../../gridtokenx-blockchain-core" }
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "parking_lot"] }

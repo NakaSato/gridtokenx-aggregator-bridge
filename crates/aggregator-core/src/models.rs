@@ -85,6 +85,35 @@ pub enum BatteryMode {
 }
 
 // =============================================================================
+// Mint Forward (aggregator → meter-service over NATS)
+// =============================================================================
+
+/// Reading forwarded to meter-service for the on-chain energy-token mint.
+///
+/// This payload IS the data that becomes on-chain mint provenance, so it carries
+/// exactly what the mint needs: a stable idempotency key (so a NATS redelivery or
+/// replay cannot double-mint the same energy), the meter identity, the net energy
+/// to mint, and when it was measured. The recipient wallet is intentionally NOT
+/// on the wire — meter-service derives it from the registered meter owner, so an
+/// untrusted forward cannot redirect minted tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintForwardReading {
+    /// Stable reading id — the idempotency key. meter-service uses it as the
+    /// reading primary key, so a duplicate delivery is a no-op insert and the
+    /// mint's `minted` guard prevents a second on-chain mint.
+    pub reading_id: Uuid,
+    /// Aggregator device id (diagnostic / correlation only).
+    pub device_id: String,
+    /// Physical meter serial — device identity / provenance for the mint and the
+    /// key meter-service resolves the owning user + wallet from.
+    pub meter_serial: String,
+    /// Net surplus energy in kWh to mint.
+    pub energy_kwh: f64,
+    /// Reading timestamp as epoch milliseconds.
+    pub timestamp_ms: i64,
+}
+
+// =============================================================================
 // Private Network Ingestion (DLMS/COSEM)
 // =============================================================================
 

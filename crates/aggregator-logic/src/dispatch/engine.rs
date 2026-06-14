@@ -95,7 +95,7 @@ impl DispatchEngine {
             freq_low_hz: env_f64("DISPATCH_FREQ_LOW_HZ", 49.8),
             freq_high_hz: env_f64("DISPATCH_FREQ_HIGH_HZ", 50.2),
             capacity_kw: env_f64("DISPATCH_CAPACITY_KW", 100.0),
-            // Default one settlement window: a sustained excursion produces one
+            // Default one 15-minute window: a sustained excursion produces one
             // dispatch per 15 minutes, not one per grid-status message.
             cooldown: std::time::Duration::from_secs(
                 std::env::var("DISPATCH_COOLDOWN_SECS")
@@ -192,9 +192,9 @@ impl DispatchEngine {
         action: DispatchType,
         capacity_kw: f64,
     ) -> Result<()> {
-        // Query aggregator state (read-only: dispatch must NOT drain settlement's bins).
-        // Zero grace: dispatch only reads completed-window capacity and never mints,
-        // so the TD-002 partial-settle guard (settlement's grace) does not apply here.
+        // Query aggregator state (read-only). Zero grace: dispatch only reads
+        // completed-window capacity, so it takes every window whose end_time has
+        // passed without waiting for late readings.
         let aggregator = self.aggregator.lock().await;
         let bins = aggregator.peek_completed_bins(chrono::Duration::zero());
 

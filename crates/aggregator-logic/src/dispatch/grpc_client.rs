@@ -19,7 +19,7 @@ impl DispatchAdapter for DispatchClient {
             cluster_id: "default-cluster".to_string(),
             dispatch_type: EnumValue::Known(action),
             capacity_kw,
-            timestamp: chrono::Utc::now().timestamp(),
+            timestamp: gridtokenx_telemetry::time::now().timestamp(),
             __buffa_cached_size: Default::default(),
             __buffa_unknown_fields: Default::default(),
         };

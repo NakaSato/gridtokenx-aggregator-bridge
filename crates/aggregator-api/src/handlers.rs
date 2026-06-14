@@ -257,7 +257,7 @@ pub async fn ingest_private_network(
             zone_code: payload.payload.get("zone_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
             timestamp: chrono::DateTime::parse_from_rfc3339(timestamp_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
+                .unwrap_or_else(|_| gridtokenx_telemetry::time::now()),
             metrics: crate::models::DeviceMetrics::Energy {
                 generated_kwh: payload.payload.get("energy_generated").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 consumed_kwh: payload.payload.get("energy_consumed").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -318,7 +318,7 @@ pub async fn ingest_legacy_batch(
         let timestamp_str = item.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)
             .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now());
+            .unwrap_or_else(|_| gridtokenx_telemetry::time::now());
 
         let reading = DeviceReading {
             reading_id: Uuid::new_v4(),
@@ -444,7 +444,7 @@ pub async fn ingest_private_network_batch(
                 zone_code: item.get("zone_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 timestamp: chrono::DateTime::parse_from_rfc3339(timestamp_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                    .unwrap_or_else(|_| gridtokenx_telemetry::time::now()),
                 metrics: crate::models::DeviceMetrics::Energy {
                     generated_kwh: item.get("energy_generated").and_then(|v| v.as_f64()).unwrap_or(0.0),
                     consumed_kwh: item.get("energy_consumed").and_then(|v| v.as_f64()).unwrap_or(0.0),

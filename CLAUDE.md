@@ -8,13 +8,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this service is
 
-High-throughput **ingestion + VPP convergence layer**. Decoupled from edge hardware; it verifies, aggregates, and
-disseminates inbound telemetry. Two flows:
+High-throughput **ingestion + VPP convergence layer** — the central connection point for every device node in the
+smart grid. Decoupled from edge hardware; it verifies, aggregates, and disseminates inbound telemetry:
 
-- **Path A (operational)**: real-time Ed25519-signed telemetry → verify → zone-partitioned Redis Streams → VPP forecasting/optimization.
-- **Path B (settlement)**: 15-minute batched attestations → Plonky2 ZK-rollup → Merkle root → HyperEVM settlement.
+- **Operational flow**: real-time Ed25519-signed telemetry → verify → zone-partitioned Redis Streams → VPP
+  forecasting/optimization and flex dispatch (IEEE 2030.5 / OpenADR). Each disseminated reading is also
+  written to an **independent InfluxDB v2 instance** (this service's own, shared with nobody) for realtime
+  history — async fire-and-forget, so a slow/down InfluxDB never blocks ingest (`Router::disseminate` →
+  `InfluxWriter`, `crates/aggregator-persistence/src/infra/influxdb.rs`).
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) (source of truth, the four-layer VPP map) and [PROTOCOL.md](PROTOCOL.md)
+> **No on-chain settlement here.** The former "Path B" (15-min batched attestations → Plonky2 ZK-rollup → Merkle
+> root → HyperEVM mint/settlement) has been removed. This service does not mint GRID or talk to the chain.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) (source of truth, the VPP map) and [PROTOCOL.md](PROTOCOL.md)
 (the v4 UTT-S+ binary frame layout + TLV dictionary). Both are doc-lint gated — edit the doc next to the code you change.
 
 ## Build & test
@@ -45,9 +51,9 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 | `aggregator-core` | Domain models, numeric types. Zero internal deps. |
 | `aggregator-protocol` | Generated ConnectRPC/prost types from `proto/{oracle,dispatch}.proto` via `build.rs` → `OUT_DIR`. Packages: `oracle::*`, `dispatch::*`, `identity::*`. |
 | `aggregator-stacks` | DLMS/COSEM meter decoder (`dlms`) + `binary_decoder` (secure v4 frame). DLMS/COSEM is the only meter protocol; `protocol="auto"`/omitted resolves to `dlms`. |
-| `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry, circular-buffer/sync storage. |
-| `aggregator-logic` | Aggregator, Router (dissemination), ZK prover (Plonky2 circuit), dispatch engine, IEEE 2030.5 standards. Depends on `gridtokenx-blockchain-core` (sibling submodule). |
-| `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, settlement, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |
+| `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry, circular-buffer/sync storage, independent InfluxDB v2 history sink (`infra/influxdb.rs`). |
+| `aggregator-logic` | Aggregator, Router (dissemination), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
+| `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |
 
 `src/main.rs` is a wiring-only entrypoint: it re-imports everything through `aggregator_api::{...}` and runs the HTTP + gRPC servers. New business logic goes in the crate that matches the dependency rule, **not** in `main.rs`.
 
@@ -55,8 +61,8 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 
 - Two servers run concurrently: **HTTP IoT gateway** on `IOT_GATEWAY_PORT` (default `4010`) and **gRPC ingestion** on `GRPC_PORT` (default **5030**, the canonical mesh port — `50051` in `.env.example` is the simulator override).
 - HTTP routes: `/health`, `/v1/private-network/ingest[/batch]`, `/v1/ingest/telemetry[/batch]`.
-- **Degraded-mode by design**: Redis (3s timeout), NATS, Kafka, RabbitMQ, IAM gRPC, and the settlement signer all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
-- Background tasks: zone ingester, Kafka dispatch listener, UTT settlement engine, gRPC server — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
+- **Degraded-mode by design**: Redis (3s timeout), NATS, Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
+- Background tasks: zone ingester, Kafka dispatch listener, gRPC server — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
 - Env interpolation: values support `${VAR}` expansion via `expand_env`.
 
 ## Security-critical invariants (don't regress)
@@ -71,13 +77,27 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 ## Config
 
 Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `IOT_GATEWAY_PORT`, `GRPC_PORT`, `GRIDTOKENX_API_KEYS`,
-`IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `AGGREGATOR_BRIDGE_SIGNING_KEY`,
-`SETTLEMENT_API_URL`, `IOT_NUM_ZONES` (default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS
-decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow plaintext v4 frames when a device has no `enckey`),
-`SETTLEMENT_GRACE_SECS` (default 120) — grace delay after a 15-min window closes before its bin is
-eligible to settle. Lets a late / briefly-buffered reading land in a just-closed window so a **partial**
-bin isn't minted: minting one creates the on-chain `(meter, window)` `gen_mint` PDA and strands every
-later reading for that window (TD-002). `0` restores the old "settle as soon as `end_time` passes".
+`IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `IOT_NUM_ZONES` (default 10),
+`ENVIRONMENT` (`production` ⇒ strict sig + DLMS decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow
+plaintext v4 frames when a device has no `enckey`).
+
+Meter-service handoff (NATS): when `NATS_URL` is set, each verified smart-meter reading with mintable
+surplus (`net_kwh > 0`) is forwarded to **meter-service** on `METER_SERVICE_NATS_SUBJECT` (default
+`meter.reading`) as a `MintForwardReading` (`aggregator_core::models`, published by `Router::disseminate`,
+`crates/aggregator-logic/src/router.rs`). That payload is the on-chain mint provenance, so it carries a
+stable `reading_id` (idempotency key — meter-service uses it as the row PK so a redelivery never
+double-ingests/mints) plus `meter_serial`, `energy_kwh`, `timestamp_ms`. The recipient wallet is **not**
+on the wire — meter-service derives it from the registered meter owner, so an untrusted forward cannot
+redirect minted tokens. meter-service owns the mint decision; this bridge never mints and has no
+blockchain deps. Unset `NATS_URL` ⇒ forwarding disabled.
+
+InfluxDB (independent realtime history): `INFLUXDB_URL` enables an InfluxDB v2 sink dedicated to this
+service alone — point it at this service's **own** instance (the superproject's `aggregator-influxdb`
+compose service), never a shared one. Optional: `INFLUXDB_ORG` (default `gridtokenx`), `INFLUXDB_BUCKET`
+(default `aggregator_telemetry`), `INFLUXDB_TOKEN`. Unset `INFLUXDB_URL` ⇒ disabled; unreachable at boot ⇒
+`warn!` + disabled. Writes are async fire-and-forget (batched), so InfluxDB latency/outage never blocks the
+realtime Redis dissemination path. Measurements: `energy` / `ev_session` / `battery`; tags include
+`device_id`, `device_type`, `serial_number`, `zone_code`.
 
 OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
 (`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.
@@ -103,3 +123,9 @@ listener self-registers a VEN object named `OPENLEADR_VEN_CLIENT_NAME` on the VT
 needs `write_vens_ven` scope; `OPENLEADR_VEN_REGISTER=false` disables). When
 `OPENLEADR_VEN_VTN_URL` equals `OPENLEADR_VTN_URL` with no program/target filter, main.rs warns:
 the VEN would consume the bridge's own outbound events (double actuation).
+
+## Search Tooling
+
+> **Use `rg` (ripgrep), never `grep`.** When shelling out to search files, run `rg` —
+> it respects `.gitignore`, skips binaries, and is far faster than `grep`/`find -exec grep`.
+> Reserve plain `grep` only for piping non-file streams.

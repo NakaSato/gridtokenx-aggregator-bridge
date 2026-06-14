@@ -6,7 +6,6 @@
 //! - `dispatch`: VPP flex dispatch engine + ConnectRPC dispatch client
 //! - `grid_status`: rolling grid-frequency window from meter telemetry
 //! - `standards`: IEEE 2030.5 / OpenADR 3 (OpenLEADR) standard handling
-//! - `zk`: zero-knowledge energy attestation (circuit/prover scaffolding)
 //! - `metrics`: Prometheus metrics wiring
 
 pub mod aggregator;
@@ -15,4 +14,3 @@ pub mod grid_status;
 pub mod metrics;
 pub mod router;
 pub mod standards;
-pub mod zk;

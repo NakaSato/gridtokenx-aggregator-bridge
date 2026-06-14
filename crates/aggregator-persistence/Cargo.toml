@@ -6,6 +6,7 @@ description = "GridTokenX Aggregator Bridge - persistence & external adapters (s
 
 [dependencies]
 aggregator-protocol = { path = "../aggregator-protocol" }
+gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
@@ -19,6 +20,9 @@ redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 rdkafka = { version = "0.37", features = ["zstd"] }
 lapin = "2.5"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+# Independent time-series history sink (InfluxDB v2)
+influxdb2 = "0.5"
+futures = "0.3"
 
 # HTTP / gRPC
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
