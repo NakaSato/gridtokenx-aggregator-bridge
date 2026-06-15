@@ -1863,6 +1863,7 @@ dependencies = [
  "anyhow",
  "async-nats",
  "axum",
+ "chrono",
  "connectrpc",
  "dotenvy",
  "http 1.4.0",

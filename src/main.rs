@@ -75,7 +75,10 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(4010);
     let iam_service_url = expand_env(
-        &std::env::var("IAM_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string()),
+        // IAM's gRPC (ConnectRPC) endpoint for API-key verification — host-mapped
+        // to 5010 (see README port table), NOT this service's own GRPC_PORT. The
+        // deployed compose overrides this with http://iam-service:8090.
+        &std::env::var("IAM_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:5010".to_string()),
     );
     let num_zones: usize = std::env::var("IOT_NUM_ZONES")
         .ok()
@@ -191,11 +194,67 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Keep a handle for the billing sink before the writer moves into the router.
+    // Both share the same async fire-and-forget queue.
+    let billing_influx = influx_writer.clone();
+
     let iot_router = Arc::new(
         router::Router::new(&redis_url, num_zones, nats_client, influx_writer)
             .await
             .context("Failed to initialize IoT router")?,
     );
+
+    // Billing sink: periodically drains completed 15-minute billing bins (TOU
+    // peak/off-peak split + window max demand) to the independent InfluxDB
+    // `billing` measurement, then evicts them. With on-chain settlement removed
+    // this is the only durable consumer of the bins — and the eviction bounds the
+    // otherwise-unbounded `active_bins` map. No-op when InfluxDB is disabled.
+    if let Some(billing_influx) = billing_influx {
+        let billing_agg = aggregator.clone();
+        let billing_shutdown = shutdown_token.clone();
+        let interval_secs = std::env::var("BILLING_FLUSH_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let grace_secs = std::env::var("BILLING_FLUSH_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(120);
+        info!(
+            "🧾 Billing sink ENABLED (interval={}s, grace={}s → InfluxDB `billing`)",
+            interval_secs, grace_secs
+        );
+        tokio::spawn(async move {
+            let grace = chrono::Duration::seconds(grace_secs);
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            loop {
+                tokio::select! {
+                    _ = billing_shutdown.cancelled() => {
+                        info!("🛑 Billing sink stopped");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let mut agg = billing_agg.lock().await;
+                        let bins = agg.peek_completed_bins(grace);
+                        if bins.is_empty() {
+                            continue;
+                        }
+                        let keys: Vec<_> = bins.iter().map(|b| b.key()).collect();
+                        let mut written = 0usize;
+                        for bin in &bins {
+                            if let Some(point) = aggregator_api::billing_sink::bin_to_billing_point(bin) {
+                                billing_influx.record(point);
+                                written += 1;
+                            }
+                        }
+                        agg.remove_bins(&keys);
+                        drop(agg);
+                        info!("🧾 Billing sink: flushed {} completed bin(s) to InfluxDB", written);
+                    }
+                }
+            }
+        });
+    }
     let api_keys_raw = std::env::var("GRIDTOKENX_API_KEYS").unwrap_or_default();
     let api_keys: Vec<String> = api_keys_raw
         .split(',')

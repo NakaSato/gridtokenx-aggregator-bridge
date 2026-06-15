@@ -11,6 +11,8 @@ description = "GridTokenX Aggregator Bridge + IoT Gateway - Unified ingestion an
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync", "signal", "parking_lot"] }
 tokio-util = "0.7.18"
+# Billing-bin window math (grace duration for the InfluxDB billing sink)
+chrono = "0.4"
 
 # Web framework (HTTP gateway entrypoint)
 axum = { version = "0.8.7", features = ["macros"] }

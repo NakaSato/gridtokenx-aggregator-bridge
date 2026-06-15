@@ -11,7 +11,9 @@
 pub use aggregator_core::models;
 pub use aggregator_stacks as protocol;
 pub use aggregator_persistence::infra;
-pub use aggregator_logic::{aggregator, dispatch, grid_status, metrics, router, standards};
+pub use aggregator_logic::{
+    aggregator, billing_sink, dispatch, grid_status, metrics, router, standards,
+};
 
 pub mod auth;
 pub mod grpc;

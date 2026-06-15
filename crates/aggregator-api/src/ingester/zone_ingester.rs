@@ -525,6 +525,11 @@ impl ZoneEventIngester {
             }
         };
 
+        // Decode the active tariff (1=peak, 2=off-peak) and net import demand (kW)
+        // from the DLMS-decoded metadata so the bin carries the TOU split + peak
+        // demand. Absent for non-DLMS sources -> None (split/demand untouched).
+        let (tariff_period, demand_kw) = extract_tariff_demand(&reading.metadata);
+
         // 1. Update Aggregator (local stats). Feeds the dispatch engine's
         // completed-window capacity query (VPP flex dispatch).
         {
@@ -536,6 +541,8 @@ impl ZoneEventIngester {
                 energy_generated,
                 energy_consumed,
                 reading.timestamp,
+                tariff_period,
+                demand_kw,
             );
         }
 
@@ -568,9 +575,34 @@ fn extract_frequency(metadata: &std::collections::HashMap<String, serde_json::Va
         })
 }
 
+/// Resolve the TOU tariff period and net import demand (kW) a reading should
+/// contribute to its 15-minute billing bin, from DLMS-decoded metadata.
+///
+/// - `tariff_period`: `active_tariff` (1=peak, 2=off-peak); `None` when absent.
+/// - `demand_kw`: `sum_active_power_kw` (signed net power), kept **only when
+///   positive** — export is not demand, so a net-exporting reading contributes
+///   no demand. `None` when absent or non-importing.
+///
+/// Both `None` for non-DLMS sources, leaving the bin's split/demand untouched.
+fn extract_tariff_demand(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> (Option<u8>, Option<Decimal>) {
+    let tariff_period = metadata
+        .get("active_tariff")
+        .and_then(|v| v.as_u64())
+        .map(|t| t as u8);
+    let demand_kw = metadata
+        .get("sum_active_power_kw")
+        .and_then(|v| v.as_f64())
+        .filter(|p| *p > 0.0) // import demand only; export is not demand
+        .and_then(Decimal::from_f64_retain);
+    (tariff_period, demand_kw)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_frequency;
+    use super::{extract_frequency, extract_tariff_demand};
+    use rust_decimal::Decimal;
     use std::collections::HashMap;
 
     fn meta(key: &str, value: serde_json::Value) -> HashMap<String, serde_json::Value> {
@@ -596,5 +628,32 @@ mod tests {
             extract_frequency(&meta("frequency", serde_json::json!("not-a-number"))),
             None
         );
+    }
+
+    #[test]
+    fn tariff_and_import_demand_extracted() {
+        let m = HashMap::from([
+            ("active_tariff".to_string(), serde_json::json!(1)),
+            ("sum_active_power_kw".to_string(), serde_json::json!(3.5)),
+        ]);
+        let (tariff, demand) = extract_tariff_demand(&m);
+        assert_eq!(tariff, Some(1));
+        assert_eq!(demand, Decimal::from_f64_retain(3.5));
+    }
+
+    #[test]
+    fn net_export_contributes_no_demand() {
+        // Negative sum_active_power = exporting; not demand.
+        let (tariff, demand) =
+            extract_tariff_demand(&meta("sum_active_power_kw", serde_json::json!(-3.944)));
+        assert_eq!(tariff, None);
+        assert_eq!(demand, None);
+    }
+
+    #[test]
+    fn missing_metadata_is_none() {
+        let (tariff, demand) = extract_tariff_demand(&HashMap::new());
+        assert_eq!(tariff, None);
+        assert_eq!(demand, None);
     }
 }

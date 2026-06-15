@@ -9,6 +9,7 @@
 //! - `metrics`: Prometheus metrics wiring
 
 pub mod aggregator;
+pub mod billing_sink;
 pub mod dispatch;
 pub mod grid_status;
 pub mod metrics;

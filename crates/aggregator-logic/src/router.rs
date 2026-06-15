@@ -234,7 +234,7 @@ impl Router {
 fn reading_to_point(reading: &DeviceReading) -> Option<TelemetryPoint> {
     let timestamp_ns = reading.timestamp.timestamp_nanos_opt()?;
 
-    let (measurement, extra_tags, fields): (&'static str, Vec<(&'static str, String)>, Vec<(&'static str, f64)>) =
+    let (measurement, extra_tags, mut fields): (&'static str, Vec<(&'static str, String)>, Vec<(&'static str, f64)>) =
         match &reading.metrics {
             DeviceMetrics::Energy {
                 generated_kwh,
@@ -280,6 +280,33 @@ fn reading_to_point(reading: &DeviceReading) -> Option<TelemetryPoint> {
                 ],
             ),
         };
+
+    // Promote the decoded residential OBIS registers from metadata onto the
+    // InfluxDB point so the full set (not just energy) is queryable/plottable.
+    // Each is emitted only when present and numeric; the bridge's DlmsStack
+    // decodes these names (see dlms.rs). f64 fields only — `active_tariff` is an
+    // int register surfaced as a float for InfluxDB.
+    if measurement == "energy" {
+        const EXTRA_FIELDS: &[&str] = &[
+            "sum_active_power_kw",
+            "max_demand_import_kw",
+            "active_tariff",
+            "active_import_rate1_kwh",
+            "active_import_rate2_kwh",
+            "active_export_rate1_kwh",
+            "active_export_rate2_kwh",
+            "reactive_energy_import_kvarh",
+            "reactive_energy_export_kvarh",
+            "voltage_l1_v",
+            "frequency_hz",
+            "power_factor",
+        ];
+        for &name in EXTRA_FIELDS {
+            if let Some(v) = reading.metadata.get(name).and_then(|v| v.as_f64()) {
+                fields.push((name, v));
+            }
+        }
+    }
 
     let device_type = match reading.device_type {
         DeviceType::SmartMeter => "smart_meter",
@@ -359,6 +386,79 @@ mod tests {
 
         // Note: Hashing results might differ between 10 and 20, which is expected.
         // The test ensures they are within bounds.
+    }
+
+    fn energy_reading_with_metadata(
+        meta: std::collections::HashMap<String, serde_json::Value>,
+    ) -> DeviceReading {
+        DeviceReading {
+            reading_id: Uuid::new_v4(),
+            device_id: "DEV-1".to_string(),
+            device_type: DeviceType::SmartMeter,
+            serial_number: "SN-1".to_string(),
+            zone_code: Some("ZONE1".to_string()),
+            timestamp: Utc::now(),
+            metrics: DeviceMetrics::Energy {
+                generated_kwh: 10.0,
+                consumed_kwh: 5.0,
+                net_kwh: 5.0,
+            },
+            metadata: meta,
+        }
+    }
+
+    fn field<'a>(point: &'a TelemetryPoint, name: &str) -> Option<f64> {
+        point.fields.iter().find(|(k, _)| *k == name).map(|(_, v)| *v)
+    }
+
+    #[test]
+    fn energy_point_promotes_numeric_obis_metadata_fields() {
+        let mut meta = std::collections::HashMap::new();
+        // Numeric registers — must be promoted onto the point.
+        meta.insert("active_tariff".to_string(), serde_json::json!(1));
+        meta.insert("max_demand_import_kw".to_string(), serde_json::json!(32.0));
+        meta.insert("sum_active_power_kw".to_string(), serde_json::json!(-3.944));
+        meta.insert("active_import_rate1_kwh".to_string(), serde_json::json!(10.0));
+        // Non-numeric / unknown — must NOT be promoted.
+        meta.insert("dr_status".to_string(), serde_json::json!("active"));
+        meta.insert("not_a_listed_field".to_string(), serde_json::json!(99.0));
+
+        let point = reading_to_point(&energy_reading_with_metadata(meta)).expect("representable");
+
+        assert_eq!(point.measurement, "energy");
+        // Base energy fields stay.
+        assert_eq!(field(&point, "generated_kwh"), Some(10.0));
+        assert_eq!(field(&point, "consumed_kwh"), Some(5.0));
+        assert_eq!(field(&point, "net_kwh"), Some(5.0));
+        // Listed numeric OBIS registers promoted (int coerced to f64).
+        assert_eq!(field(&point, "active_tariff"), Some(1.0));
+        assert_eq!(field(&point, "max_demand_import_kw"), Some(32.0));
+        assert_eq!(field(&point, "sum_active_power_kw"), Some(-3.944));
+        assert_eq!(field(&point, "active_import_rate1_kwh"), Some(10.0));
+        // Non-numeric string and unlisted keys are dropped.
+        assert_eq!(field(&point, "dr_status"), None);
+        assert_eq!(field(&point, "not_a_listed_field"), None);
+    }
+
+    #[test]
+    fn non_energy_measurement_skips_obis_promotion() {
+        let mut meta = std::collections::HashMap::new();
+        // Even if an OBIS-named numeric field is present, a battery point ignores it.
+        meta.insert("max_demand_import_kw".to_string(), serde_json::json!(32.0));
+        let reading = DeviceReading {
+            device_type: DeviceType::Battery,
+            metrics: DeviceMetrics::BatteryState {
+                soc_percent: 80.0,
+                power_kw: 1.0,
+                temperature_c: 25.0,
+                mode: aggregator_core::models::BatteryMode::Idle,
+            },
+            ..energy_reading_with_metadata(meta)
+        };
+
+        let point = reading_to_point(&reading).expect("representable");
+        assert_eq!(point.measurement, "battery");
+        assert_eq!(field(&point, "max_demand_import_kw"), None);
     }
 
     /// Live cross-service hop: drives the REAL `Router::disseminate` net_kwh

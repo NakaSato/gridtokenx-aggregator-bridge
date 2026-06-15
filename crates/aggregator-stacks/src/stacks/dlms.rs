@@ -18,6 +18,16 @@ mod obis {
     // Electricity (Medium 1)
     pub const ELEC_ACTIVE_IMPORT_TOTAL: &str = "1.1.1.8.0.255";
     pub const ELEC_ACTIVE_EXPORT_TOTAL: &str = "1.1.2.8.0.255";
+    // Tariff-split active energy (residential TOU): rate 1 = peak, rate 2 = off-peak.
+    // The total registers above stay the settlement energy; these are billing detail.
+    pub const ELEC_ACTIVE_IMPORT_RATE1: &str = "1.1.1.8.1.255";
+    pub const ELEC_ACTIVE_IMPORT_RATE2: &str = "1.1.1.8.2.255";
+    pub const ELEC_ACTIVE_EXPORT_RATE1: &str = "1.1.2.8.1.255";
+    pub const ELEC_ACTIVE_EXPORT_RATE2: &str = "1.1.2.8.2.255";
+    pub const ELEC_MAX_DEMAND_IMPORT: &str = "1.1.1.6.0.255";
+    // Sum active instantaneous power (A+ − A−), signed — the simulator's net power.
+    // Distinct from ELEC_TOTAL_ACTIVE_POWER (1.1.1.7.0.255), which is positive-only.
+    pub const ELEC_SUM_ACTIVE_POWER: &str = "1.1.16.7.0.255";
     pub const ELEC_REACTIVE_IMPORT_TOTAL: &str = "1.1.3.8.0.255";
     pub const ELEC_REACTIVE_EXPORT_TOTAL: &str = "1.1.4.8.0.255";
     pub const ELEC_VOLTAGE_L1: &str = "1.1.32.7.0.255";
@@ -41,6 +51,7 @@ mod obis {
 
     // Demand Response / Abstract
     pub const DR_STATUS: &str = "0.0.96.10.0.255";
+    pub const ACTIVE_TARIFF: &str = "0.0.96.14.0.255";
 }
 
 impl DlmsStack {
@@ -83,6 +94,41 @@ impl DlmsStack {
                 "energy_consumed" => {
                     plain_consumed_kwh = val.as_f64();
                     metadata.insert(key.clone(), val.clone());
+                }
+
+                // Electricity - Tariff-split active energy (TOU). Metadata only —
+                // these do NOT drive consumed/generated (the totals above own that)
+                // to avoid double-counting. Stored as kWh for symmetry with the
+                // settlement energy.
+                obis::ELEC_ACTIVE_IMPORT_RATE1 => {
+                    metadata.insert(
+                        "active_import_rate1_kwh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
+                }
+                obis::ELEC_ACTIVE_IMPORT_RATE2 => {
+                    metadata.insert(
+                        "active_import_rate2_kwh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
+                }
+                obis::ELEC_ACTIVE_EXPORT_RATE1 => {
+                    metadata.insert(
+                        "active_export_rate1_kwh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
+                }
+                obis::ELEC_ACTIVE_EXPORT_RATE2 => {
+                    metadata.insert(
+                        "active_export_rate2_kwh".to_string(),
+                        Value::from(val.as_f64().unwrap_or(0.0) / 1000.0),
+                    );
+                }
+                obis::ELEC_MAX_DEMAND_IMPORT => {
+                    metadata.insert("max_demand_import_kw".to_string(), val.clone());
+                }
+                obis::ELEC_SUM_ACTIVE_POWER => {
+                    metadata.insert("sum_active_power_kw".to_string(), val.clone());
                 }
 
                 // Electricity - Reactive Energy
@@ -145,6 +191,9 @@ impl DlmsStack {
                 // Demand Response
                 obis::DR_STATUS => {
                     metadata.insert("demand_response_status".to_string(), val.clone());
+                }
+                obis::ACTIVE_TARIFF => {
+                    metadata.insert("active_tariff".to_string(), val.clone());
                 }
 
                 // Fallback for metadata (non-OBIS extra fields)
@@ -311,6 +360,54 @@ mod tests {
         } else {
             panic!("expected Energy metrics");
         }
+    }
+
+    #[tokio::test]
+    async fn test_dlms_residential_tou_registers_are_metadata_not_double_counted() {
+        let stack = DlmsStack::new();
+        // Peak interval: total import 10 kWh, all in rate 1; plus max demand and
+        // the active-tariff indicator. Totals must equal the *_8_0 registers only.
+        let payload = json!({
+            "1.1.1.8.0.255": 10000.0, // total import 10 kWh
+            "1.1.2.8.0.255": 5000.0,  // total export 5 kWh
+            "1.1.1.8.1.255": 10000.0, // import rate 1 (peak) Wh
+            "1.1.2.8.1.255": 5000.0,  // export rate 1 (peak) Wh
+            "1.1.1.6.0.255": 32.0,    // max demand kW
+            "1.1.16.7.0.255": -3.944, // sum active power (net, exporting) kW
+            "0.0.96.14.0.255": 1,     // active tariff = peak
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+        let reading = stack.handle_message("TOU-MTR", &raw).await.unwrap().unwrap();
+
+        if let DeviceMetrics::Energy {
+            generated_kwh,
+            consumed_kwh,
+            ..
+        } = reading.metrics
+        {
+            // Rate registers must NOT add to the totals.
+            assert_eq!(consumed_kwh, 10.0);
+            assert_eq!(generated_kwh, 5.0);
+        } else {
+            panic!("expected Energy metrics");
+        }
+        assert_eq!(
+            reading.metadata.get("active_import_rate1_kwh").unwrap(),
+            &json!(10.0)
+        );
+        assert_eq!(
+            reading.metadata.get("active_export_rate1_kwh").unwrap(),
+            &json!(5.0)
+        );
+        assert_eq!(
+            reading.metadata.get("max_demand_import_kw").unwrap(),
+            &json!(32.0)
+        );
+        assert_eq!(
+            reading.metadata.get("sum_active_power_kw").unwrap(),
+            &json!(-3.944)
+        );
+        assert_eq!(reading.metadata.get("active_tariff").unwrap(), &json!(1));
     }
 
     #[tokio::test]

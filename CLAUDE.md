@@ -52,7 +52,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 | `aggregator-protocol` | Generated ConnectRPC/prost types from `proto/{oracle,dispatch}.proto` via `build.rs` → `OUT_DIR`. Packages: `oracle::*`, `dispatch::*`, `identity::*`. |
 | `aggregator-stacks` | DLMS/COSEM meter decoder (`dlms`) + `binary_decoder` (secure v4 frame). DLMS/COSEM is the only meter protocol; `protocol="auto"`/omitted resolves to `dlms`. |
 | `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry, circular-buffer/sync storage, independent InfluxDB v2 history sink (`infra/influxdb.rs`). |
-| `aggregator-logic` | Aggregator, Router (dissemination), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
+| `aggregator-logic` | Aggregator (15-min billing bins w/ TOU split + max-demand), Router (dissemination), `billing_sink` (bins → InfluxDB `billing`), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
 | `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |
 
 `src/main.rs` is a wiring-only entrypoint: it re-imports everything through `aggregator_api::{...}` and runs the HTTP + gRPC servers. New business logic goes in the crate that matches the dependency rule, **not** in `main.rs`.
@@ -62,7 +62,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 - Two servers run concurrently: **HTTP IoT gateway** on `IOT_GATEWAY_PORT` (default `4010`) and **gRPC ingestion** on `GRPC_PORT` (default **5030**, the canonical mesh port — `50051` in `.env.example` is the simulator override).
 - HTTP routes: `/health`, `/v1/private-network/ingest[/batch]`, `/v1/ingest/telemetry[/batch]`.
 - **Degraded-mode by design**: Redis (3s timeout), NATS, Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
-- Background tasks: zone ingester, Kafka dispatch listener, gRPC server — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
+- Background tasks: zone ingester, Kafka dispatch listener, gRPC server, billing-sink flush loop (only when InfluxDB enabled) — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
 - Env interpolation: values support `${VAR}` expansion via `expand_env`.
 
 ## Security-critical invariants (don't regress)
@@ -72,7 +72,8 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 - **Self-healing connections.** The `SignatureVerifier` owns a Redis *URL* (not a one-shot connection) and rebuilds + retries once on transport error (`get_with_retry`). The `Router::disseminate` publisher does the same for `XADD`. This is why a Redis restart no longer freezes the bridge — preserve it.
 - **Production enforcement.** `ENVIRONMENT=production` makes signature verification strict.
 - **DLMS REST canonical sign-value.** The REST sign-target is `{device_id}:{value}:{timestamp_ms}` where `value` is protocol-native (`canonical_sign_value`, `crates/aggregator-api/src/handlers.rs`). For DLMS it resolves `kwh` → `energy_consumed` → `energy_generated` → OBIS active import `1.1.1.8.0.255` (Wh/1000) → OBIS export `1.1.2.8.0.255` (Wh/1000). A real OBIS-only meter must sign that derived kWh — don't drop the OBIS fallback or pure-OBIS payloads sign `:0:` and fail closed. (Binary gRPC path signs raw frame bytes; not affected.)
-- Auth falls back to static `GRIDTOKENX_API_KEYS` (comma-separated) when the IAM gRPC client is unavailable.
+- **OBIS register decode → metadata, but only the zone stream keeps it.** `DlmsStack.map_payload` (`crates/aggregator-stacks/src/stacks/dlms.rs`) decodes the residential register set into `DeviceReading.metadata`: active import/export totals drive `consumed/generated_kwh`; reactive, per-phase V/I, frequency, PF, sum active power (`1.1.16.7.0.255`, signed kW — the sim's net; `1.1.1.7.0.255` stays positive-only A+ for real meters), max demand (`1.1.1.6.0.255`, kW), DR status (`0.0.96.10.0.255`), active tariff (`0.0.96.14.0.255`) and TOU rate registers (`1.1.1.8.1/2`, `1.1.2.8.1/2`) land as metadata only — **not** double-counted into the energy. That metadata survives **only** on the zone Redis Streams (`router.disseminate` serializes the whole `DeviceReading`); `reading_to_point`→InfluxDB keeps just `generated/consumed/net_kwh`, the Kafka `MeterReadingEvent` cherry-picks `voltage_v`/`frequency_hz`/`power_factor`/`signature`, and settlement uses energy + `frequency` only. Unknown OBIS keys pass through the `_` fallback arm verbatim.
+- Auth falls back to static `GRIDTOKENX_API_KEYS` (comma-separated) **only when the IAM gRPC client errors** (connection failure) — a definitive IAM *reject* returns 401 without trying static keys. The seeded IAM key (`api_keys` migration) is a placeholder (empty-string hash), so no usable dev key exists out of the box; register one via `ApiKeyService` (hash = `SHA-256(key + API_KEY_SECRET)`).
 
 ## Config
 
@@ -96,8 +97,19 @@ service alone — point it at this service's **own** instance (the superproject'
 compose service), never a shared one. Optional: `INFLUXDB_ORG` (default `gridtokenx`), `INFLUXDB_BUCKET`
 (default `aggregator_telemetry`), `INFLUXDB_TOKEN`. Unset `INFLUXDB_URL` ⇒ disabled; unreachable at boot ⇒
 `warn!` + disabled. Writes are async fire-and-forget (batched), so InfluxDB latency/outage never blocks the
-realtime Redis dissemination path. Measurements: `energy` / `ev_session` / `battery`; tags include
-`device_id`, `device_type`, `serial_number`, `zone_code`.
+realtime Redis dissemination path. Measurements: `energy` / `ev_session` / `battery` (realtime per-reading,
+from `Router::disseminate`) and `billing` (rolled-up bins, see below); tags include `device_id`,
+`device_type`, `serial_number`, `zone_code`.
+
+Billing sink (durable home for completed bins): the binary spawns a flush loop (`src/main.rs`) that
+periodically `peek_completed_bins(grace)`, converts each via `bin_to_billing_point`
+(`crates/aggregator-logic/src/billing_sink.rs`) to the InfluxDB `billing` measurement (TOU peak/off-peak
+energy split + window `max_demand_kw`, tagged `user_id`, timestamped at the window's `end_time`), then
+**evicts** it — which is also what bounds the otherwise-unbounded `active_bins` map now that on-chain
+settlement is gone. Tunables: `BILLING_FLUSH_INTERVAL_SECS` (default 30), `BILLING_FLUSH_GRACE_SECS`
+(default 120, delays flush so late readings still land in their bin). No-op when InfluxDB is disabled — so
+with InfluxDB off, bins are never evicted (`active_bins` grows). `BillingBin` carries `#[serde(default)]`
+TOU/demand fields so bins persisted before these existed still deserialize on crash recovery.
 
 OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
 (`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.

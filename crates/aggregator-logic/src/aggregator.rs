@@ -22,6 +22,20 @@ pub struct BillingBin {
     pub energy_generated: Decimal,
     pub energy_consumed: Decimal,
     pub reading_count: u64,
+    // Time-of-use split of the window energy (peak = tariff rate 1, off-peak =
+    // rate 2), so settlement can price each tariff window. `serde(default)` keeps
+    // bins persisted before these fields existed deserializable (crash recovery).
+    #[serde(default)]
+    pub energy_generated_peak: Decimal,
+    #[serde(default)]
+    pub energy_generated_offpeak: Decimal,
+    #[serde(default)]
+    pub energy_consumed_peak: Decimal,
+    #[serde(default)]
+    pub energy_consumed_offpeak: Decimal,
+    /// Peak net import demand seen in the window (kW), for demand-charge billing.
+    #[serde(default)]
+    pub max_demand_kw: Decimal,
 }
 
 impl BillingBin {
@@ -54,6 +68,11 @@ impl Aggregator {
         generated: Decimal,
         consumed: Decimal,
         timestamp: DateTime<Utc>,
+        // Active tariff (1 = peak, 2 = off-peak) and net import demand (kW) for
+        // this reading, decoded from the DLMS payload. `None` leaves the TOU
+        // split / demand untouched (e.g. non-DLMS or pre-TOU sources).
+        tariff_period: Option<u8>,
+        demand_kw: Option<Decimal>,
     ) -> BillingBin {
         let start_time = self.get_window_start(timestamp);
         let end_time = start_time + chrono::Duration::minutes(WINDOW_MINUTES as i64);
@@ -75,12 +94,40 @@ impl Aggregator {
                     energy_generated: Decimal::ZERO,
                     energy_consumed: Decimal::ZERO,
                     reading_count: 0,
+                    energy_generated_peak: Decimal::ZERO,
+                    energy_generated_offpeak: Decimal::ZERO,
+                    energy_consumed_peak: Decimal::ZERO,
+                    energy_consumed_offpeak: Decimal::ZERO,
+                    max_demand_kw: Decimal::ZERO,
                 }
             });
 
         bin.energy_generated += generated;
         bin.energy_consumed += consumed;
         bin.reading_count += 1;
+
+        // TOU split: route this reading's energy into the active tariff's bucket.
+        // Rate 1 = peak, rate 2 = off-peak; any other/missing value leaves the
+        // split untouched (totals above stay authoritative regardless).
+        match tariff_period {
+            Some(1) => {
+                bin.energy_generated_peak += generated;
+                bin.energy_consumed_peak += consumed;
+            }
+            Some(2) => {
+                bin.energy_generated_offpeak += generated;
+                bin.energy_consumed_offpeak += consumed;
+            }
+            _ => {}
+        }
+
+        // Track the window's peak net import demand.
+        if let Some(d) = demand_kw {
+            if d > bin.max_demand_kw {
+                bin.max_demand_kw = d;
+            }
+        }
+
         bin.clone()
     }
 
@@ -143,6 +190,28 @@ mod tests {
             Decimal::from(gen),
             Decimal::from(con),
             ts,
+            None,
+            None,
+        )
+    }
+
+    fn reading_tou(
+        agg: &mut Aggregator,
+        gen: i64,
+        con: i64,
+        ts: DateTime<Utc>,
+        tariff: u8,
+        demand_kw: i64,
+    ) -> BillingBin {
+        agg.handle_reading(
+            Uuid::nil(),
+            Uuid::nil(),
+            "M1".to_string(),
+            Decimal::from(gen),
+            Decimal::from(con),
+            ts,
+            Some(tariff),
+            Some(Decimal::from(demand_kw)),
         )
     }
 
@@ -186,6 +255,24 @@ mod tests {
         assert_eq!(bin.energy_generated, Decimal::from(15), "generation sums");
         assert_eq!(bin.energy_consumed, Decimal::from(5), "consumption sums");
         assert_eq!(bin.reading_count, 2, "both readings counted in one bin");
+    }
+
+    #[test]
+    fn tou_split_and_max_demand_accumulate() {
+        let mut agg = Aggregator::new();
+        // peak reading then off-peak reading in the same window.
+        reading_tou(&mut agg, 1, 10, at(10, 1, 0), 1, 8); // peak, 8 kW demand
+        let bin = reading_tou(&mut agg, 2, 4, at(10, 5, 0), 2, 5); // off-peak, 5 kW
+        // Totals fold across both.
+        assert_eq!(bin.energy_consumed, Decimal::from(14));
+        assert_eq!(bin.energy_generated, Decimal::from(3));
+        // TOU buckets split by tariff.
+        assert_eq!(bin.energy_consumed_peak, Decimal::from(10));
+        assert_eq!(bin.energy_consumed_offpeak, Decimal::from(4));
+        assert_eq!(bin.energy_generated_peak, Decimal::from(1));
+        assert_eq!(bin.energy_generated_offpeak, Decimal::from(2));
+        // Max demand is the running peak (8 > 5).
+        assert_eq!(bin.max_demand_kw, Decimal::from(8));
     }
 
     #[test]
@@ -243,6 +330,11 @@ mod tests {
             energy_generated: Decimal::from(10),
             energy_consumed: Decimal::ZERO,
             reading_count: 1,
+            energy_generated_peak: Decimal::ZERO,
+            energy_generated_offpeak: Decimal::ZERO,
+            energy_consumed_peak: Decimal::ZERO,
+            energy_consumed_offpeak: Decimal::ZERO,
+            max_demand_kw: Decimal::ZERO,
         };
         agg.active_bins.insert(bin.key(), bin);
 
