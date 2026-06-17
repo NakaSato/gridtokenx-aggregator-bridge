@@ -38,6 +38,8 @@ cargo build --release             # LTO + panic=abort + strip (slow; see [profil
 `cargo test` is the test path — tests live in `#[cfg(test)] mod tests` inline (no `tests/` dirs). The README references
 `scripts/test-e2e.sh` / `scripts/register-edge-key.sh`, but those scripts are **not** in this submodule (provided by the superproject's tooling).
 
+See [TEST.md](TEST.md) for the full test inventory — unit tests (per crate/file) and the superproject pytest e2e suite.
+
 ## Crate layout & dependency direction
 
 Workspace of 6 crates under `crates/`, plus a thin binary at `src/main.rs`. Strict one-way dependency flow — never reverse:

@@ -136,3 +136,6 @@ no external SCADA feed:
 - **Settlement:** HyperEVM.
 - **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
 - **Market Engines:** P2P Order Book, I-REC Minting, HIP-3 Derivatives.
+
+## 5. Testing
+- See [TEST.md](TEST.md) — unit-test inventory (per crate/file) + the superproject pytest e2e suite (`20_oracle`, `30_settlement`, `90_golden_path` cover this layer).
