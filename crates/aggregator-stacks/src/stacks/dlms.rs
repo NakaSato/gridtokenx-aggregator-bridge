@@ -251,12 +251,22 @@ impl ProtocolStack for DlmsStack {
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|| gridtokenx_telemetry::time::now());
 
+        // Optional microgrid zone tag from the meter payload. The router parses
+        // its numeric suffix to pick the zone_<n> stream; accept a string code
+        // ("2", "zone_2") or a bare JSON number. Absent => router falls back to
+        // serial-number hashing.
+        let zone_code = payload.get("zone_code").and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        });
+
         Ok(Some(DeviceReading {
             reading_id: Uuid::new_v4(),
             device_id: device_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: device_id.to_string(),
-            zone_code: None,
+            zone_code,
             timestamp,
             metrics: DeviceMetrics::Energy {
                 generated_kwh,
@@ -360,6 +370,34 @@ mod tests {
         } else {
             panic!("expected Energy metrics");
         }
+    }
+
+    #[tokio::test]
+    async fn test_dlms_zone_code_drives_device_reading_zone() {
+        let stack = DlmsStack::new();
+
+        // String zone code (as the simulator sends it) -> routed by zone.
+        let raw = serde_json::to_vec(&json!({
+            "1.1.1.8.0.255": 1000.0,
+            "zone_code": "2",
+        }))
+        .unwrap();
+        let reading = stack.handle_message("Z-MTR", &raw).await.unwrap().unwrap();
+        assert_eq!(reading.zone_code.as_deref(), Some("2"));
+
+        // Bare JSON number is also accepted (stringified).
+        let raw = serde_json::to_vec(&json!({
+            "1.1.1.8.0.255": 1000.0,
+            "zone_code": 3,
+        }))
+        .unwrap();
+        let reading = stack.handle_message("Z-MTR", &raw).await.unwrap().unwrap();
+        assert_eq!(reading.zone_code.as_deref(), Some("3"));
+
+        // Absent -> None (router falls back to serial-number hashing).
+        let raw = serde_json::to_vec(&json!({ "1.1.1.8.0.255": 1000.0 })).unwrap();
+        let reading = stack.handle_message("Z-MTR", &raw).await.unwrap().unwrap();
+        assert_eq!(reading.zone_code, None);
     }
 
     #[tokio::test]
