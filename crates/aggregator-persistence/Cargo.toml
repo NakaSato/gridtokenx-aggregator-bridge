@@ -13,16 +13,26 @@ tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", 
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `float_roundtrip` makes f64 parse back bit-exact over the JSON wire — required
+# because the mint envelope is signed over `energy_kwh.to_le_bytes()` (raw f64
+# bits, mirror of blockchain-core's canonical_mint_bytes). Without it serde_json's
+# default parser is off-by-1-ULP on some surplus values, so the recomputed
+# canonical bytes drift and the bridge rejects the signature (infra/mint.rs).
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 
 # Storage / messaging / cache
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+# Durable meter-owner lookup (shared gridtokenx Postgres `meters` JOIN `users`).
+# Runtime-checked queries only (no macros) — no DATABASE_URL/.sqlx needed to build.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid"] }
 rdkafka = { version = "0.37", features = ["zstd"] }
 lapin = "2.5"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 # Independent time-series history sink (InfluxDB v2)
 influxdb2 = "0.5"
 futures = "0.3"
+# Chain Bridge mint over NATS request-reply
+async-nats = "0.37"
 
 # HTTP / gRPC
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
@@ -33,6 +43,11 @@ http = "1.0.0"
 ed25519-dalek = "2.1"
 bs58 = "0.5"
 hex = "0.4.3"
+# NATS envelope auth — sign mint intents with the mTLS client key (P-256/ECDSA,
+# SEC1 PEM from gen-certs.sh). Mirrors gridtokenx-blockchain-core's envelope_auth
+# scheme locally so the aggregator stays chain-light (no blockchain-core dep).
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+base64 = "0.22"
 
 # Utils
 anyhow = "1.0"
