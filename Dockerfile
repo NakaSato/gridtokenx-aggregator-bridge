@@ -16,7 +16,8 @@ RUN <<EOT
         clang \
         git \
         curl \
-        protobuf-compiler
+        protobuf-compiler \
+        busybox-static
 EOT
 
 # Set working directory
@@ -43,6 +44,7 @@ RUN set -eux; \
     BIN=/app/aggregator-bridge-bin; \
     mkdir -p /out/lib; \
     cp "$BIN" /out/aggregator-bridge; \
+    cp /bin/busybox /out/busybox; \
     ldd "$BIN" | awk '/=>/{print $3} !/=>/{print $1}' | grep -E '^/' | sort -u | while read -r lib; do \
         case "$lib" in \
             */ld-linux*|*/libc.so*|*/libm.so*|*/libpthread*|*/libdl.so*|*/librt.so*) continue;; \
@@ -60,6 +62,7 @@ WORKDIR /app
 # Copy binary + its lib folder from the builder stage
 COPY --from=builder /out/aggregator-bridge /app/aggregator-bridge
 COPY --from=builder /out/lib/ /app/lib/
+COPY --from=builder /out/busybox /usr/bin/busybox
 
 ENV LD_LIBRARY_PATH=/app/lib
 
