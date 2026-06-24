@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 /// DLMS/COSEM Protocol Stack.
 /// Handles commercial and industrial smart meter protocol packets.
+#[derive(Default)]
 pub struct DlmsStack;
 
 use serde_json::Value;
@@ -249,7 +250,7 @@ impl ProtocolStack for DlmsStack {
             .and_then(|v| v.as_str())
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|| gridtokenx_telemetry::time::now());
+            .unwrap_or_else(gridtokenx_telemetry::time::now);
 
         // Optional microgrid zone tag from the meter payload. The router parses
         // its numeric suffix to pick the zone_<n> stream; accept a string code
@@ -333,7 +334,11 @@ mod tests {
         });
         let raw = serde_json::to_vec(&payload).unwrap();
 
-        let reading = stack.handle_message("PLAIN-MTR", &raw).await.unwrap().unwrap();
+        let reading = stack
+            .handle_message("PLAIN-MTR", &raw)
+            .await
+            .unwrap()
+            .unwrap();
 
         if let DeviceMetrics::Energy {
             generated_kwh,
@@ -364,7 +369,11 @@ mod tests {
         });
         let raw = serde_json::to_vec(&payload).unwrap();
 
-        let reading = stack.handle_message("MIX-MTR", &raw).await.unwrap().unwrap();
+        let reading = stack
+            .handle_message("MIX-MTR", &raw)
+            .await
+            .unwrap()
+            .unwrap();
         if let DeviceMetrics::Energy { generated_kwh, .. } = reading.metrics {
             assert_eq!(generated_kwh, 5.0);
         } else {
@@ -415,7 +424,11 @@ mod tests {
             "0.0.96.14.0.255": 1,     // active tariff = peak
         });
         let raw = serde_json::to_vec(&payload).unwrap();
-        let reading = stack.handle_message("TOU-MTR", &raw).await.unwrap().unwrap();
+        let reading = stack
+            .handle_message("TOU-MTR", &raw)
+            .await
+            .unwrap()
+            .unwrap();
 
         if let DeviceMetrics::Energy {
             generated_kwh,

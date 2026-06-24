@@ -13,6 +13,7 @@ pub struct DerControlPayload {
 }
 
 /// Adapter for IEEE 2030.5 DERControl mapping logic
+#[derive(Default)]
 pub struct Ieee2030_5Adapter;
 
 impl Ieee2030_5Adapter {

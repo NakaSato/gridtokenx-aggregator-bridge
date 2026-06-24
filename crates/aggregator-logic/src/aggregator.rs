@@ -1,4 +1,5 @@
 use chrono::{DateTime, Timelike, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -43,6 +44,25 @@ impl BillingBin {
     pub fn key(&self) -> BinKey {
         (self.meter_id, self.start_time)
     }
+
+    /// Window start as Unix epoch milliseconds. Used as the mint idempotency
+    /// component (`mint:{serial}:{window_start_ms}`) and the on-chain
+    /// `(meter_id, window_start_ms)` settlement PDA seed.
+    pub fn window_start_ms(&self) -> i64 {
+        self.start_time.timestamp_millis()
+    }
+
+    /// Net surplus generation for the window, in kWh — `Some(kwh)` only when the
+    /// bin generated more than it consumed (the mintable amount). Returns `None`
+    /// for net-zero or net-import windows (nothing to tokenize).
+    pub fn net_surplus_kwh(&self) -> Option<f64> {
+        let net = self.energy_generated - self.energy_consumed;
+        if net > Decimal::ZERO {
+            net.to_f64()
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Aggregator {
@@ -60,6 +80,7 @@ impl Aggregator {
     /// Handles a new meter reading and updates or creates the corresponding billing
     /// bin. Returns a snapshot (clone) of the updated bin so the async edge can
     /// write it through to the durable store (crash-recovery of accumulated energy).
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_reading(
         &mut self,
         meter_id: Uuid,
@@ -229,9 +250,22 @@ mod tests {
     #[test]
     fn window_floor_covers_all_four_quarters() {
         let mut agg = Aggregator::new();
-        for (min, want) in [(0, 0), (14, 0), (15, 15), (29, 15), (30, 30), (44, 30), (45, 45), (59, 45)] {
+        for (min, want) in [
+            (0, 0),
+            (14, 0),
+            (15, 15),
+            (29, 15),
+            (30, 30),
+            (44, 30),
+            (45, 45),
+            (59, 45),
+        ] {
             let bin = reading(&mut agg, 1, 0, at(10, min, 30));
-            assert_eq!(bin.start_time, at(10, want, 0), "minute {min} floors to :{want:02}");
+            assert_eq!(
+                bin.start_time,
+                at(10, want, 0),
+                "minute {min} floors to :{want:02}"
+            );
         }
     }
 
@@ -263,7 +297,7 @@ mod tests {
         // peak reading then off-peak reading in the same window.
         reading_tou(&mut agg, 1, 10, at(10, 1, 0), 1, 8); // peak, 8 kW demand
         let bin = reading_tou(&mut agg, 2, 4, at(10, 5, 0), 2, 5); // off-peak, 5 kW
-        // Totals fold across both.
+                                                                   // Totals fold across both.
         assert_eq!(bin.energy_consumed, Decimal::from(14));
         assert_eq!(bin.energy_generated, Decimal::from(3));
         // TOU buckets split by tariff.
@@ -280,7 +314,7 @@ mod tests {
         let mut agg = Aggregator::new();
         reading(&mut agg, 10, 0, at(10, 1, 0)); // [10:00,10:15)
         let later = reading(&mut agg, 7, 0, at(10, 20, 0)); // [10:15,10:30)
-        // The second window's bin holds only its own reading — no carry-over.
+                                                            // The second window's bin holds only its own reading — no carry-over.
         assert_eq!(later.energy_generated, Decimal::from(7));
         assert_eq!(later.reading_count, 1);
     }
@@ -312,7 +346,10 @@ mod tests {
         assert_eq!(again.len(), 1, "peek must not evict");
 
         agg.remove_bins(&[again[0].key()]);
-        assert!(agg.peek_completed_bins(chrono::Duration::zero()).is_empty(), "remove_bins evicts");
+        assert!(
+            agg.peek_completed_bins(chrono::Duration::zero()).is_empty(),
+            "remove_bins evicts"
+        );
     }
 
     #[test]
@@ -341,8 +378,13 @@ mod tests {
         // Strict (zero grace): the just-closed window is eligible.
         assert_eq!(agg.peek_completed_bins(chrono::Duration::zero()).len(), 1);
         // 120s grace: closed only 30s ago → NOT yet eligible (hold for stragglers).
-        assert!(agg.peek_completed_bins(chrono::Duration::seconds(120)).is_empty());
+        assert!(agg
+            .peek_completed_bins(chrono::Duration::seconds(120))
+            .is_empty());
         // 20s grace: closed 30s ago > grace → now eligible.
-        assert_eq!(agg.peek_completed_bins(chrono::Duration::seconds(20)).len(), 1);
+        assert_eq!(
+            agg.peek_completed_bins(chrono::Duration::seconds(20)).len(),
+            1
+        );
     }
 }

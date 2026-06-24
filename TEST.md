@@ -2,8 +2,10 @@
 
 Test inventory for the **Aggregator Bridge** service.
 
-> Two layers: **unit tests** live inline in this submodule (`cargo test`); **e2e tests** are
-> pytest suites in the superproject (`gridtokenx-coresystem/tests/e2e/`, run via `run.sh` / `just e2e`).
+> This submodule ships **unit tests only** — inline `#[cfg(test)] mod tests`, no `tests/` dirs,
+> **no e2e or integration tests in-repo**. The e2e/integration suite is **not** part of this submodule;
+> it lives in the **superproject** (`gridtokenx-coresystem/tests/e2e/`, pytest, run via `run.sh` / `just e2e`)
+> and is listed below for reference only.
 
 ---
 

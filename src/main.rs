@@ -102,19 +102,49 @@ async fn main() -> Result<()> {
     let early_redis_client = redis::Client::open(redis_url.clone())?;
     let early_redis_conn_result = tokio::time::timeout(
         std::time::Duration::from_secs(3),
-        redis::aio::ConnectionManager::new(early_redis_client)
-    ).await;
+        redis::aio::ConnectionManager::new(early_redis_client),
+    )
+    .await;
 
     let early_redis_conn = match early_redis_conn_result {
         Ok(Ok(conn)) => Some(conn),
         _ => {
-            warn!("⚠️ Redis connection timed out or failed. Running in degraded mode without Redis.");
+            warn!(
+                "⚠️ Redis connection timed out or failed. Running in degraded mode without Redis."
+            );
+            None
+        }
+    };
+
+    // Durable meter-owner source of truth: the shared gridtokenx Postgres, written
+    // by the meter-service registration API. The MeterRegistry uses it as tier-3
+    // (after local cache + Redis) and backfills Redis on a hit. Degraded-safe like
+    // every other edge here: unreachable at boot ⇒ warn + None (Redis-only).
+    let database_url = expand_env(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx".to_string()
+    }));
+    let pg_pool = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect(&database_url),
+    )
+    .await
+    {
+        Ok(Ok(pool)) => {
+            info!("🔗 Postgres meter-owner registry: connected");
+            Some(pool)
+        }
+        _ => {
+            warn!("⚠️ Postgres unreachable; meter-owner DB tier disabled (Redis-only). Readings for unseeded meters will be unattributed.");
             None
         }
     };
 
     let meter_registry = Arc::new(infra::meter_registry::MeterRegistry::new(
         early_redis_conn.clone(),
+        pg_pool,
     ));
 
     // NOTE: the on-chain settlement/mint path (former "Path B") was removed. The
@@ -176,20 +206,15 @@ async fn main() -> Result<()> {
     );
 
     // 6. Initialize IoT Gateway components
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
-    let nats_client = async_nats::connect(&nats_url).await.ok();
-    if nats_client.is_some() {
-        info!("🔗 Connected to NATS for telemetry forwarding");
-    } else {
-        warn!("⚠️ Could not connect to NATS. Telemetry forwarding disabled.");
-    }
-
     // Independent InfluxDB telemetry-history sink (own INFLUXDB_* connection;
     // shared with no other service). Degrades to None when unset/unreachable.
     let influx_writer = match infra::influxdb::InfluxWriter::connect().await {
         Ok(w) => w.map(Arc::new),
         Err(e) => {
-            warn!("⚠️ InfluxDB init failed: {}. Realtime history persistence disabled.", e);
+            warn!(
+                "⚠️ InfluxDB init failed: {}. Realtime history persistence disabled.",
+                e
+            );
             None
         }
     };
@@ -199,19 +224,46 @@ async fn main() -> Result<()> {
     let billing_influx = influx_writer.clone();
 
     let iot_router = Arc::new(
-        router::Router::new(&redis_url, num_zones, nats_client, influx_writer)
+        router::Router::new(&redis_url, num_zones, influx_writer)
             .await
             .context("Failed to initialize IoT router")?,
     );
 
-    // Billing sink: periodically drains completed 15-minute billing bins (TOU
-    // peak/off-peak split + window max demand) to the independent InfluxDB
-    // `billing` measurement, then evicts them. With on-chain settlement removed
-    // this is the only durable consumer of the bins — and the eviction bounds the
-    // otherwise-unbounded `active_bins` map. No-op when InfluxDB is disabled.
-    if let Some(billing_influx) = billing_influx {
+    // Chain Bridge mint gateway for surplus settlement. Degrades to Disabled when
+    // MINT_VIA_CHAIN_BRIDGE is off or NATS is unreachable, so the settlement loop
+    // still runs (and still evicts bins) regardless of mint availability.
+    let nats_url = std::env::var("NATS_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let mint_via_chain_bridge =
+        std::env::var("MINT_VIA_CHAIN_BRIDGE").is_ok_and(|v| v.eq_ignore_ascii_case("true"));
+    let mint_service_identity = std::env::var("CHAIN_BRIDGE_SERVICE_IDENTITY")
+        .unwrap_or_else(|_| "spiffe://gridtokenx.th/prod/aggregator-bridge".to_string());
+    let mint_gateway = Arc::new(
+        infra::mint::MintGateway::connect(
+            mint_via_chain_bridge,
+            nats_url.as_deref(),
+            mint_service_identity,
+        )
+        .await,
+    );
+    if mint_gateway.is_enabled() {
+        info!("⚡ Surplus mint via Chain Bridge ENABLED (NATS request-reply → chain.tx.mint)");
+    } else {
+        info!("⚡ Surplus mint DISABLED (needs MINT_VIA_CHAIN_BRIDGE=true + NATS_URL)");
+    }
+
+    // Settlement sink: periodically drains completed 15-minute billing bins. For
+    // each bin it (1) writes the TOU/demand `billing` point to InfluxDB (if
+    // enabled) and (2) mints the net surplus to the meter owner via Chain Bridge
+    // (if enabled), then evicts the bin — the eviction bounds the otherwise-
+    // unbounded `active_bins` map. Runs whenever InfluxDB OR minting is enabled.
+    if billing_influx.is_some() || mint_gateway.is_enabled() {
         let billing_agg = aggregator.clone();
         let billing_shutdown = shutdown_token.clone();
+        let settle_mint = mint_gateway.clone();
+        let settle_registry = meter_registry.clone();
+        let billing_influx = billing_influx;
         let interval_secs = std::env::var("BILLING_FLUSH_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -221,8 +273,11 @@ async fn main() -> Result<()> {
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(120);
         info!(
-            "🧾 Billing sink ENABLED (interval={}s, grace={}s → InfluxDB `billing`)",
-            interval_secs, grace_secs
+            "🧾 Settlement sink ENABLED (interval={}s, grace={}s; influxdb={}, mint={})",
+            interval_secs,
+            grace_secs,
+            billing_influx.is_some(),
+            settle_mint.is_enabled()
         );
         tokio::spawn(async move {
             let grace = chrono::Duration::seconds(grace_secs);
@@ -230,26 +285,80 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = billing_shutdown.cancelled() => {
-                        info!("🛑 Billing sink stopped");
+                        info!("🛑 Settlement sink stopped");
                         break;
                     }
                     _ = ticker.tick() => {
-                        let mut agg = billing_agg.lock().await;
-                        let bins = agg.peek_completed_bins(grace);
-                        if bins.is_empty() {
-                            continue;
-                        }
-                        let keys: Vec<_> = bins.iter().map(|b| b.key()).collect();
+                        // Drain and evict under the lock, then process the owned
+                        // snapshot without holding the mutex (mint may be slow).
+                        let bins = {
+                            let mut agg = billing_agg.lock().await;
+                            let bins = agg.peek_completed_bins(grace);
+                            if bins.is_empty() {
+                                continue;
+                            }
+                            let keys: Vec<_> = bins.iter().map(|b| b.key()).collect();
+                            agg.remove_bins(&keys);
+                            bins
+                        };
+
                         let mut written = 0usize;
                         for bin in &bins {
-                            if let Some(point) = aggregator_api::billing_sink::bin_to_billing_point(bin) {
-                                billing_influx.record(point);
-                                written += 1;
+                            // (1) InfluxDB billing point.
+                            if let Some(influx) = billing_influx.as_ref() {
+                                if let Some(point) =
+                                    aggregator_api::billing_sink::bin_to_billing_point(bin)
+                                {
+                                    influx.record(point);
+                                    written += 1;
+                                }
+                            }
+
+                            // (2) Surplus mint — fire-and-forget so a slow bridge
+                            // never stalls the sweep. The bridge idempotency key
+                            // mint:{serial}:{window_start_ms} + on-chain PDA dedup
+                            // any replay (e.g. a crash before eviction).
+                            if settle_mint.is_enabled() {
+                                if let Some(kwh) = bin.net_surplus_kwh() {
+                                    let gw = settle_mint.clone();
+                                    let reg = settle_registry.clone();
+                                    let serial = bin.meter_serial.clone();
+                                    let meter_id = *bin.meter_id.as_bytes();
+                                    let window_start_ms = bin.window_start_ms();
+                                    tokio::spawn(async move {
+                                        let wallet = match reg.resolve_wallet(&serial).await {
+                                            Ok(Some(w)) => w,
+                                            Ok(None) => {
+                                                warn!("surplus mint skipped: no wallet registered for meter {serial}");
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                warn!("surplus mint skipped: wallet lookup failed for {serial}: {e}");
+                                                return;
+                                            }
+                                        };
+                                        match gw
+                                            .mint(&wallet, kwh, meter_id, &serial, window_start_ms)
+                                            .await
+                                        {
+                                            Ok(out) => info!(
+                                                "⚡ minted {kwh} kWh surplus for meter {serial} (sig={}, slot={})",
+                                                out.signature, out.slot
+                                            ),
+                                            Err(e) => {
+                                                warn!("surplus mint failed for meter {serial}: {e}")
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
-                        agg.remove_bins(&keys);
-                        drop(agg);
-                        info!("🧾 Billing sink: flushed {} completed bin(s) to InfluxDB", written);
+                        if written > 0 {
+                            info!(
+                                "🧾 Settlement sink: flushed {} completed bin(s) to InfluxDB",
+                                written
+                            );
+                        }
                     }
                 }
             }
@@ -302,8 +411,7 @@ async fn main() -> Result<()> {
                 "📶 Grid-status publisher started (every {}s → {})",
                 publish_secs, topic
             );
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(publish_secs));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(publish_secs));
             loop {
                 tokio::select! {
                     _ = publisher_shutdown.cancelled() => {
@@ -334,9 +442,11 @@ async fn main() -> Result<()> {
     // the zone ingester fills). Must NOT create a second instance: a separate
     // aggregator here would never see any readings, so dispatch would scan an
     // always-empty map and report zero available capacity.
-    let dispatch_grpc_url = std::env::var("DISPATCH_GRPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
-    let grpc_client = match dispatch::grpc_client::DispatchClient::new(dispatch_grpc_url.clone()).await {
+    let dispatch_grpc_url =
+        std::env::var("DISPATCH_GRPC_URL").unwrap_or_else(|_| "http://127.0.0.1:50051".to_string());
+    let grpc_client = match dispatch::grpc_client::DispatchClient::new(dispatch_grpc_url.clone())
+        .await
+    {
         Ok(client) => client,
         Err(e) => {
             warn!(
@@ -346,13 +456,18 @@ async fn main() -> Result<()> {
             dispatch::grpc_client::DispatchClient::new("http://127.0.0.1:50051".to_string()).await?
         }
     };
-    let mut dispatch_engine = dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
-    
+    let mut dispatch_engine =
+        dispatch::engine::DispatchEngine::new(aggregator.clone(), grpc_client);
+
     // Kafka Consumer for Dispatch
     let kafka_consumer = if let Ok(brokers) = std::env::var("KAFKA_BOOTSTRAP_SERVERS") {
         let topic = std::env::var("KAFKA_TOPIC_GRID_STATUS")
             .unwrap_or_else(|_| "gridtokenx.aggregator.grid_status".to_string());
-        match infra::kafka::AggregatorKafkaConsumer::new(&brokers, "aggregator-bridge-group", &topic) {
+        match infra::kafka::AggregatorKafkaConsumer::new(
+            &brokers,
+            "aggregator-bridge-group",
+            &topic,
+        ) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
                 error!("❌ Kafka consumer init failed: {}", e);
@@ -370,7 +485,8 @@ async fn main() -> Result<()> {
             loop {
                 match consumer.consume_grid_status().await {
                     Ok(event) => {
-                        if let Err(e) = dispatch_engine.evaluate_and_dispatch(event.frequency).await {
+                        if let Err(e) = dispatch_engine.evaluate_and_dispatch(event.frequency).await
+                        {
                             error!("❌ Dispatch Engine error: {}", e);
                         }
                     }
@@ -407,9 +523,9 @@ async fn main() -> Result<()> {
                         Ok(client) => Some(Arc::new(client)),
                         Err(e) => {
                             warn!(
-                                "⚠️ OpenADR VEN listener disabled: DISPATCH_GRPC_URL '{}' invalid: {}",
-                                addr, e
-                            );
+                            "⚠️ OpenADR VEN listener disabled: DISPATCH_GRPC_URL '{}' invalid: {}",
+                            addr, e
+                        );
                             None
                         }
                     }
@@ -543,10 +659,7 @@ async fn main() -> Result<()> {
             "/v1/private-network/ingest/batch",
             post(handlers::ingest_private_network_batch),
         )
-        .route(
-            "/v1/ingest/telemetry",
-            post(handlers::ingest_legacy_batch),
-        )
+        .route("/v1/ingest/telemetry", post(handlers::ingest_legacy_batch))
         .route(
             "/v1/ingest/telemetry/batch",
             post(handlers::ingest_legacy_batch),

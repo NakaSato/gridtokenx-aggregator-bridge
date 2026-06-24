@@ -6,6 +6,11 @@
 //!   - `aggregator_protocol::dispatch::*` (proto package `gridtokenx.dispatch`)
 //!   - `aggregator_protocol::identity::*` (proto package `identity`)
 
+// The generated prost/connectrpc code nests modules matching the proto package
+// path (e.g. `oracle::gridtokenx::oracle`), which trips `clippy::module_inception`
+// on machine-generated code we don't hand-edit. Allow it crate-wide.
+#![allow(clippy::module_inception)]
+
 pub mod oracle {
     include!(concat!(env!("OUT_DIR"), "/_oracle_include.rs"));
     pub use gridtokenx::oracle::v1::*;

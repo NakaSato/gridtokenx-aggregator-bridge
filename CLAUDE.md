@@ -17,8 +17,14 @@ smart grid. Decoupled from edge hardware; it verifies, aggregates, and dissemina
   history — async fire-and-forget, so a slow/down InfluxDB never blocks ingest (`Router::disseminate` →
   `InfluxWriter`, `crates/aggregator-persistence/src/infra/influxdb.rs`).
 
-> **No on-chain settlement here.** The former "Path B" (15-min batched attestations → Plonky2 ZK-rollup → Merkle
-> root → HyperEVM mint/settlement) has been removed. This service does not mint GRID or talk to the chain.
+> **Surplus minting lives here (Chain Bridge over NATS), chain-light.** The former "Path B" (Plonky2
+> ZK-rollup → HyperEVM) and the NATS `MintForwardReading` handoff to meter-service were both removed.
+> Minting was re-added directly: when a 15-min billing window closes with net surplus generation, the
+> settlement sink mints it to the meter owner via **Chain Bridge over NATS** (`chain.tx.mint`). The
+> service carries **no Solana / blockchain-core dependency** — it sends intent only and mirrors the wire
+> types locally (`crates/aggregator-persistence/src/infra/mint.rs`). Disabled by default; gated on
+> `MINT_VIA_CHAIN_BRIDGE` + `NATS_URL`. Verification, aggregation, and telemetry dissemination
+> (Redis Streams + InfluxDB) are unchanged.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) (source of truth, the VPP map) and [PROTOCOL.md](PROTOCOL.md)
 (the v4 UTT-S+ binary frame layout + TLV dictionary). Both are doc-lint gated — edit the doc next to the code you change.
@@ -53,7 +59,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 | `aggregator-core` | Domain models, numeric types. Zero internal deps. |
 | `aggregator-protocol` | Generated ConnectRPC/prost types from `proto/{oracle,dispatch}.proto` via `build.rs` → `OUT_DIR`. Packages: `oracle::*`, `dispatch::*`, `identity::*`. |
 | `aggregator-stacks` | DLMS/COSEM meter decoder (`dlms`) + `binary_decoder` (secure v4 frame). DLMS/COSEM is the only meter protocol; `protocol="auto"`/omitted resolves to `dlms`. |
-| `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry, circular-buffer/sync storage, independent InfluxDB v2 history sink (`infra/influxdb.rs`). |
+| `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry (3-tier owner resolver: local cache → Redis → Postgres source of truth, `infra/meter_registry.rs`), circular-buffer/sync storage, independent InfluxDB v2 history sink (`infra/influxdb.rs`). |
 | `aggregator-logic` | Aggregator (15-min billing bins w/ TOU split + max-demand), Router (dissemination), `billing_sink` (bins → InfluxDB `billing`), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
 | `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |
 
@@ -63,7 +69,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 
 - Two servers run concurrently: **HTTP IoT gateway** on `IOT_GATEWAY_PORT` (default `4010`) and **gRPC ingestion** on `GRPC_PORT` (default **5030**, the canonical mesh port — `50051` in `.env.example` is the simulator override).
 - HTTP routes: `/health`, `/v1/private-network/ingest[/batch]`, `/v1/ingest/telemetry[/batch]`.
-- **Degraded-mode by design**: Redis (3s timeout), NATS, Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
+- **Degraded-mode by design**: Redis (3s timeout), Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
 - Background tasks: zone ingester, Kafka dispatch listener, gRPC server, billing-sink flush loop (only when InfluxDB enabled) — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
 - Env interpolation: values support `${VAR}` expansion via `expand_env`.
 
@@ -79,20 +85,21 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 
 ## Config
 
-Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `IOT_GATEWAY_PORT`, `GRPC_PORT`, `GRIDTOKENX_API_KEYS`,
-`IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `NATS_URL`, `IOT_NUM_ZONES` (default 10),
-`ENVIRONMENT` (`production` ⇒ strict sig + DLMS decryption), `ALLOW_PLAINTEXT_DLMS` (dev-only; allow
-plaintext v4 frames when a device has no `enckey`).
+Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `DATABASE_URL`, `IOT_GATEWAY_PORT`, `GRPC_PORT`,
+`GRIDTOKENX_API_KEYS`, `IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `IOT_NUM_ZONES`
+(default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS decryption), `ALLOW_PLAINTEXT_DLMS`
+(dev-only; allow plaintext v4 frames when a device has no `enckey`).
 
-Meter-service handoff (NATS): when `NATS_URL` is set, each verified smart-meter reading with mintable
-surplus (`net_kwh > 0`) is forwarded to **meter-service** on `METER_SERVICE_NATS_SUBJECT` (default
-`meter.reading`) as a `MintForwardReading` (`aggregator_core::models`, published by `Router::disseminate`,
-`crates/aggregator-logic/src/router.rs`). That payload is the on-chain mint provenance, so it carries a
-stable `reading_id` (idempotency key — meter-service uses it as the row PK so a redelivery never
-double-ingests/mints) plus `meter_serial`, `energy_kwh`, `timestamp_ms`. The recipient wallet is **not**
-on the wire — meter-service derives it from the registered meter owner, so an untrusted forward cannot
-redirect minted tokens. meter-service owns the mint decision; this bridge never mints and has no
-blockchain deps. Unset `NATS_URL` ⇒ forwarding disabled.
+Meter-owner registry (`DATABASE_URL`): the **durable source of truth** for `meter_serial →
+(user_id, owner wallet)` is the shared gridtokenx Postgres `meters` JOIN `users`, written by the
+**meter-service** registration API (`POST /api/v1/meters`). `MeterRegistry`
+(`crates/aggregator-persistence/src/infra/meter_registry.rs`) resolves in three tiers — local cache
+→ Redis (`gridtokenx:meters:{serial}:user_id`/`:wallet`) → **Postgres** — and **backfills Redis +
+local cache** on a Postgres hit, so Redis is a self-populating hot cache and a flush/restart never
+loses ownership. Read-only; the bridge never writes `meters`. Degraded-safe: `DATABASE_URL`
+unreachable at boot ⇒ `warn!` + DB tier disabled (Redis-only; unseeded meters stay unattributed).
+When **neither** Redis nor Postgres is configured, `resolve_user_id` keeps the legacy nil-user
+fallback for pure-local dev. Compose already sets `DATABASE_URL` (→ `pgdog:6432/gridtokenx`).
 
 InfluxDB (independent realtime history): `INFLUXDB_URL` enables an InfluxDB v2 sink dedicated to this
 service alone — point it at this service's **own** instance (the superproject's `aggregator-influxdb`
@@ -103,15 +110,31 @@ realtime Redis dissemination path. Measurements: `energy` / `ev_session` / `batt
 from `Router::disseminate`) and `billing` (rolled-up bins, see below); tags include `device_id`,
 `device_type`, `serial_number`, `zone_code`.
 
-Billing sink (durable home for completed bins): the binary spawns a flush loop (`src/main.rs`) that
-periodically `peek_completed_bins(grace)`, converts each via `bin_to_billing_point`
-(`crates/aggregator-logic/src/billing_sink.rs`) to the InfluxDB `billing` measurement (TOU peak/off-peak
-energy split + window `max_demand_kw`, tagged `user_id`, timestamped at the window's `end_time`), then
-**evicts** it — which is also what bounds the otherwise-unbounded `active_bins` map now that on-chain
-settlement is gone. Tunables: `BILLING_FLUSH_INTERVAL_SECS` (default 30), `BILLING_FLUSH_GRACE_SECS`
-(default 120, delays flush so late readings still land in their bin). No-op when InfluxDB is disabled — so
-with InfluxDB off, bins are never evicted (`active_bins` grows). `BillingBin` carries `#[serde(default)]`
+Settlement sink (durable home for completed bins + surplus mint): the binary spawns a flush loop
+(`src/main.rs`) that periodically `peek_completed_bins(grace)` and for each completed bin: (1) converts via
+`bin_to_billing_point` (`crates/aggregator-logic/src/billing_sink.rs`) to the InfluxDB `billing` measurement
+(TOU peak/off-peak split + window `max_demand_kw`, tagged `user_id`, timestamped at `end_time`); (2) if
+`BillingBin::net_surplus_kwh()` is `Some` (net generation > consumption), **mints** that surplus to the meter
+owner via Chain Bridge — fire-and-forget in a spawned task so a slow bridge never stalls the sweep; (3)
+**evicts** the bin — which bounds the otherwise-unbounded `active_bins` map. The loop now runs whenever
+InfluxDB **or** minting is enabled (previously InfluxDB-only), so eviction no longer depends on InfluxDB.
+Mint idempotency: `mint:{serial}:{window_start_ms}` (15-min window = the billing window) lets the bridge
+dedup any replay (e.g. a crash before eviction); the on-chain `(meter_id, window_start_ms)` PDA is the
+backstop. Recipient wallet is resolved from the meter registry (`gridtokenx:meters:{serial}:wallet`); a
+missing wallet skips the mint (logged, bin still evicts). No on-chain confirmer (fire-and-forget).
+Tunables: `BILLING_FLUSH_INTERVAL_SECS` (default 30), `BILLING_FLUSH_GRACE_SECS` (default 120). Mint config:
+`MINT_VIA_CHAIN_BRIDGE`, `NATS_URL`, `CHAIN_BRIDGE_SERVICE_IDENTITY`. `BillingBin` carries `#[serde(default)]`
 TOU/demand fields so bins persisted before these existed still deserialize on crash recovery.
+
+> SECURITY: `NatsMintGateway` **signs** the mint envelope with this service's mTLS client key
+> (P-256/ECDSA over the canonical bytes) and attaches an `EnvelopeAuth` (cert PEM + signature), so the
+> bridge binds the self-asserted `service_identity` to a CA-issued cert and rejects spoofed identities
+> under `CHAIN_BRIDGE_REQUIRE_SIGNED_NATS`. The signing scheme is mirrored locally
+> (`crates/aggregator-persistence/src/infra/mint.rs`: `EnvelopeSigner` + `canonical_mint_bytes`,
+> p256/base64 only) so the service stays chain-light — that layout MUST stay byte-identical to
+> `gridtokenx-blockchain-core`'s `rpc::envelope_auth` or the bridge rejects every signature. When the
+> client cert/key is absent (insecure dev), the signer is `None` and the envelope ships unsigned
+> (accepted only while the bridge runs signing in log-only mode).
 
 OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
 (`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.

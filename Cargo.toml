@@ -23,7 +23,9 @@ http = "1.0.0"
 
 # Cache / messaging clients used at startup
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
-async-nats = "0.37"
+# Durable meter-owner source of truth (shared gridtokenx Postgres) — read-only,
+# degraded-safe pool built at startup and handed to the MeterRegistry DB tier.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 
 # Metrics exporter
 metrics = "0.24"

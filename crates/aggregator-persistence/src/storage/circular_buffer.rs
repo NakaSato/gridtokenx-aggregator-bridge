@@ -5,6 +5,9 @@ use serde_json::Value;
 use std::path::Path;
 use tracing::{debug, info};
 
+/// An unsynced telemetry row: `(id, meter_id, timestamp, payload)`.
+pub type UnsyncedRecord = (i64, String, DateTime<Utc>, Value);
+
 /// A local, resilient telemetry ring-buffer using SQLite.
 /// Ensures 24-hour data retention for offline operation.
 pub struct CircularBuffer {
@@ -74,7 +77,7 @@ impl CircularBuffer {
         self.push_count += 1;
 
         // Perform cleanup every 100 pushes to reduce SQL overhead in the critical path
-        if self.push_count % 100 == 0 {
+        if self.push_count.is_multiple_of(100) {
             self.cleanup()?;
         }
 
@@ -99,7 +102,7 @@ impl CircularBuffer {
     }
 
     /// Fetch unsynced records to replay to the API Gateway.
-    pub fn get_unsynced(&self, limit: u32) -> Result<Vec<(i64, String, DateTime<Utc>, Value)>> {
+    pub fn get_unsynced(&self, limit: u32) -> Result<Vec<UnsyncedRecord>> {
         let mut stmt = self.conn.prepare("SELECT id, meter_id, timestamp, payload FROM telemetry WHERE synced = 0 ORDER BY id LIMIT ?")?;
 
         let rows = stmt.query_map(params![limit], |row| {
@@ -121,7 +124,8 @@ impl CircularBuffer {
 
     /// Cleanup old data beyond retention period (default 24h).
     fn cleanup(&mut self) -> Result<()> {
-        let cutoff = gridtokenx_telemetry::time::now() - chrono::Duration::hours(self.retention_hours as i64);
+        let cutoff = gridtokenx_telemetry::time::now()
+            - chrono::Duration::hours(self.retention_hours as i64);
         let deleted = self.conn.execute(
             "DELETE FROM telemetry WHERE timestamp < ?1 AND synced = 1",
             params![cutoff],

@@ -1,0 +1,7 @@
+# Pin the toolchain so cargo build / clippy / fmt are deterministic across local,
+# CI, and the Docker builder (Dockerfile uses rust:1.91-bookworm). Without this,
+# a newer rustfmt/clippy (e.g. 1.96) reports drift on code that was clean under
+# the build toolchain. Keep this channel in sync with the Dockerfile base image.
+[toolchain]
+channel = "1.91"
+components = ["rustfmt", "clippy"]
