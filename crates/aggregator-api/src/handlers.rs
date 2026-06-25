@@ -24,14 +24,34 @@ pub async fn health() -> impl IntoResponse {
 // Private Network Ingestion (B2B - Specialized Protocols)
 // =============================================================================
 
+/// Secure (locked-down / production) mode. When `AGGREGATOR_REQUIRE_SECURE=true`,
+/// every ingest bypass is neutralized: the unverified-telemetry escape hatch is
+/// ignored, the unsigned `simulator` protocol is refused, and the REST meter path
+/// requires an authenticated `dlms-enc` frame (no plaintext downgrade). Default
+/// off so dev/e2e keep their bypasses.
+pub fn secure_mode_enabled() -> bool {
+    std::env::var("AGGREGATOR_REQUIRE_SECURE").unwrap_or_default() == "true"
+}
+
 // Helper function to verify signature on REST ingestion paths
 /// Whether telemetry signature enforcement is disabled (dev/test escape hatch).
 ///
 /// Default (env unset) is fail-CLOSED: telemetry with an invalid or unverifiable
 /// Ed25519 signature is rejected. Set `AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY=true`
 /// only in trusted dev/test environments to accept unverified readings.
+///
+/// Secure mode ([`secure_mode_enabled`]) hard-overrides this to `false`: the
+/// escape hatch cannot re-enable unverified telemetry in a locked-down deployment.
 pub fn signature_enforcement_disabled() -> bool {
-    std::env::var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY").unwrap_or_default() == "true"
+    !secure_mode_enabled()
+        && std::env::var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY").unwrap_or_default() == "true"
+}
+
+/// Whether the unsigned `simulator` ingest bypass is permitted. Allowed only
+/// outside secure mode; in secure mode a `simulator` frame falls through to
+/// normal signature verification (and is rejected, being unsigned).
+pub fn simulator_bypass_allowed() -> bool {
+    !secure_mode_enabled()
 }
 
 /// The numeric value a DLMS/COSEM meter signs in its canonical
@@ -259,7 +279,8 @@ pub async fn ingest_private_network(
     // kwh and timestamp extraction below all run on the recovered OBIS payload
     // exactly as for a plaintext `dlms` frame.
     let mut payload = payload;
-    if payload.protocol.to_lowercase() == "dlms-enc" {
+    let was_encrypted = payload.protocol.to_lowercase() == "dlms-enc";
+    if was_encrypted {
         match decrypt_dlms_envelope(&state, &payload.device_id, &payload.payload).await {
             DecryptOutcome::Ok(obis) => {
                 payload.payload = obis;
@@ -285,6 +306,21 @@ pub async fn ingest_private_network(
                     .into_response();
             }
         }
+    }
+
+    // 0b. Secure mode: the meter path must be an authenticated encrypted frame.
+    // Reject any non-`dlms-enc` frame (plaintext `dlms`, `simulator`, downgrade)
+    // before it can reach a bypass.
+    if secure_mode_enabled() && !was_encrypted {
+        warn!(
+            "🚫 Secure mode: rejecting non-encrypted frame (protocol '{}') for {}",
+            payload.protocol, payload.device_id
+        );
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(json!({ "error": "secure mode requires an encrypted dlms-enc frame" })),
+        )
+            .into_response();
     }
 
     // 1. Signature Verification (Ed25519)
@@ -356,8 +392,14 @@ pub async fn ingest_private_network(
     // reject invalid/unverifiable telemetry unless
     // AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY=true.
     let canonical_value = canonical_sign_value(&protocol, &payload.payload);
-    let is_simulator = protocol == "simulator";
+    // The `simulator` bypass is honored only outside secure mode (and is already
+    // unreachable in secure mode — the require-encryption guard above rejects it).
+    let is_simulator = protocol == "simulator" && simulator_bypass_allowed();
     let sig_verified = if is_simulator {
+        warn!(
+            "⚠️ Unsigned `simulator` ingest bypass used for {} (dev path)",
+            payload.device_id
+        );
         true
     } else {
         match verify_rest_signature(
@@ -607,8 +649,10 @@ pub async fn ingest_private_network_batch(
             .unwrap_or(0);
 
         let canonical_value = canonical_sign_value(&protocol, &item);
-        let is_verified = if protocol == "simulator" {
-            true // Skip signature for simulator mode
+        // Simulator bypass honored only outside secure mode; in secure mode the
+        // frame falls through to verification and is rejected below (unsigned).
+        let is_verified = if protocol == "simulator" && simulator_bypass_allowed() {
+            true // Skip signature for simulator mode (dev only)
         } else {
             match verify_rest_signature(
                 &state,
@@ -709,8 +753,53 @@ pub async fn ingest_private_network_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_sign_value, rest_sign_candidates};
+    use super::{
+        canonical_sign_value, rest_sign_candidates, secure_mode_enabled,
+        signature_enforcement_disabled, simulator_bypass_allowed,
+    };
     use serde_json::json;
+    use std::sync::Mutex;
+
+    // Serialize the env-mutating secure-mode tests — process env is global, so
+    // these cannot run concurrently with each other without flaking.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Secure mode hard-overrides every ingest bypass: the unverified-telemetry
+    /// escape hatch is ignored and the unsigned `simulator` bypass is refused,
+    /// regardless of the dev env vars.
+    #[test]
+    fn secure_mode_neutralizes_bypasses() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY", "true");
+
+        // Without secure mode, the escape hatch + simulator bypass are honored.
+        std::env::remove_var("AGGREGATOR_REQUIRE_SECURE");
+        assert!(!secure_mode_enabled());
+        assert!(signature_enforcement_disabled()); // hatch active
+        assert!(simulator_bypass_allowed());
+
+        // Secure mode forces fail-closed even with the hatch still set to "true".
+        std::env::set_var("AGGREGATOR_REQUIRE_SECURE", "true");
+        assert!(secure_mode_enabled());
+        assert!(!signature_enforcement_disabled()); // hatch overridden
+        assert!(!simulator_bypass_allowed());
+
+        std::env::remove_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY");
+        std::env::remove_var("AGGREGATOR_REQUIRE_SECURE");
+    }
+
+    /// Outside secure mode, signature enforcement is on by default and only the
+    /// explicit env hatch disables it.
+    #[test]
+    fn enforcement_on_by_default_off_only_via_hatch() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AGGREGATOR_REQUIRE_SECURE");
+        std::env::remove_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY");
+        assert!(!signature_enforcement_disabled()); // fail-closed default
+        std::env::set_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY", "true");
+        assert!(signature_enforcement_disabled());
+        std::env::remove_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY");
+    }
 
     // --- REST signature fallback ladder (canonical / sec-scale ts / JSON) ---
 
