@@ -1972,6 +1972,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "redis",
  "rustls",
+ "rustls-pemfile 2.2.0",
  "sqlx",
  "tokio",
  "tokio-util",

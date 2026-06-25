@@ -19,6 +19,8 @@ axum = { version = "0.8.7", features = ["macros"] }
 # Optional TLS termination for the IoT gateway (encrypts DLMS/COSEM telemetry in
 # transit). Uses the same rustls 0.23 provider installed in main().
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Load PEM cert chains + client-CA roots when building the mTLS ServerConfig.
+rustls-pemfile = "2"
 
 # gRPC server/client wiring
 connectrpc = { version = "0.2.1", features = ["server", "client"] }

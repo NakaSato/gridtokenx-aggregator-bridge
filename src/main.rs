@@ -39,6 +39,55 @@ fn expand_env(s: &str) -> String {
     result
 }
 
+/// Build a rustls `ServerConfig` that requires and verifies client certificates
+/// (mTLS) against `client_ca_path`, presenting the server identity from
+/// `cert_path`/`key_path`. Used when `IOT_GATEWAY_TLS_CLIENT_CA` is set so the
+/// IoT gateway authenticates the meter simulator at the transport layer, not
+/// just by API key. Uses the process-default crypto provider (installed in main).
+fn build_mtls_server_config(
+    cert_path: &str,
+    key_path: &str,
+    client_ca_path: &str,
+) -> Result<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+
+    let mut cert_rd = BufReader::new(
+        std::fs::File::open(cert_path)
+            .with_context(|| format!("open server cert {}", cert_path))?,
+    );
+    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_rd)
+        .collect::<std::result::Result<_, _>>()
+        .context("parse server cert chain")?;
+
+    let mut key_rd = BufReader::new(
+        std::fs::File::open(key_path).with_context(|| format!("open server key {}", key_path))?,
+    );
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_rd)
+        .context("parse server key")?
+        .ok_or_else(|| anyhow::anyhow!("no private key in {}", key_path))?;
+
+    let mut ca_rd = BufReader::new(
+        std::fs::File::open(client_ca_path)
+            .with_context(|| format!("open client CA {}", client_ca_path))?,
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in rustls_pemfile::certs(&mut ca_rd) {
+        roots
+            .add(ca.context("parse client CA cert")?)
+            .context("add client CA root")?;
+    }
+
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .context("build client cert verifier")?;
+
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .context("build mTLS server config")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install default crypto provider for rustls (required for rustls 0.23+ when both
@@ -793,11 +842,31 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // Optional mTLS: when IOT_GATEWAY_TLS_CLIENT_CA is set, require + verify a
+    // client cert (the simulator's) against that CA — transport-layer auth on top
+    // of the API key. Unset => server-auth TLS only (backward-compatible).
+    let client_ca = std::env::var("IOT_GATEWAY_TLS_CLIENT_CA")
+        .ok()
+        .filter(|s| !s.is_empty());
+
     let server_result: anyhow::Result<()> = if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
-        info!("🔐 Starting HTTPS gateway (TLS) using cert {}...", cert);
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
-            .await
-            .context("Failed to load IoT Gateway TLS cert/key")?;
+        let tls_config = match client_ca.as_ref() {
+            Some(ca) => {
+                info!(
+                    "🔐 Starting HTTPS gateway (mTLS) cert {} — verifying client certs against {}",
+                    cert, ca
+                );
+                let server_config = build_mtls_server_config(&cert, &key, ca)
+                    .context("Failed to build IoT Gateway mTLS config")?;
+                axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config))
+            }
+            None => {
+                info!("🔐 Starting HTTPS gateway (TLS) using cert {}...", cert);
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+                    .await
+                    .context("Failed to load IoT Gateway TLS cert/key")?
+            }
+        };
 
         // axum_server binds its own socket; release the plain listener bound above
         // so the port is free for the TLS acceptor.
