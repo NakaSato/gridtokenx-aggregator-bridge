@@ -584,9 +584,16 @@ async fn main() -> Result<()> {
     // Crypto: Per-device AES key registry (decrypts secure v4 DLMS frames).
     // Same self-healing Redis URL ownership as the verifier — survives a Redis
     // restart without freezing decryption.
-    let device_key_registry = Arc::new(infra::crypto::DeviceKeyRegistry::new(Some(
-        redis_url.clone(),
-    )));
+    // Attach a Vault Transit client (from VAULT_ADDR/VAULT_TOKEN/VAULT_METER_KEK_NAME)
+    // so rotated, KEK-wrapped GUEK versions can be unwrapped. None when Vault is
+    // unset — the registry then serves only the legacy unversioned key.
+    let meter_vault = infra::vault::VaultTransitClient::from_env();
+    if meter_vault.is_some() {
+        info!("🔐 Vault Transit enabled for per-meter key rotation (versioned GUEK unwrap)");
+    }
+    let device_key_registry = Arc::new(
+        infra::crypto::DeviceKeyRegistry::new(Some(redis_url.clone())).with_vault(meter_vault),
+    );
 
     // 7. Initialize IAM gRPC Client (optional - auth falls back to static API keys).
     // Used by the ingest auth middleware to resolve API keys via IAM.

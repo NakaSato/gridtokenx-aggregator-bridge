@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
@@ -282,6 +282,12 @@ fn decode_aes_key_hex(meter_id: &str, raw: &str) -> Result<[u8; 32]> {
 pub struct DeviceKeyRegistry {
     redis_url: Option<String>,
     conn: Arc<Mutex<Option<ConnectionManager>>>,
+    /// Vault Transit client for unwrapping versioned (rotated) GUEKs. `None`
+    /// disables the versioned path (legacy unversioned key only).
+    vault: Option<super::vault::VaultTransitClient>,
+    /// Cache of unwrapped versioned keys, keyed by `(meter_id, kid)`. A wrapped
+    /// GUEK version is immutable, so caching avoids re-hitting Vault per frame.
+    versioned_cache: Arc<Mutex<std::collections::HashMap<(String, i64), [u8; 32]>>>,
 }
 
 impl DeviceKeyRegistry {
@@ -291,6 +297,8 @@ impl DeviceKeyRegistry {
         Self {
             redis_url,
             conn: Arc::new(Mutex::new(None)),
+            vault: None,
+            versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -300,7 +308,15 @@ impl DeviceKeyRegistry {
         Self {
             redis_url: None,
             conn: Arc::new(Mutex::new(conn)),
+            vault: None,
+            versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Attach a Vault Transit client, enabling versioned (rotated) key lookup.
+    pub fn with_vault(mut self, vault: Option<super::vault::VaultTransitClient>) -> Self {
+        self.vault = vault;
+        self
     }
 
     async fn conn(&self) -> Result<ConnectionManager> {
@@ -382,6 +398,48 @@ impl DeviceKeyRegistry {
             Some(hex_str) => Ok(Some(decode_aes_key_hex(meter_id, &hex_str)?)),
             None => Ok(None),
         }
+    }
+
+    /// Fetch a device's **versioned** AES-256 key (rotated GUEK) for `kid`.
+    ///
+    /// Reads the Vault-wrapped blob at `gridtokenx:devices:{id}:enckey:v{kid}`,
+    /// unwraps it via Vault Transit, and caches the result by `(meter_id, kid)`
+    /// (a wrapped version is immutable). `Ok(None)` when that version is absent
+    /// (e.g. pruned past the grace window); `Err` when Redis is unreachable, no
+    /// Vault client is configured, or the unwrap fails (fail-closed).
+    pub async fn get_device_aes_key_versioned(
+        &self,
+        meter_id: &str,
+        kid: i64,
+    ) -> Result<Option<[u8; 32]>> {
+        let cache_key = (meter_id.to_string(), kid);
+        {
+            let cache = self.versioned_cache.lock().await;
+            if let Some(k) = cache.get(&cache_key) {
+                return Ok(Some(*k));
+            }
+        }
+
+        let redis_key = format!("gridtokenx:devices:{}:enckey:v{}", meter_id, kid);
+        let wrapped = match self.get_with_retry(&redis_key).await? {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        let vault = self.vault.as_ref().ok_or_else(|| {
+            anyhow!(
+                "versioned key v{} present for {} but no Vault client configured to unwrap it",
+                kid,
+                meter_id
+            )
+        })?;
+        let key = vault
+            .unwrap(wrapped.trim())
+            .await
+            .with_context(|| format!("failed to unwrap GUEK v{} for {}", kid, meter_id))?;
+
+        self.versioned_cache.lock().await.insert(cache_key, key);
+        Ok(Some(key))
     }
 
     /// Batch fetch via a single MGET (same round-trip shape as

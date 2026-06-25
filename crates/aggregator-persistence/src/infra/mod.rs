@@ -5,3 +5,4 @@ pub mod meter_registry;
 pub mod mint;
 pub mod platform;
 pub mod rabbitmq;
+pub mod vault;

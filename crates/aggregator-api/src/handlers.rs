@@ -173,6 +173,8 @@ async fn decrypt_dlms_envelope(
         Some(c) => c,
         None => return DecryptOutcome::Bad("missing/invalid counter".into()),
     };
+    // `kid` selects a rotated key version; absent => Phase-2 legacy static key.
+    let kid = enc.get("kid").and_then(|v| v.as_i64());
     let nonce_b64 = enc
         .get("nonce")
         .and_then(|v| v.as_str())
@@ -190,14 +192,31 @@ async fn decrypt_dlms_envelope(
         Err(_) => return DecryptOutcome::Bad("ciphertext not base64".into()),
     };
 
-    // Per-device AES key (fail-closed: absent key or Redis error both reject).
-    let key_bytes = match state
-        .device_key_registry
-        .get_device_aes_key(device_id)
-        .await
-    {
+    // Per-device AES key: a `kid` selects the rotated (Vault-wrapped) version;
+    // its absence uses the legacy unversioned key (Phase-2). Fail-closed: absent
+    // key or Redis/Vault error both reject.
+    let key_lookup = match kid {
+        Some(v) => {
+            state
+                .device_key_registry
+                .get_device_aes_key_versioned(device_id, v)
+                .await
+        }
+        None => {
+            state
+                .device_key_registry
+                .get_device_aes_key(device_id)
+                .await
+        }
+    };
+    let key_bytes = match key_lookup {
         Ok(Some(k)) => k,
-        Ok(None) => return DecryptOutcome::Bad(format!("no AES key for {}", device_id)),
+        Ok(None) => {
+            return DecryptOutcome::Bad(match kid {
+                Some(v) => format!("no AES key v{} for {}", v, device_id),
+                None => format!("no AES key for {}", device_id),
+            })
+        }
         Err(e) => return DecryptOutcome::Bad(format!("key lookup failed: {}", e)),
     };
 
