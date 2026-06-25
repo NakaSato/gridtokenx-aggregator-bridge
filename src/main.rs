@@ -733,42 +733,82 @@ async fn main() -> Result<()> {
         }
     });
 
-    info!("🚀 Starting HTTP gateway...");
+    // Shared graceful-shutdown trigger: SIGINT/SIGTERM cancels the shutdown token,
+    // which both the HTTP/HTTPS server path and all background tasks observe.
     let server_shutdown = shutdown_token.clone();
-    let server_result: anyhow::Result<()> = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            // Wait for SIGINT, SIGTERM, or common cancellation
-            let ctrl_c = async {
-                signal::ctrl_c()
-                    .await
-                    .expect("failed to install Ctrl+C handler");
-            };
+    let shutdown_signal = async move {
+        let ctrl_c = async {
+            signal::ctrl_c()
+                .await
+                .expect("failed to install Ctrl+C handler");
+        };
 
-            #[cfg(unix)]
-            let terminate = async {
-                signal::unix::signal(signal::unix::SignalKind::terminate())
-                    .expect("failed to install signal handler")
-                    .recv()
-                    .await;
-            };
+        #[cfg(unix)]
+        let terminate = async {
+            signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        };
 
-            #[cfg(not(unix))]
-            let terminate = std::future::pending::<()>();
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
 
-            tokio::select! {
-                _ = ctrl_c => {
-                    info!("🛑 SIGINT received, triggering shutdown...");
-                },
-                _ = terminate => {
-                    info!("🛑 SIGTERM received, triggering shutdown...");
-                },
-            }
+        tokio::select! {
+            _ = ctrl_c => {
+                info!("🛑 SIGINT received, triggering shutdown...");
+            },
+            _ = terminate => {
+                info!("🛑 SIGTERM received, triggering shutdown...");
+            },
+        }
 
-            // Signal all background tasks to stop
-            server_shutdown.cancel();
-        })
-        .await
-        .context("IoT Gateway HTTP server failed");
+        // Signal all background tasks to stop
+        server_shutdown.cancel();
+    };
+
+    // Optional TLS termination for the IoT gateway: when both IOT_GATEWAY_TLS_CERT
+    // and IOT_GATEWAY_TLS_KEY are set, serve HTTPS so DLMS/COSEM telemetry is
+    // encrypted in transit. Otherwise serve plain HTTP (backward-compatible default).
+    let tls_cert = std::env::var("IOT_GATEWAY_TLS_CERT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let tls_key = std::env::var("IOT_GATEWAY_TLS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let server_result: anyhow::Result<()> = if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
+        info!("🔐 Starting HTTPS gateway (TLS) using cert {}...", cert);
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .context("Failed to load IoT Gateway TLS cert/key")?;
+
+        // axum_server binds its own socket; release the plain listener bound above
+        // so the port is free for the TLS acceptor.
+        let addr = listener
+            .local_addr()
+            .context("Failed to read IoT Gateway listener address")?;
+        drop(listener);
+
+        let handle = axum_server::Handle::new();
+        let watcher = handle.clone();
+        tokio::spawn(async move {
+            shutdown_signal.await;
+            watcher.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+
+        axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .context("IoT Gateway HTTPS server failed")
+    } else {
+        info!("🚀 Starting HTTP gateway (plaintext; set IOT_GATEWAY_TLS_CERT/KEY for TLS)...");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .await
+            .context("IoT Gateway HTTP server failed")
+    };
 
     // Clean up gRPC server on shutdown (grpc_server doesn't currently support graceful signal directly in this pattern)
     // In production, we'd wrap this in a tokio task as well.
