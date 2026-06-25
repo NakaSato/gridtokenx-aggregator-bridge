@@ -56,6 +56,47 @@ impl VaultTransitClient {
         Some(Self::new(addr, token, kek_name))
     }
 
+    /// Idempotently ensure the Transit engine + KEK key exist.
+    ///
+    /// The dev Vault is in-memory, so its mounts/keys vanish on restart; calling
+    /// this on bridge startup self-heals the KEK without an external script
+    /// (mirrors how IAM provisions its own Transit key). Both steps tolerate the
+    /// "already exists" responses, so re-running is a no-op. Best-effort: errors
+    /// are returned for the caller to log, not to block boot.
+    pub async fn ensure_kek(&self) -> Result<()> {
+        // 1. Enable the transit secrets engine (ignore "already in use").
+        let mount = self
+            .http
+            .post(format!("{}/v1/sys/mounts/transit", self.addr))
+            .header("X-Vault-Token", &self.token)
+            .json(&serde_json::json!({ "type": "transit" }))
+            .send()
+            .await
+            .context("Vault enable-transit request failed")?;
+        if !mount.status().is_success() {
+            let body = mount.text().await.unwrap_or_default();
+            // 400 "path is already in use" is the idempotent no-op case.
+            if !body.contains("already in use") {
+                tracing::debug!("enable transit returned non-success (continuing): {}", body);
+            }
+        }
+
+        // 2. Create the KEK (transit key creation is idempotent server-side).
+        let key = self
+            .http
+            .post(format!("{}/v1/transit/keys/{}", self.addr, self.kek_name))
+            .header("X-Vault-Token", &self.token)
+            .send()
+            .await
+            .context("Vault create-KEK request failed")?;
+        if !key.status().is_success() {
+            let status = key.status();
+            let body = key.text().await.unwrap_or_default();
+            return Err(anyhow!("Vault create-KEK returned {}: {}", status, body));
+        }
+        Ok(())
+    }
+
     /// Unwrap a `vault:v1:…` ciphertext back to the raw 32-byte AES-256 key.
     pub async fn unwrap(&self, ciphertext: &str) -> Result<[u8; 32]> {
         let url = format!("{}/v1/transit/decrypt/{}", self.addr, self.kek_name);

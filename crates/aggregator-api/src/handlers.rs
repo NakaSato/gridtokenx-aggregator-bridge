@@ -590,6 +590,17 @@ pub async fn ingest_private_network_batch(
     State(state): State<AppState>,
     Json(payload): Json<BatchPrivateNetworkPayload>,
 ) -> impl IntoResponse {
+    // Secure mode: only the encrypted single-frame REST path is permitted. The
+    // batch path carries no per-frame encryption, so reject it wholesale rather
+    // than accept plaintext telemetry in a locked-down deployment.
+    if secure_mode_enabled() {
+        warn!("🚫 Secure mode: rejecting plaintext batch ingest (use the encrypted REST path)");
+        return (
+            StatusCode::UPGRADE_REQUIRED,
+            Json(json!({ "error": "secure mode: encrypted single-frame REST ingest only" })),
+        )
+            .into_response();
+    }
     info!(
         "📥 Received private network batch ingestion: protocol={}",
         payload.protocol

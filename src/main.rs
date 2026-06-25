@@ -588,8 +588,17 @@ async fn main() -> Result<()> {
     // so rotated, KEK-wrapped GUEK versions can be unwrapped. None when Vault is
     // unset — the registry then serves only the legacy unversioned key.
     let meter_vault = infra::vault::VaultTransitClient::from_env();
-    if meter_vault.is_some() {
+    if let Some(v) = meter_vault.as_ref() {
         info!("🔐 Vault Transit enabled for per-meter key rotation (versioned GUEK unwrap)");
+        // Self-heal the KEK on boot (dev Vault is in-memory). Best-effort: a
+        // failure here just means rotation can't unwrap until the key exists, so
+        // log and continue rather than blocking startup.
+        if let Err(e) = v.ensure_kek().await {
+            warn!(
+                "⚠️ Could not ensure Vault meter KEK (rotation unwrap may fail): {}",
+                e
+            );
+        }
     }
     let device_key_registry = Arc::new(
         infra::crypto::DeviceKeyRegistry::new(Some(redis_url.clone())).with_vault(meter_vault),
