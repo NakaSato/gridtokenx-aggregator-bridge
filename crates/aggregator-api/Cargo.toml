@@ -42,6 +42,9 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "v5", "serde"] }
 rust_decimal = { version = "1.36.0", features = ["serde-float", "maths"] }
 hex = "0.4.3"
+# AES-256-GCM decryption of encrypted DLMS payloads (per-meter key) on REST ingest.
+aes-gcm = "0.10"
+base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 

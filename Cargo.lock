@@ -55,6 +55,7 @@ dependencies = [
  "aggregator-stacks",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "buffa",
  "chrono",
  "connectrpc",

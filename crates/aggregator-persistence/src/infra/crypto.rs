@@ -343,7 +343,11 @@ impl DeviceKeyRegistry {
                 self.invalidate().await;
                 let mut conn2 = self.conn().await?;
                 conn2.get::<_, Option<String>>(key).await.map_err(|e2| {
-                    anyhow!("Redis enckey lookup failed for {} after reconnect: {}", key, e2)
+                    anyhow!(
+                        "Redis enckey lookup failed for {} after reconnect: {}",
+                        key,
+                        e2
+                    )
                 })
             }
         }
@@ -386,10 +390,7 @@ impl DeviceKeyRegistry {
     /// single path, a *malformed* key for one meter is logged and yields `None`
     /// for that entry so one bad key cannot fail the whole batch; Redis-unreachable
     /// still fails the whole call loudly.
-    pub async fn get_device_aes_keys(
-        &self,
-        meter_ids: &[String],
-    ) -> Result<Vec<Option<[u8; 32]>>> {
+    pub async fn get_device_aes_keys(&self, meter_ids: &[String]) -> Result<Vec<Option<[u8; 32]>>> {
         let keys: Vec<String> = meter_ids
             .iter()
             .map(|id| format!("gridtokenx:devices:{}:enckey", id))
@@ -413,6 +414,35 @@ impl DeviceKeyRegistry {
         }
         Ok(out)
     }
+
+    /// Atomically check-and-bump a meter's monotonic invocation counter, the
+    /// anti-replay guard for encrypted telemetry. Returns `Ok(true)` when
+    /// `counter` is strictly greater than the last accepted value (and stores it),
+    /// `Ok(false)` when it is a replay (`counter <= last`). The compare-and-set is
+    /// a single Redis Lua script so concurrent ticks for one meter cannot race a
+    /// stale counter through. Redis-unreachable returns a loud `Err` (fail-closed),
+    /// mirroring the key-fetch paths.
+    ///
+    /// Key: `gridtokenx:devices:{meter_id}:ic`.
+    pub async fn check_and_bump_counter(&self, meter_id: &str, counter: i64) -> Result<bool> {
+        let key = format!("gridtokenx:devices:{}:ic", meter_id);
+        // KEYS[1] = ic key, ARGV[1] = incoming counter. Reject (0) when the stored
+        // counter is >= incoming; otherwise store incoming and accept (1).
+        let script = redis::Script::new(
+            r"local cur = redis.call('GET', KEYS[1])
+if cur and tonumber(cur) >= tonumber(ARGV[1]) then return 0 end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1",
+        );
+        let mut conn = self.conn().await?;
+        let accepted: i64 = script
+            .key(&key)
+            .arg(counter)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(|e| anyhow!("IC counter CAS failed for {}: {}", meter_id, e))?;
+        Ok(accepted == 1)
+    }
 }
 
 #[cfg(test)]
@@ -426,7 +456,8 @@ mod tests {
     // A syntactically valid 64-char hex pubkey + base58 sig so the verifier
     // reaches the Redis lookup before any decode error — the lookup is what we
     // exercise here.
-    const DUMMY_SIG_B58: &str = "11111111111111111111111111111111111111111111111111111111111111111111";
+    const DUMMY_SIG_B58: &str =
+        "11111111111111111111111111111111111111111111111111111111111111111111";
 
     /// Security regression guard for the 403-on-all-readings incident: when the
     /// verifier has no way to reach Redis it MUST return a loud `Err`, never a
@@ -437,7 +468,11 @@ mod tests {
         let res = v
             .verify_telemetry_signature("meter-1", b"payload", DUMMY_SIG_B58)
             .await;
-        assert!(res.is_err(), "no-URL verifier must Err, got Ok({:?})", res.ok());
+        assert!(
+            res.is_err(),
+            "no-URL verifier must Err, got Ok({:?})",
+            res.ok()
+        );
     }
 
     /// Same guard for a manager-less verifier built via `from_manager(None)`.
@@ -447,7 +482,11 @@ mod tests {
         let res = v
             .verify_telemetry_signature("meter-1", b"payload", DUMMY_SIG_B58)
             .await;
-        assert!(res.is_err(), "manager-less verifier must Err, got Ok({:?})", res.ok());
+        assert!(
+            res.is_err(),
+            "manager-less verifier must Err, got Ok({:?})",
+            res.ok()
+        );
     }
 
     /// An empty batch must short-circuit to `Ok(vec![])` BEFORE any Redis call —
@@ -459,7 +498,11 @@ mod tests {
     async fn verify_batch_empty_is_ok_without_redis() {
         let v = SignatureVerifier::new(None);
         let res = v.verify_telemetry_signature_batch(&[], &[], &[]).await;
-        assert!(matches!(res.as_deref(), Ok(&[])), "empty batch must be Ok([]), got {:?}", res);
+        assert!(
+            matches!(res.as_deref(), Ok(&[])),
+            "empty batch must be Ok([]), got {:?}",
+            res
+        );
     }
 
     /// Device Ed25519 primitive — the exact checks `verify_telemetry_signature`
@@ -497,7 +540,11 @@ mod tests {
     async fn get_aes_key_errors_loud_when_no_redis_url() {
         let r = DeviceKeyRegistry::new(None);
         let res = r.get_device_aes_key("meter-1").await;
-        assert!(res.is_err(), "no-URL registry must Err, got Ok({:?})", res.ok());
+        assert!(
+            res.is_err(),
+            "no-URL registry must Err, got Ok({:?})",
+            res.ok()
+        );
     }
 
     /// Same guard for the batch path — Redis-unreachable fails the whole call.
@@ -505,7 +552,11 @@ mod tests {
     async fn get_aes_keys_batch_errors_loud_when_no_redis_url() {
         let r = DeviceKeyRegistry::new(None);
         let res = r.get_device_aes_keys(&["meter-1".to_string()]).await;
-        assert!(res.is_err(), "no-URL registry must Err, got Ok({:?})", res.ok());
+        assert!(
+            res.is_err(),
+            "no-URL registry must Err, got Ok({:?})",
+            res.ok()
+        );
     }
 
     /// A present-but-malformed key is a hard `Err` on the single path (never
@@ -599,6 +650,45 @@ mod tests {
         let mut conn = client.get_multiplexed_async_connection().await.unwrap();
         let key = format!("gridtokenx:devices:{}:enckey", meter);
         let _: () = conn.del(&key).await.unwrap();
+    }
+
+    async fn del_ic(url: &str, meter: &str) {
+        let client = redis::Client::open(url).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let key = format!("gridtokenx:devices:{}:ic", meter);
+        let _: () = conn.del(&key).await.unwrap();
+    }
+
+    /// Live Redis: the invocation-counter CAS accepts a strictly-increasing
+    /// sequence and rejects any counter <= the last accepted (replay guard).
+    #[tokio::test]
+    #[ignore = "requires REDIS_URL (default redis://localhost:7010)"]
+    async fn check_and_bump_counter_accepts_increasing_rejects_replay() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:7010".to_string());
+        let r = DeviceKeyRegistry::new(Some(url.clone()));
+        let meter = "__ic_test__";
+        del_ic(&url, meter).await; // clean slate
+
+        // First counter accepted (no prior value).
+        assert!(r.check_and_bump_counter(meter, 100).await.unwrap());
+        // Strictly greater accepted.
+        assert!(r.check_and_bump_counter(meter, 101).await.unwrap());
+        // Equal rejected (replay).
+        assert!(!r.check_and_bump_counter(meter, 101).await.unwrap());
+        // Lower rejected (replay).
+        assert!(!r.check_and_bump_counter(meter, 50).await.unwrap());
+        // Jump ahead accepted.
+        assert!(r.check_and_bump_counter(meter, 200).await.unwrap());
+
+        del_ic(&url, meter).await;
+    }
+
+    /// Fail-closed: no Redis URL ⇒ the CAS errors loudly, never silently accepts.
+    #[tokio::test]
+    async fn check_and_bump_counter_errors_loud_when_no_redis_url() {
+        let r = DeviceKeyRegistry::new(None);
+        assert!(r.check_and_bump_counter("m", 1).await.is_err());
     }
 
     /// Live reconnect check — exercises `get_with_retry` against a real Redis.

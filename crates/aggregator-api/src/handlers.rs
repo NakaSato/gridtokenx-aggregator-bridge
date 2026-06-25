@@ -44,9 +44,10 @@ pub fn signature_enforcement_disabled() -> bool {
 /// kept in the signature for call-site symmetry.
 fn canonical_sign_value(_protocol: &str, payload: &serde_json::Value) -> String {
     fn num(payload: &serde_json::Value, key: &str) -> Option<f64> {
-        payload
-            .get(key)
-            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        payload.get(key).and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
     }
     // DLMS canonical value = consumption in kWh. Plain fields win first (existing
     // clients), then OBIS active import/export — which arrive in Wh, so /1000 to
@@ -82,8 +83,14 @@ fn rest_sign_candidates(
     payload_val: &serde_json::Value,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let mut out = vec![
-        ("", format!("{}:{}:{}", device_id, kwh, timestamp_ms).into_bytes()),
-        ("second-scale", format!("{}:{}:{}", device_id, kwh, timestamp_ms / 1000).into_bytes()),
+        (
+            "",
+            format!("{}:{}:{}", device_id, kwh, timestamp_ms).into_bytes(),
+        ),
+        (
+            "second-scale",
+            format!("{}:{}:{}", device_id, kwh, timestamp_ms / 1000).into_bytes(),
+        ),
     ];
     if let serde_json::Value::Object(map) = payload_val {
         let mut sorted = map.clone();
@@ -113,7 +120,10 @@ async fn verify_rest_signature(
         {
             Ok(true) => {
                 if !label.is_empty() {
-                    info!("✅ Telemetry signature verified (REST, {}) for {}", label, device_id);
+                    info!(
+                        "✅ Telemetry signature verified (REST, {}) for {}",
+                        label, device_id
+                    );
                 }
                 return Ok(true);
             }
@@ -125,10 +135,139 @@ async fn verify_rest_signature(
     Ok(false)
 }
 
+/// Outcome of decrypting an AES-256-GCM `dlms-enc` envelope.
+enum DecryptOutcome {
+    /// Recovered inner OBIS payload (replaces the encrypted envelope).
+    Ok(serde_json::Value),
+    /// Replayed / non-increasing invocation counter — reject (anti-replay).
+    Replay,
+    /// Malformed envelope, missing key, or GCM auth failure — reject.
+    Bad(String),
+}
+
+/// Decrypt a `dlms-enc` envelope (`payload.enc = {counter, nonce, ciphertext}`)
+/// with the meter's per-device AES-256 key, then enforce the monotonic
+/// invocation counter for replay protection.
+///
+/// Order matters: authenticate (GCM, whose AAD binds `device_id:counter`) BEFORE
+/// touching the counter store. A forged frame fails GCM and never advances the
+/// stored counter, so it cannot lock out a meter by bumping the counter past its
+/// legitimate sequence; a replayed *valid* frame authenticates but is then caught
+/// by the `<= last` check. Fail-closed throughout (missing key / Redis error /
+/// auth failure all reject).
+async fn decrypt_dlms_envelope(
+    state: &AppState,
+    device_id: &str,
+    payload: &serde_json::Value,
+) -> DecryptOutcome {
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    let enc = match payload.get("enc") {
+        Some(e) => e,
+        None => return DecryptOutcome::Bad("missing 'enc' envelope".into()),
+    };
+    let counter = match enc.get("counter").and_then(|v| v.as_i64()) {
+        Some(c) => c,
+        None => return DecryptOutcome::Bad("missing/invalid counter".into()),
+    };
+    let nonce_b64 = enc
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let ct_b64 = enc
+        .get("ciphertext")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let nonce_bytes = match STANDARD.decode(nonce_b64) {
+        Ok(b) if b.len() == 12 => b,
+        _ => return DecryptOutcome::Bad("nonce must be 12 bytes base64".into()),
+    };
+    let ct = match STANDARD.decode(ct_b64) {
+        Ok(b) => b,
+        Err(_) => return DecryptOutcome::Bad("ciphertext not base64".into()),
+    };
+
+    // Per-device AES key (fail-closed: absent key or Redis error both reject).
+    let key_bytes = match state
+        .device_key_registry
+        .get_device_aes_key(device_id)
+        .await
+    {
+        Ok(Some(k)) => k,
+        Ok(None) => return DecryptOutcome::Bad(format!("no AES key for {}", device_id)),
+        Err(e) => return DecryptOutcome::Bad(format!("key lookup failed: {}", e)),
+    };
+
+    // Authenticate + decrypt first (AAD binds device_id:counter into the tag).
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let aad = format!("{}:{}", device_id, counter);
+    let plaintext = match cipher.decrypt(
+        Nonce::from_slice(&nonce_bytes),
+        Payload {
+            msg: &ct,
+            aad: aad.as_bytes(),
+        },
+    ) {
+        Ok(p) => p,
+        Err(_) => return DecryptOutcome::Bad("GCM auth/decrypt failed".into()),
+    };
+
+    // Only an authenticated frame advances the replay counter.
+    match state
+        .device_key_registry
+        .check_and_bump_counter(device_id, counter)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return DecryptOutcome::Replay,
+        Err(e) => return DecryptOutcome::Bad(format!("counter check failed: {}", e)),
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+        Ok(v) => DecryptOutcome::Ok(v),
+        Err(e) => DecryptOutcome::Bad(format!("decrypted payload not JSON: {}", e)),
+    }
+}
+
 pub async fn ingest_private_network(
     State(state): State<AppState>,
     Json(payload): Json<PrivateNetworkPayload>,
 ) -> impl IntoResponse {
+    // 0. Decrypt an AES-256-GCM `dlms-enc` envelope up front, so the signature,
+    // kwh and timestamp extraction below all run on the recovered OBIS payload
+    // exactly as for a plaintext `dlms` frame.
+    let mut payload = payload;
+    if payload.protocol.to_lowercase() == "dlms-enc" {
+        match decrypt_dlms_envelope(&state, &payload.device_id, &payload.payload).await {
+            DecryptOutcome::Ok(obis) => {
+                payload.payload = obis;
+                payload.protocol = "dlms".to_string();
+            }
+            DecryptOutcome::Replay => {
+                warn!("🚫 Replayed invocation counter for {}", payload.device_id);
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "replayed invocation counter" })),
+                )
+                    .into_response();
+            }
+            DecryptOutcome::Bad(e) => {
+                warn!(
+                    "🚫 Rejecting encrypted frame for {}: {}",
+                    payload.device_id, e
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("decrypt failed: {}", e) })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // 1. Signature Verification (Ed25519)
     let signature = payload
         .payload
@@ -254,16 +393,34 @@ pub async fn ingest_private_network(
             device_id: payload.device_id.clone(),
             device_type: DeviceType::SmartMeter,
             serial_number: payload.device_id.clone(),
-            zone_code: payload.payload.get("zone_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            zone_code: payload
+                .payload
+                .get("zone_code")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             timestamp: chrono::DateTime::parse_from_rfc3339(timestamp_str)
                 .map(|dt| dt.with_timezone(&chrono::Utc))
                 .unwrap_or_else(|_| gridtokenx_telemetry::time::now()),
             metrics: crate::models::DeviceMetrics::Energy {
-                generated_kwh: payload.payload.get("energy_generated").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                consumed_kwh: payload.payload.get("energy_consumed").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                generated_kwh: payload
+                    .payload
+                    .get("energy_generated")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                consumed_kwh: payload
+                    .payload
+                    .get("energy_consumed")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
                 net_kwh: kwh.parse::<f64>().unwrap_or(0.0),
             },
-            metadata: payload.payload.as_object().cloned().unwrap_or_default().into_iter().collect(),
+            metadata: payload
+                .payload
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         };
         return disseminate_reading(&state, reading, sig_verified).await;
     }
@@ -295,10 +452,16 @@ pub async fn ingest_legacy_batch(
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     info!("📥 Received legacy simulator batch ingestion");
-    
+
     let readings = match payload.get("readings").and_then(|v| v.as_array()) {
         Some(r) => r,
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "Missing readings array"}))).into_response(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Missing readings array"})),
+            )
+                .into_response()
+        }
     };
 
     let mut responses = Vec::new();
@@ -310,10 +473,7 @@ pub async fn ingest_legacy_batch(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let kwh = item
-            .get("kwh")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let kwh = item.get("kwh").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
         let timestamp_str = item.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)
@@ -325,14 +485,28 @@ pub async fn ingest_legacy_batch(
             device_id: device_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: device_id.to_string(),
-            zone_code: item.get("zone_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            zone_code: item
+                .get("zone_code")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             timestamp,
             metrics: crate::models::DeviceMetrics::Energy {
-                generated_kwh: item.get("energy_generated").and_then(|v| v.as_f64()).unwrap_or(kwh),
-                consumed_kwh: item.get("energy_consumed").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                generated_kwh: item
+                    .get("energy_generated")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(kwh),
+                consumed_kwh: item
+                    .get("energy_consumed")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
                 net_kwh: kwh,
             },
-            metadata: item.as_object().cloned().unwrap_or_default().into_iter().collect(),
+            metadata: item
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
         };
 
         let reading_id = reading.reading_id.clone();
@@ -355,7 +529,10 @@ pub async fn ingest_private_network_batch(
     State(state): State<AppState>,
     Json(payload): Json<BatchPrivateNetworkPayload>,
 ) -> impl IntoResponse {
-    info!("📥 Received private network batch ingestion: protocol={}", payload.protocol);
+    info!(
+        "📥 Received private network batch ingestion: protocol={}",
+        payload.protocol
+    );
     let mut responses = Vec::new();
     // DLMS/COSEM is the only meter protocol; `auto`/empty resolve to `dlms`,
     // `simulator` is the unsigned dev bypass.
@@ -441,18 +618,32 @@ pub async fn ingest_private_network_batch(
                 device_id: device_id.to_string(),
                 device_type: DeviceType::SmartMeter,
                 serial_number: device_id.to_string(),
-                zone_code: item.get("zone_code").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                zone_code: item
+                    .get("zone_code")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 timestamp: chrono::DateTime::parse_from_rfc3339(timestamp_str)
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| gridtokenx_telemetry::time::now()),
                 metrics: crate::models::DeviceMetrics::Energy {
-                    generated_kwh: item.get("energy_generated").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                    consumed_kwh: item.get("energy_consumed").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    generated_kwh: item
+                        .get("energy_generated")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
+                    consumed_kwh: item
+                        .get("energy_consumed")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0),
                     net_kwh: kwh.parse::<f64>().unwrap_or(0.0),
                 },
-                metadata: item.as_object().cloned().unwrap_or_default().into_iter().collect(),
+                metadata: item
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
             };
-            
+
             let reading_id = reading.reading_id.clone();
             let device_type = reading.device_type;
             state.router.disseminate(&reading).await.ok();
@@ -526,8 +717,15 @@ mod tests {
         let cands = rest_sign_candidates("M", "10", 1000, &payload);
         let json_bytes = &cands[2].1;
         let parsed: serde_json::Value = serde_json::from_slice(json_bytes).unwrap();
-        assert!(parsed.get("signature").is_none(), "signature must be removed from signed bytes");
-        assert_eq!(parsed.get("kwh"), Some(&json!(10.0)), "other fields preserved");
+        assert!(
+            parsed.get("signature").is_none(),
+            "signature must be removed from signed bytes"
+        );
+        assert_eq!(
+            parsed.get("kwh"),
+            Some(&json!(10.0)),
+            "other fields preserved"
+        );
         assert_eq!(parsed.get("zone_code"), Some(&json!("Z1")));
     }
 
@@ -537,7 +735,11 @@ mod tests {
         // the two string forms are emitted, never a panic.
         let payload = json!([1, 2, 3]);
         let cands = rest_sign_candidates("M", "10", 2000, &payload);
-        assert_eq!(cands.len(), 2, "non-object payload yields only the 2 string forms");
+        assert_eq!(
+            cands.len(),
+            2,
+            "non-object payload yields only the 2 string forms"
+        );
         assert_eq!(cands[0].1, b"M:10:2000");
         assert_eq!(cands[1].1, b"M:10:2");
     }
