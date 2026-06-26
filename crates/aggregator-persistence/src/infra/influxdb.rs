@@ -128,7 +128,10 @@ impl InfluxWriter {
         if let Err(e) = self.tx.try_send(point) {
             // `warn` not `error`: dropping history under overload is degraded,
             // not a failure of the operational (Redis) path.
-            warn!("⚠️ InfluxDB queue full or closed; dropping telemetry point: {}", e);
+            warn!(
+                "⚠️ InfluxDB queue full or closed; dropping telemetry point: {}",
+                e
+            );
         }
     }
 }

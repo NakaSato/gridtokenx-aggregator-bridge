@@ -497,7 +497,10 @@ mod tests {
         field("idempotency_key", b"ik");
         field("reply_subject", b"chain.mint.result.c1");
         field("recipient_wallet", b"Wa11et");
-        field("service_identity", b"spiffe://gridtokenx.th/prod/meter-service");
+        field(
+            "service_identity",
+            b"spiffe://gridtokenx.th/prod/meter-service",
+        );
         field("created_at_ms", &1_700_000_000_000u64.to_le_bytes());
         field("energy_kwh", &7.5f64.to_le_bytes());
         field("meter_id", &[7u8; 16]);

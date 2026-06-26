@@ -1,7 +1,7 @@
+use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use crc32fast::Hasher;
-use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 
 /// Current Protocol Version (UTT-H Security+)
 pub const PROTOCOL_VERSION_V4: u8 = 0x04;
@@ -74,14 +74,23 @@ impl DlmsBinaryFrame {
         let mut cursor = 2;
         let manufacturer_id = String::from_utf8_lossy(&payload[cursor..cursor + 3]).to_string();
         cursor += 3;
-        let logical_device_name =
-            String::from_utf8_lossy(&payload[cursor..cursor + 8]).trim_matches('\0').to_string();
+        let logical_device_name = String::from_utf8_lossy(&payload[cursor..cursor + 8])
+            .trim_matches('\0')
+            .to_string();
         cursor += 8;
         let ts_bytes: [u8; 8] = payload[cursor..cursor + 8].try_into().unwrap();
         let ts_seconds = u64::from_be_bytes(ts_bytes);
-        let timestamp = Utc.timestamp_opt(ts_seconds as i64, 0).single().context("Invalid TS")?;
+        let timestamp = Utc
+            .timestamp_opt(ts_seconds as i64, 0)
+            .single()
+            .context("Invalid TS")?;
 
-        Ok(DlmsHeader { version, manufacturer_id, logical_device_name, timestamp })
+        Ok(DlmsHeader {
+            version,
+            manufacturer_id,
+            logical_device_name,
+            timestamp,
+        })
     }
 
     /// Parses Secure DLMS-lite v4 format
@@ -93,15 +102,19 @@ impl DlmsBinaryFrame {
     /// [Encrypted Block: TLVs... + Auth Tag (16b)]
     /// [Checksum: 4 bytes (CRC-32)]
     ///
-    /// Note: AES-GCM requires a 96-bit (12-byte) nonce. 
+    /// Note: AES-GCM requires a 96-bit (12-byte) nonce.
     /// We derive the nonce from: [Manufacturer (3b)] + [Timestamp (8b)] + [Version (1b)].
     pub fn parse(payload: &[u8], encryption_key: Option<&[u8]>) -> Result<Self> {
         // 1-3. Integrity (CRC-32) + version + plaintext header — validated once by parse_header.
         // parse_header enforces the 25B header floor + total_length bounds; the encrypted path
         // additionally fails GCM auth if the ciphertext region is too short, so no separate
         // "minimum encrypted size" guard is needed (and one would wrongly reject plaintext frames).
-        let DlmsHeader { version, manufacturer_id, logical_device_name, timestamp } =
-            Self::parse_header(payload)?;
+        let DlmsHeader {
+            version,
+            manufacturer_id,
+            logical_device_name,
+            timestamp,
+        } = Self::parse_header(payload)?;
         let total_length = payload[1] as usize;
 
         // Nonce derivation needs the *raw* header bytes (UTF-8-lossy strings can't round-trip).
@@ -114,7 +127,7 @@ impl DlmsBinaryFrame {
         let decrypted_data = if let Some(key_bytes) = encryption_key {
             let key = Key::<Aes256Gcm>::from_slice(key_bytes);
             let cipher = Aes256Gcm::new(key);
-            
+
             // Nonce (12 bytes): Manuf (3) + TS (8) + Version (1)
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes[0..3].copy_from_slice(manuf_bytes);
@@ -122,7 +135,8 @@ impl DlmsBinaryFrame {
             nonce_bytes[11] = version;
             let nonce = Nonce::from_slice(&nonce_bytes);
 
-            cipher.decrypt(nonce, encrypted_data)
+            cipher
+                .decrypt(nonce, encrypted_data)
                 .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?
         } else {
             // If no key provided, assume plaintext (for development/legacy)
@@ -146,19 +160,35 @@ impl DlmsBinaryFrame {
         while tlv_cursor < decrypted_data.len() {
             let tag = decrypted_data[tlv_cursor];
             tlv_cursor += 1;
-            if tlv_cursor >= decrypted_data.len() { break; }
+            if tlv_cursor >= decrypted_data.len() {
+                break;
+            }
             let tag_len = decrypted_data[tlv_cursor] as usize;
             tlv_cursor += 1;
 
-            if tlv_cursor + tag_len > decrypted_data.len() { break; }
+            if tlv_cursor + tag_len > decrypted_data.len() {
+                break;
+            }
             let val = &decrypted_data[tlv_cursor..tlv_cursor + tag_len];
 
             match tag {
-                1 if tag_len == 8 => frame.active_energy_import_wh = Some(u64::from_be_bytes(val.try_into().unwrap())),
-                2 if tag_len == 8 => frame.active_energy_export_wh = Some(u64::from_be_bytes(val.try_into().unwrap())),
-                3 if tag_len == 4 => frame.voltage_cv = Some(u32::from_be_bytes(val.try_into().unwrap())),
-                4 if tag_len == 4 => frame.current_ma = Some(u32::from_be_bytes(val.try_into().unwrap())),
-                5 if tag_len == 4 => frame.battery_soc_bps = Some(u32::from_be_bytes(val.try_into().unwrap())),
+                1 if tag_len == 8 => {
+                    frame.active_energy_import_wh =
+                        Some(u64::from_be_bytes(val.try_into().unwrap()))
+                }
+                2 if tag_len == 8 => {
+                    frame.active_energy_export_wh =
+                        Some(u64::from_be_bytes(val.try_into().unwrap()))
+                }
+                3 if tag_len == 4 => {
+                    frame.voltage_cv = Some(u32::from_be_bytes(val.try_into().unwrap()))
+                }
+                4 if tag_len == 4 => {
+                    frame.current_ma = Some(u32::from_be_bytes(val.try_into().unwrap()))
+                }
+                5 if tag_len == 4 => {
+                    frame.battery_soc_bps = Some(u32::from_be_bytes(val.try_into().unwrap()))
+                }
                 _ => {}
             }
             tlv_cursor += tag_len;
@@ -176,7 +206,9 @@ mod tests {
     fn test_parse_v4_encrypted_frame() {
         let key_bytes = [0u8; 32]; // 256-bit key
         let mut tlv_data = Vec::new();
-        tlv_data.push(1); tlv_data.push(8); tlv_data.extend_from_slice(&5000_u64.to_be_bytes());
+        tlv_data.push(1);
+        tlv_data.push(8);
+        tlv_data.extend_from_slice(&5000_u64.to_be_bytes());
 
         let manuf = b"INC";
         let ts_sec = 1700000000_u64;
@@ -233,7 +265,9 @@ mod tests {
                 nonce_bytes[0..3].copy_from_slice(manuf);
                 nonce_bytes[3..11].copy_from_slice(&ts_bytes);
                 nonce_bytes[11] = PROTOCOL_VERSION_V4;
-                cipher.encrypt(Nonce::from_slice(&nonce_bytes), tlv.as_slice()).unwrap()
+                cipher
+                    .encrypt(Nonce::from_slice(&nonce_bytes), tlv.as_slice())
+                    .unwrap()
             }
             None => tlv,
         };
@@ -341,11 +375,21 @@ mod tests {
     fn parse_decodes_all_tlv_fields() {
         let key = [0u8; 32];
         let mut tlv = Vec::new();
-        tlv.push(1); tlv.push(8); tlv.extend_from_slice(&5000_u64.to_be_bytes()); // import_wh
-        tlv.push(2); tlv.push(8); tlv.extend_from_slice(&1200_u64.to_be_bytes()); // export_wh
-        tlv.push(3); tlv.push(4); tlv.extend_from_slice(&23010_u32.to_be_bytes()); // voltage_cv
-        tlv.push(4); tlv.push(4); tlv.extend_from_slice(&8500_u32.to_be_bytes());  // current_ma
-        tlv.push(5); tlv.push(4); tlv.extend_from_slice(&7600_u32.to_be_bytes());  // battery_soc_bps
+        tlv.push(1);
+        tlv.push(8);
+        tlv.extend_from_slice(&5000_u64.to_be_bytes()); // import_wh
+        tlv.push(2);
+        tlv.push(8);
+        tlv.extend_from_slice(&1200_u64.to_be_bytes()); // export_wh
+        tlv.push(3);
+        tlv.push(4);
+        tlv.extend_from_slice(&23010_u32.to_be_bytes()); // voltage_cv
+        tlv.push(4);
+        tlv.push(4);
+        tlv.extend_from_slice(&8500_u32.to_be_bytes()); // current_ma
+        tlv.push(5);
+        tlv.push(4);
+        tlv.extend_from_slice(&7600_u32.to_be_bytes()); // battery_soc_bps
         let payload = frame_from_tlv(Some(&key), "METER042", tlv);
 
         let f = DlmsBinaryFrame::parse(&payload, Some(&key)).unwrap();

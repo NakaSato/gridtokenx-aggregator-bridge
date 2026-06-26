@@ -111,26 +111,38 @@ impl ZoneEventIngester {
     }
 
     async fn create_connection_manager(client: &Client) -> Result<ConnectionManager> {
-        use tokio::time::{sleep, Duration, timeout};
+        use tokio::time::{sleep, timeout, Duration};
         for attempt in 1..=5 {
-            match timeout(Duration::from_secs(2), ConnectionManager::new(client.clone())).await {
+            match timeout(
+                Duration::from_secs(2),
+                ConnectionManager::new(client.clone()),
+            )
+            .await
+            {
                 Ok(Ok(cm)) => {
                     info!("✅ Redis connection manager created for zone ingester");
                     return Ok(cm);
                 }
                 Ok(Err(e)) => {
-                    warn!("⚠️ Redis connection attempt {} failed: {}. Retrying...", attempt, e);
+                    warn!(
+                        "⚠️ Redis connection attempt {} failed: {}. Retrying...",
+                        attempt, e
+                    );
                     sleep(Duration::from_secs(1)).await;
                 }
                 Err(_) => {
-                    warn!("⚠️ Redis connection attempt {} timed out. Retrying...", attempt);
+                    warn!(
+                        "⚠️ Redis connection attempt {} timed out. Retrying...",
+                        attempt
+                    );
                     sleep(Duration::from_secs(1)).await;
                 }
             }
         }
-        Err(anyhow::anyhow!("Failed to connect to Redis after 5 attempts"))
+        Err(anyhow::anyhow!(
+            "Failed to connect to Redis after 5 attempts"
+        ))
     }
-
 
     /// Determine which zone stream a reading should go to
     #[allow(dead_code)]
@@ -554,9 +566,10 @@ impl ZoneEventIngester {
 
     async fn ack_entry(&self, stream_name: &str, entry_id: &str) -> Result<()> {
         let mut conn = self.connection_manager.clone();
-        let _: () = redis::AsyncCommands::xack(&mut conn, stream_name, &self.group_name, &[entry_id])
-            .await
-            .context("Failed to ACK message in Redis stream")?;
+        let _: () =
+            redis::AsyncCommands::xack(&mut conn, stream_name, &self.group_name, &[entry_id])
+                .await
+                .context("Failed to ACK message in Redis stream")?;
 
         Ok(())
     }
@@ -565,7 +578,9 @@ impl ZoneEventIngester {
 /// Pull a grid-frequency sample (Hz) out of reading metadata. Accepts both the
 /// REST/simulator key (`frequency`) and the explicit-unit variant
 /// (`frequency_hz`), as number or numeric string.
-fn extract_frequency(metadata: &std::collections::HashMap<String, serde_json::Value>) -> Option<f64> {
+fn extract_frequency(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<f64> {
     ["frequency", "frequency_hz"]
         .iter()
         .find_map(|key| metadata.get(*key))

@@ -64,14 +64,14 @@ mod tests {
             meter_serial: "SN-1".to_string(),
             start_time: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             end_time: Utc.timestamp_opt(1_700_000_900, 0).unwrap(),
-            energy_generated: Decimal::new(15, 1),  // 1.5
-            energy_consumed: Decimal::new(40, 1),   // 4.0
+            energy_generated: Decimal::new(15, 1), // 1.5
+            energy_consumed: Decimal::new(40, 1),  // 4.0
             reading_count: 3,
-            energy_generated_peak: Decimal::new(10, 1),    // 1.0
-            energy_generated_offpeak: Decimal::new(5, 1),  // 0.5
-            energy_consumed_peak: Decimal::new(25, 1),     // 2.5
-            energy_consumed_offpeak: Decimal::new(15, 1),  // 1.5
-            max_demand_kw: Decimal::new(24, 1),            // 2.4
+            energy_generated_peak: Decimal::new(10, 1), // 1.0
+            energy_generated_offpeak: Decimal::new(5, 1), // 0.5
+            energy_consumed_peak: Decimal::new(25, 1),  // 2.5
+            energy_consumed_offpeak: Decimal::new(15, 1), // 1.5
+            max_demand_kw: Decimal::new(24, 1),         // 2.4
         }
     }
 

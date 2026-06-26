@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rdkafka::{
-    consumer::{StreamConsumer, Consumer},
-    message::{OwnedHeaders, Message},
+    consumer::{Consumer, StreamConsumer},
+    message::{Message, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
     ClientConfig,
 };

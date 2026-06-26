@@ -227,7 +227,12 @@ mod tests {
     fn adapters(names: &[&str]) -> std::collections::HashMap<String, Arc<dyn DispatchAdapter>> {
         names
             .iter()
-            .map(|n| (n.to_string(), Arc::new(NoopAdapter) as Arc<dyn DispatchAdapter>))
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Arc::new(NoopAdapter) as Arc<dyn DispatchAdapter>,
+                )
+            })
             .collect()
     }
 
@@ -285,12 +290,21 @@ mod tests {
 
         // FLEX_UP fires, then frequency flips: FLEX_DOWN still allowed.
         last.push((DispatchType::FLEX_UP, std::time::Instant::now()));
-        assert!(cooldown_allows(lookup(&last, DispatchType::FLEX_DOWN), cooldown));
+        assert!(cooldown_allows(
+            lookup(&last, DispatchType::FLEX_DOWN),
+            cooldown
+        ));
 
         // FLEX_DOWN fires too; now flipping BACK to FLEX_UP is suppressed —
         // its own timer is still hot.
         last.push((DispatchType::FLEX_DOWN, std::time::Instant::now()));
-        assert!(!cooldown_allows(lookup(&last, DispatchType::FLEX_UP), cooldown));
-        assert!(!cooldown_allows(lookup(&last, DispatchType::FLEX_DOWN), cooldown));
+        assert!(!cooldown_allows(
+            lookup(&last, DispatchType::FLEX_UP),
+            cooldown
+        ));
+        assert!(!cooldown_allows(
+            lookup(&last, DispatchType::FLEX_DOWN),
+            cooldown
+        ));
     }
 }

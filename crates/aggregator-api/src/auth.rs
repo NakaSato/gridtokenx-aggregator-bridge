@@ -186,7 +186,10 @@ mod tests {
         assert!(!cache_hit(key), "expired entry must miss");
         // And the lookup must have removed it (no unbounded growth of stale keys).
         let cache = api_key_cache().lock().expect("cache lock");
-        assert!(!cache.contains_key(key), "expired entry must be evicted on lookup");
+        assert!(
+            !cache.contains_key(key),
+            "expired entry must be evicted on lookup"
+        );
     }
 
     #[test]

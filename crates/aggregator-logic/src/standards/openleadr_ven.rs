@@ -155,8 +155,7 @@ impl OpenLeadrVenListener {
         let credentials = credentials.map(|(id, secret)| ClientCredentials::new(id, secret));
         let program_id = program_id
             .map(|id| {
-                ProgramId::new(&id)
-                    .ok_or_else(|| anyhow!("invalid OPENLEADR_VEN_PROGRAM_ID: {id}"))
+                ProgramId::new(&id).ok_or_else(|| anyhow!("invalid OPENLEADR_VEN_PROGRAM_ID: {id}"))
             })
             .transpose()?;
         let target = target
@@ -479,7 +478,8 @@ impl RedisSeenStore {
 
     async fn load(&mut self) -> Result<HashMap<String, DateTime<Utc>>> {
         let mut conn = self.conn().await?;
-        let raw: HashMap<String, String> = redis::AsyncCommands::hgetall(&mut conn, SEEN_KEY).await?;
+        let raw: HashMap<String, String> =
+            redis::AsyncCommands::hgetall(&mut conn, SEEN_KEY).await?;
         Ok(raw
             .into_iter()
             .filter_map(|(id, ts)| {
@@ -532,9 +532,7 @@ fn find_setpoints(event: &EventRequest) -> Vec<(i32, f64, Option<&IntervalPeriod
                     return None;
                 }
                 payload.values.iter().find_map(|v| match v {
-                    Value::Number(n) => {
-                        Some((interval.id, *n, interval.interval_period.as_ref()))
-                    }
+                    Value::Number(n) => Some((interval.id, *n, interval.interval_period.as_ref())),
                     _ => None,
                 })
             })
@@ -600,15 +598,15 @@ fn active_window_end(event: &EventRequest, now: DateTime<Utc>) -> DateTime<Utc> 
     let fallback = now + chrono::Duration::hours(24);
     find_setpoints(event)
         .iter()
-        .map(|(_, _, interval_period)| {
-            match interval_period.or(event.interval_period.as_ref()) {
+        .map(
+            |(_, _, interval_period)| match interval_period.or(event.interval_period.as_ref()) {
                 Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
                     Some(d) => p.start + d.to_chrono_at_datetime(p.start),
                     None => fallback,
                 },
                 None => fallback,
-            }
-        })
+            },
+        )
         .max()
         .unwrap_or(fallback)
 }
@@ -661,10 +659,10 @@ mod tests {
     }
 
     fn setpoint_event(start_offset_mins: i64, duration_hours: f32) -> EventRequest {
-        let mut event =
-            event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
-        let mut period =
-            IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins));
+        let mut event = event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
+        let mut period = IntervalPeriod::new(
+            gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins),
+        );
         period.duration = Some(WireDuration::hours(duration_hours));
         event.interval_period = Some(period);
         event
@@ -688,10 +686,7 @@ mod tests {
     #[test]
     fn setpoint_sign_maps_to_action() {
         assert_eq!(setpoint_to_dispatch(75.0), (DispatchType::FLEX_UP, 75.0));
-        assert_eq!(
-            setpoint_to_dispatch(-30.5),
-            (DispatchType::FLEX_DOWN, 30.5)
-        );
+        assert_eq!(setpoint_to_dispatch(-30.5), (DispatchType::FLEX_DOWN, 30.5));
         assert_eq!(setpoint_to_dispatch(0.0), (DispatchType::FLEX_UP, 0.0));
     }
 
@@ -701,8 +696,7 @@ mod tests {
 
     #[test]
     fn unscheduled_event_executes_immediately() {
-        let event =
-            event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
+        let event = event_with_payload(EventType::DispatchSetpoint, vec![Value::Number(42.0)]);
         assert_eq!(
             decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::Execute {
@@ -750,7 +744,8 @@ mod tests {
     fn interval_period_wins_over_event_period() {
         // Event-level period says active; interval-level says future.
         let mut event = setpoint_event(-10, 1.0);
-        let future = IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(30));
+        let future =
+            IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(30));
         event.intervals.as_mut().unwrap()[0].interval_period = Some(future);
         assert_eq!(
             decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
@@ -782,8 +777,9 @@ mod tests {
     #[test]
     fn multi_interval_schedule_executes_each_window() {
         fn interval(id: i32, setpoint: f64, start_offset_mins: i64) -> EventInterval {
-            let mut period =
-                IntervalPeriod::new(gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins));
+            let mut period = IntervalPeriod::new(
+                gridtokenx_telemetry::time::now() + chrono::Duration::minutes(start_offset_mins),
+            );
             period.duration = Some(WireDuration::hours(1.0));
             EventInterval {
                 id,

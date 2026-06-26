@@ -1,11 +1,11 @@
-use anyhow::{Result, anyhow};
-use connectrpc::client::{HttpClient as Client, ClientConfig};
-use http::Uri;
-use async_trait::async_trait;
 use crate::dispatch::DispatchAdapter;
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use connectrpc::client::{ClientConfig, HttpClient as Client};
+use http::Uri;
 
 // Generated code now lives in the aggregator-protocol crate.
-pub use aggregator_protocol::dispatch::{FlexCommand, DispatchType, DispatchControllerClient};
+pub use aggregator_protocol::dispatch::{DispatchControllerClient, DispatchType, FlexCommand};
 use buffa::EnumValue;
 
 pub struct DispatchClient {
@@ -38,7 +38,9 @@ impl DispatchAdapter for DispatchClient {
                 }
                 Err(e) => {
                     retries -= 1;
-                    if retries == 0 { return Err(anyhow!("gRPC error: {}", e)); }
+                    if retries == 0 {
+                        return Err(anyhow!("gRPC error: {}", e));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
             }

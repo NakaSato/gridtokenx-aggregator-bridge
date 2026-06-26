@@ -70,11 +70,19 @@ impl AggregatorServiceImpl {
             crate::handlers::secure_mode_enabled(),
         );
 
-        let key = match self.state.device_key_registry.get_device_aes_key(meter_id).await {
+        let key = match self
+            .state
+            .device_key_registry
+            .get_device_aes_key(meter_id)
+            .await
+        {
             Ok(k) => k,
             Err(e) => {
                 // Fail-closed-loud: key store unreachable / key malformed — never decode unverified.
-                error!("🚫 DLMS key fetch failed for meter={}: {} — frame skipped", meter_id, e);
+                error!(
+                    "🚫 DLMS key fetch failed for meter={}: {} — frame skipped",
+                    meter_id, e
+                );
                 return None;
             }
         };
@@ -106,7 +114,10 @@ fn apply_dlms_key_policy(
         Some(k) => match DlmsBinaryFrame::parse(frame_bytes, Some(&k)) {
             Ok(f) => Some(f),
             Err(e) => {
-                warn!("🚫 DLMS decrypt failed for meter={}: {} — frame skipped", meter_id, e);
+                warn!(
+                    "🚫 DLMS decrypt failed for meter={}: {} — frame skipped",
+                    meter_id, e
+                );
                 None
             }
         },
@@ -126,7 +137,10 @@ fn apply_dlms_key_policy(
                 Some(f)
             }
             Err(e) => {
-                warn!("⚠️ DLMS plaintext parse failed for meter={}: {}", meter_id, e);
+                warn!(
+                    "⚠️ DLMS plaintext parse failed for meter={}: {}",
+                    meter_id, e
+                );
                 None
             }
         },
@@ -190,12 +204,12 @@ impl OracleService for AggregatorServiceImpl {
             // Resolve per-device key, decrypt, parse (prod/dev policy in decode_secure_frame).
             if let Some(frame) = self.decode_secure_frame(frame_bytes).await {
                 let meter_id = frame.logical_device_name.clone();
-                
-                // Note: We need the canonical string for signature verification, 
+
+                // Note: We need the canonical string for signature verification,
                 // but the current version simply verifies against the binary payload
                 // if the canonical string fails (as seen in ingest()).
                 // For bulk, we'll verify against the binary payload for speed.
-                
+
                 meter_ids.push(meter_id);
                 payloads_for_sig.push(frame_bytes.to_vec());
                 signatures.push(sig_bytes);
@@ -216,23 +230,29 @@ impl OracleService for AggregatorServiceImpl {
             );
             vec![true; meter_ids.len()]
         } else {
-            self.state.signature_verifier
+            self.state
+                .signature_verifier
                 .verify_telemetry_signature_batch(&meter_ids, &payloads_for_sig, &signatures)
                 .await
-                .map_err(|e| ConnectError::internal(format!("Batch signature verification failed: {}", e)))?
+                .map_err(|e| {
+                    ConnectError::internal(format!("Batch signature verification failed: {}", e))
+                })?
         };
 
         // 3. Process Verified Frames
         for (i, is_verified) in verification_results.into_iter().enumerate() {
             if !is_verified {
-                warn!("🚫 Bulk ingest: Invalid signature for meter={}", meter_ids[i]);
+                warn!(
+                    "🚫 Bulk ingest: Invalid signature for meter={}",
+                    meter_ids[i]
+                );
                 continue;
             }
 
             let frame = &frames[i];
             let generated_kwh = frame.active_energy_export_wh.unwrap_or(0) as f64 / 1000.0;
             let consumed_kwh = frame.active_energy_import_wh.unwrap_or(0) as f64 / 1000.0;
-            
+
             let mut metadata = HashMap::new();
             if let Some(cv) = frame.voltage_cv {
                 metadata.insert("voltage_v".to_string(), json!((cv as f64) / 100.0));
@@ -243,7 +263,10 @@ impl OracleService for AggregatorServiceImpl {
             if let Some(bps) = frame.battery_soc_bps {
                 metadata.insert("battery_level_pct".to_string(), json!((bps as f64) / 100.0));
             }
-            metadata.insert("dlms_manufacturer_id".to_string(), json!(frame.manufacturer_id));
+            metadata.insert(
+                "dlms_manufacturer_id".to_string(),
+                json!(frame.manufacturer_id),
+            );
             metadata.insert("ingest_mode".to_string(), json!("bulk_raw"));
 
             let reading = DeviceReading {
@@ -294,7 +317,7 @@ impl OracleService for AggregatorServiceImpl {
             // Reconstruct canonical target with sequence/ms support (UTT-H Protocol)
             // Note: In a real deployment, sequence would be tracked in Redis to prevent reuse.
             let sign_target = format!("{}:{}:{}", request.meter_id, request.kwh, request.timestamp);
-            
+
             let is_verified = match self
                 .state
                 .signature_verifier
@@ -305,9 +328,21 @@ impl OracleService for AggregatorServiceImpl {
                 _ => {
                     // Fallback to binary payload verification (which now includes CRC-32 and Versioning)
                     if !request.raw_payload.is_empty() {
-                        match self.state.signature_verifier.verify_telemetry_signature(&request.meter_id, &request.raw_payload, signature).await {
+                        match self
+                            .state
+                            .signature_verifier
+                            .verify_telemetry_signature(
+                                &request.meter_id,
+                                &request.raw_payload,
+                                signature,
+                            )
+                            .await
+                        {
                             Ok(true) => {
-                                info!("✅ UTT-H signature verified against binary payload for {}", request.meter_id);
+                                info!(
+                                    "✅ UTT-H signature verified against binary payload for {}",
+                                    request.meter_id
+                                );
                                 true
                             }
                             _ => false,
@@ -319,12 +354,20 @@ impl OracleService for AggregatorServiceImpl {
             };
 
             if !is_verified {
-                error!("🚫 UTT-H Integrity check failed for meter {}", request.meter_id);
-                return Err(ConnectError::permission_denied("UTT-H Signature Verification Failed"));
+                error!(
+                    "🚫 UTT-H Integrity check failed for meter {}",
+                    request.meter_id
+                );
+                return Err(ConnectError::permission_denied(
+                    "UTT-H Signature Verification Failed",
+                ));
             }
             true
         } else {
-            warn!("⚠️ Received unsigned telemetry from meter={}", request.meter_id);
+            warn!(
+                "⚠️ Received unsigned telemetry from meter={}",
+                request.meter_id
+            );
             if !crate::handlers::signature_enforcement_disabled() {
                 return Err(ConnectError::invalid_argument("Signature required"));
             }
@@ -368,9 +411,13 @@ impl OracleService for AggregatorServiceImpl {
                         metadata.insert("current_a".to_string(), json!((ma as f64) / 1000.0));
                     }
                     if let Some(bps) = frame.battery_soc_bps {
-                        metadata.insert("battery_level_pct".to_string(), json!((bps as f64) / 100.0));
+                        metadata
+                            .insert("battery_level_pct".to_string(), json!((bps as f64) / 100.0));
                     }
-                    metadata.insert("dlms_manufacturer_id".to_string(), json!(frame.manufacturer_id));
+                    metadata.insert(
+                        "dlms_manufacturer_id".to_string(),
+                        json!(frame.manufacturer_id),
+                    );
                 }
                 // Frame skipped (decode_secure_frame already logged why) — fall back to standard fields.
                 None => {}
@@ -378,7 +425,10 @@ impl OracleService for AggregatorServiceImpl {
         }
 
         let reading = DeviceReading {
-            reading_id: request.reading_id.parse().unwrap_or_else(|_| Uuid::new_v4()),
+            reading_id: request
+                .reading_id
+                .parse()
+                .unwrap_or_else(|_| Uuid::new_v4()),
             device_id: request.meter_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: request.meter_serial.to_string(),
@@ -449,17 +499,35 @@ impl OracleService for AggregatorServiceImpl {
                 false
             };
 
-            let mut generated_kwh = tel.energy_generated.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let mut consumed_kwh = tel.energy_consumed.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let mut timestamp = Utc.timestamp_opt(tel.timestamp, 0).single().unwrap_or_else(|| gridtokenx_telemetry::time::now());
+            let mut generated_kwh = tel
+                .energy_generated
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let mut consumed_kwh = tel
+                .energy_consumed
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            let mut timestamp = Utc
+                .timestamp_opt(tel.timestamp, 0)
+                .single()
+                .unwrap_or_else(|| gridtokenx_telemetry::time::now());
             let mut metadata = HashMap::new();
 
             if !tel.raw_payload.is_empty() {
                 if let Some(frame) = self.decode_secure_frame(&tel.raw_payload).await {
                     timestamp = frame.timestamp;
-                    if let Some(wh) = frame.active_energy_export_wh { generated_kwh = (wh as f64) / 1000.0; }
-                    if let Some(wh) = frame.active_energy_import_wh { consumed_kwh = (wh as f64) / 1000.0; }
-                    metadata.insert("dlms_manufacturer_id".to_string(), json!(frame.manufacturer_id));
+                    if let Some(wh) = frame.active_energy_export_wh {
+                        generated_kwh = (wh as f64) / 1000.0;
+                    }
+                    if let Some(wh) = frame.active_energy_import_wh {
+                        consumed_kwh = (wh as f64) / 1000.0;
+                    }
+                    metadata.insert(
+                        "dlms_manufacturer_id".to_string(),
+                        json!(frame.manufacturer_id),
+                    );
                 }
             }
 
@@ -490,7 +558,12 @@ impl OracleService for AggregatorServiceImpl {
         Ok((
             MeterReadingBatchResponse {
                 receipt_ids,
-                status: if rejected_count == 0 { "all_accepted" } else { "partially_accepted" }.to_string(),
+                status: if rejected_count == 0 {
+                    "all_accepted"
+                } else {
+                    "partially_accepted"
+                }
+                .to_string(),
                 accepted_count,
                 rejected_count,
                 ..Default::default()
@@ -527,7 +600,9 @@ mod tests {
                 nonce[0..3].copy_from_slice(manuf);
                 nonce[3..11].copy_from_slice(&ts_bytes);
                 nonce[11] = V4;
-                cipher.encrypt(Nonce::from_slice(&nonce), tlv.as_slice()).unwrap()
+                cipher
+                    .encrypt(Nonce::from_slice(&nonce), tlv.as_slice())
+                    .unwrap()
             }
             None => tlv,
         };

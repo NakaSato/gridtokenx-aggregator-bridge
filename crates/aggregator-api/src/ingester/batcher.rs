@@ -6,8 +6,8 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
-use crate::infra::platform::{MeterReading, PlatformClient};
 use crate::infra::platform::client::MeterReadingBatchResponse;
+use crate::infra::platform::{MeterReading, PlatformClient};
 
 /// Batch size for forwarding to API Gateway
 pub const FORWARD_BATCH_SIZE: usize = 50;
