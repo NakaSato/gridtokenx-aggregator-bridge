@@ -54,6 +54,17 @@ ZK-rollup "Path B" was removed).
   ingest (`crates/aggregator-api/src/handlers.rs:180`) and per-item in batch
   ingest (`crates/aggregator-api/src/handlers.rs:361`); both dispatch to the lone
   `dlms_stack` (`crates/aggregator-api/src/handlers.rs:270`).
+- **Secure mode (locked-down deployments).** `AGGREGATOR_REQUIRE_SECURE=true`
+  (`secure_mode_enabled`, `crates/aggregator-api/src/handlers.rs`) hard-overrides
+  every ingest bypass, fail-closed regardless of the dev env vars: the REST
+  unverified-telemetry hatch (`signature_enforcement_disabled`) and the unsigned
+  `simulator` bypass (`simulator_bypass_allowed`) on REST single + batch are both
+  forced off, the REST meter path requires an authenticated `dlms-enc` frame
+  (non-encrypted ⇒ `426 UPGRADE_REQUIRED`), and on gRPC the `SKIP_SIG_VERIFY` bulk
+  bypass (`bulk_skip_verify_allowed`) and `ALLOW_PLAINTEXT_DLMS` fallback
+  (`plaintext_dlms_allowed`) are forced off
+  (`crates/aggregator-api/src/grpc/service.rs`). Default off so dev/e2e keep their
+  bypasses.
 - **Dissemination (self-healing).** Verified readings fan out to
   zone-partitioned Redis Streams; the publisher rebuilds its connection and
   retries the `XADD` once on transport error (`Router::disseminate`, verified

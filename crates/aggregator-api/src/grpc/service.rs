@@ -64,7 +64,11 @@ impl AggregatorServiceImpl {
         let meter_id = header.logical_device_name.as_str();
 
         let is_production = std::env::var("ENVIRONMENT").unwrap_or_default() == "production";
-        let allow_plaintext = std::env::var("ALLOW_PLAINTEXT_DLMS").unwrap_or_default() == "true";
+        // Secure mode hard-overrides the dev plaintext fallback (see `plaintext_dlms_allowed`).
+        let allow_plaintext = plaintext_dlms_allowed(
+            std::env::var("ALLOW_PLAINTEXT_DLMS").unwrap_or_default() == "true",
+            crate::handlers::secure_mode_enabled(),
+        );
 
         let key = match self.state.device_key_registry.get_device_aes_key(meter_id).await {
             Ok(k) => k,
@@ -136,6 +140,21 @@ fn apply_dlms_key_policy(
     }
 }
 
+/// Effective plaintext-DLMS permission, given the `ALLOW_PLAINTEXT_DLMS` env flag and
+/// secure mode. Secure mode hard-overrides the flag off — an unkeyed frame is skipped
+/// (fail-closed), exactly as under `ENVIRONMENT=production`. Pure so the secure-mode
+/// override is unit-testable without AppState/env.
+fn plaintext_dlms_allowed(allow_plaintext_env: bool, secure_mode: bool) -> bool {
+    !secure_mode && allow_plaintext_env
+}
+
+/// Effective bulk skip-verify permission, given the `SKIP_SIG_VERIFY` env flag and
+/// secure mode. Secure mode hard-overrides the flag off so every bulk frame is
+/// verified in a locked-down deployment. Pure so the override is unit-testable.
+fn bulk_skip_verify_allowed(skip_verify_env: bool, secure_mode: bool) -> bool {
+    !secure_mode && skip_verify_env
+}
+
 // Unified Ingestion Pattern: Both Path A and Path B handled through single verified entry
 impl OracleService for AggregatorServiceImpl {
     /// Bulk Raw Ingestion: Optimized for high-throughput simulators.
@@ -185,7 +204,11 @@ impl OracleService for AggregatorServiceImpl {
         }
 
         // 2. Batch Signature Verification
-        let skip_verify = std::env::var("SKIP_SIG_VERIFY").unwrap_or_default() == "true";
+        // Secure mode hard-overrides the SKIP_SIG_VERIFY bulk bypass (see `bulk_skip_verify_allowed`).
+        let skip_verify = bulk_skip_verify_allowed(
+            std::env::var("SKIP_SIG_VERIFY").unwrap_or_default() == "true",
+            crate::handlers::secure_mode_enabled(),
+        );
         let verification_results = if skip_verify {
             warn!(
                 "⚠️ SKIP_SIG_VERIFY=true — bypassing Ed25519 verification for {} bulk frame(s); telemetry accepted UNVERIFIED (dev only)",
@@ -586,5 +609,23 @@ mod tests {
         let frame = build_frame(None, METER);
         let out = apply_dlms_key_policy(&frame, METER, None, true, true);
         assert!(out.is_none());
+    }
+
+    // --- secure-mode hard-override of the gRPC bypasses ---
+
+    #[test]
+    fn secure_mode_forces_plaintext_dlms_off() {
+        // Dev flag on but secure mode forces it off (fail-closed); off only via env when not secure.
+        assert!(!plaintext_dlms_allowed(true, true));
+        assert!(plaintext_dlms_allowed(true, false));
+        assert!(!plaintext_dlms_allowed(false, false));
+    }
+
+    #[test]
+    fn secure_mode_forces_bulk_verify_on() {
+        // SKIP_SIG_VERIFY honored only outside secure mode; secure mode always verifies.
+        assert!(!bulk_skip_verify_allowed(true, true));
+        assert!(bulk_skip_verify_allowed(true, false));
+        assert!(!bulk_skip_verify_allowed(false, false));
     }
 }
