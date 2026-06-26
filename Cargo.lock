@@ -127,6 +127,7 @@ dependencies = [
 name = "aggregator-persistence"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "aggregator-protocol",
  "anyhow",
  "async-nats",
@@ -136,6 +137,7 @@ dependencies = [
  "connectrpc",
  "ed25519-dalek",
  "futures",
+ "getrandom 0.2.17",
  "gridtokenx-telemetry",
  "hex",
  "http 1.4.0",

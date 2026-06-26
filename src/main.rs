@@ -218,6 +218,33 @@ async fn main() -> Result<()> {
         ))
     });
 
+    // At-rest stream encryption: bootstrap the fleet-wide SEK (Vault-KEK-wrapped,
+    // Redis-persisted, stable across restarts) when AGGREGATOR_ENCRYPT_STREAMS is
+    // set. Shared by the disseminator (encrypt) and the zone ingester (decrypt).
+    // Fail-closed: if encryption is requested but Vault/Redis is unavailable, bail
+    // rather than silently fall back to writing plaintext.
+    let stream_cipher: Option<Arc<infra::stream_cipher::StreamCipher>> =
+        if std::env::var("AGGREGATOR_ENCRYPT_STREAMS").unwrap_or_default() == "true" {
+            match (
+                infra::vault::VaultTransitClient::from_env(),
+                early_redis_conn.clone(),
+            ) {
+                (Some(vault), Some(mut conn)) => {
+                    let cipher =
+                        infra::stream_cipher::load_or_create_stream_cipher(&vault, &mut conn)
+                            .await
+                            .context("Failed to bootstrap stream encryption key (SEK)")?;
+                    info!("🔐 At-rest stream encryption ENABLED (SEK bootstrapped)");
+                    Some(Arc::new(cipher))
+                }
+                _ => anyhow::bail!(
+                    "AGGREGATOR_ENCRYPT_STREAMS=true but Vault (VAULT_ADDR) or Redis is unavailable"
+                ),
+            }
+        } else {
+            None
+        };
+
     let zone_ingester = match ingester::zone_ingester::ZoneEventIngester::new(
         &redis_url,
         &api_services_grpc_url,
@@ -226,6 +253,7 @@ async fn main() -> Result<()> {
         num_zones,
         meter_registry.clone(),
         frequency_monitor.clone(),
+        stream_cipher.clone(),
     )
     .await
     {
@@ -275,7 +303,8 @@ async fn main() -> Result<()> {
     let iot_router = Arc::new(
         router::Router::new(&redis_url, num_zones, influx_writer)
             .await
-            .context("Failed to initialize IoT router")?,
+            .context("Failed to initialize IoT router")?
+            .with_stream_cipher(stream_cipher.clone()),
     );
 
     // Chain Bridge mint gateway for surplus settlement. Degrades to Disabled when

@@ -48,6 +48,9 @@ hex = "0.4.3"
 # scheme locally so the aggregator stays chain-light (no blockchain-core dep).
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 base64 = "0.22"
+# AES-256-GCM for at-rest encryption of Redis stream payloads (StreamCipher).
+aes-gcm = "0.10"
+getrandom = "0.2"
 
 # Utils
 anyhow = "1.0"

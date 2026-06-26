@@ -44,9 +44,13 @@ pub struct ZoneEventIngester {
     /// Rolling grid-frequency window fed from reading metadata. None ⇒ no
     /// frequency-driven dispatch (e.g. Kafka disabled).
     frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
+    /// At-rest stream encryption. When set, stream entries arrive as an `enc`
+    /// envelope that is AES-256-GCM decrypted back to the reading before decode.
+    stream_cipher: Option<Arc<crate::infra::stream_cipher::StreamCipher>>,
 }
 
 impl ZoneEventIngester {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         redis_url: &str,
         api_services_url: &str,
@@ -55,6 +59,7 @@ impl ZoneEventIngester {
         num_zones: usize,
         meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
         frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
+        stream_cipher: Option<Arc<crate::infra::stream_cipher::StreamCipher>>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let connection_manager = Self::create_connection_manager(&client).await?;
@@ -107,7 +112,46 @@ impl ZoneEventIngester {
             num_zones,
             meter_registry,
             frequency_monitor,
+            stream_cipher,
         })
+    }
+
+    /// Resolve a raw stream entry to the plaintext `{event_type, payload}` JSON
+    /// the [`Event`](crate::ingester::Event) decoder expects.
+    ///
+    /// Encrypted entries arrive as `{event_type, enc:{nonce, ciphertext}}`; with
+    /// a cipher configured they are AES-256-GCM decrypted (AAD = event_type) and
+    /// rebuilt as `{event_type, payload}`. Plaintext entries (no `enc`, or no
+    /// cipher) pass through unchanged — so a flag flip and the maxlen window of
+    /// mixed entries both decode. Returns `None` (skip) on a malformed or
+    /// undecryptable entry.
+    fn decode_entry(&self, raw: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let enc = match value.get("enc") {
+            Some(enc) => enc,
+            None => return Some(raw.to_string()), // plaintext passthrough
+        };
+        let cipher = self.stream_cipher.as_ref()?; // enc present but no key ⇒ skip
+        let event_type = value
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let nonce = enc.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+        let ct = enc.get("ciphertext").and_then(|v| v.as_str()).unwrap_or("");
+        match cipher.decrypt(nonce, ct, event_type.as_bytes()) {
+            Ok(plaintext) => {
+                let payload: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
+                serde_json::to_string(&serde_json::json!({
+                    "event_type": event_type,
+                    "payload": payload,
+                }))
+                .ok()
+            }
+            Err(e) => {
+                warn!("🚫 Skipping undecryptable stream entry: {}", e);
+                None
+            }
+        }
     }
 
     async fn create_connection_manager(client: &Client) -> Result<ConnectionManager> {
@@ -305,8 +349,8 @@ impl ZoneEventIngester {
                         let fields: std::collections::BTreeMap<String, String> =
                             redis::from_redis_value(&parts[1])?;
 
-                        if let Some(json) = fields.get("event") {
-                            match serde_json::from_str::<Event>(json)
+                        if let Some(json) = fields.get("event").and_then(|j| self.decode_entry(j)) {
+                            match serde_json::from_str::<Event>(&json)
                                 .context("Failed to parse reclaimed event JSON")
                             {
                                 Ok(Event::SmartMeterReading(reading))
@@ -389,7 +433,10 @@ impl ZoneEventIngester {
                             tokio::spawn(async move {
                                 // Process entry
                                 if let Some(event_value) = entry.map.get("event") {
-                                    if let Ok(json) = redis::from_redis_value::<String>(event_value)
+                                    if let Some(json) =
+                                        redis::from_redis_value::<String>(event_value)
+                                            .ok()
+                                            .and_then(|raw| ingester.decode_entry(&raw))
                                     {
                                         match serde_json::from_str::<Event>(&json).with_context(
                                             || {

@@ -25,6 +25,10 @@ pub struct Router {
     num_zones: usize,
     /// Optional independent InfluxDB sink for realtime telemetry history.
     influx: Option<Arc<InfluxWriter>>,
+    /// Optional at-rest encryption of stream payloads. When set, the serialized
+    /// DeviceReading is AES-256-GCM sealed before XADD (the in-process zone
+    /// ingester decrypts); when None, payloads are written in the clear.
+    stream_cipher: Option<Arc<aggregator_persistence::infra::stream_cipher::StreamCipher>>,
 }
 
 impl Router {
@@ -50,7 +54,17 @@ impl Router {
             max_stream_len,
             num_zones,
             influx,
+            stream_cipher: None,
         })
+    }
+
+    /// Attach a stream cipher to encrypt payloads at rest in the Redis streams.
+    pub fn with_stream_cipher(
+        mut self,
+        cipher: Option<Arc<aggregator_persistence::infra::stream_cipher::StreamCipher>>,
+    ) -> Self {
+        self.stream_cipher = cipher;
+        self
     }
 
     /// Return a live connection manager clone, rebuilding from `redis_url` after
@@ -91,12 +105,31 @@ impl Router {
         let zone_idx = self.get_zone_index(reading);
         let stream_name = format!("gridtokenx:events:zone_{}", zone_idx);
 
-        let event_envelope = serde_json::json!({
-            "event_type": self.event_type_name(reading),
-            "payload": reading,
-        });
+        let event_type = self.event_type_name(reading);
 
-        let json = serde_json::to_string(&event_envelope).context("Failed to serialize reading")?;
+        // When a stream cipher is configured, the reading is AES-256-GCM sealed
+        // so the at-rest stream entry carries no plaintext registers — the
+        // in-process zone ingester decrypts it. Otherwise the payload is written
+        // in the clear (backward-compatible). The `event_type` stays cleartext
+        // (routing/observability) and is bound as the GCM AAD.
+        let json = if let Some(cipher) = &self.stream_cipher {
+            let payload_bytes = serde_json::to_vec(reading)
+                .context("Failed to serialize reading for encryption")?;
+            let (nonce, ciphertext) = cipher
+                .encrypt(&payload_bytes, event_type.as_bytes())
+                .context("Failed to encrypt stream payload")?;
+            serde_json::to_string(&serde_json::json!({
+                "event_type": event_type,
+                "enc": { "nonce": nonce, "ciphertext": ciphertext },
+            }))
+            .context("Failed to serialize encrypted reading")?
+        } else {
+            serde_json::to_string(&serde_json::json!({
+                "event_type": event_type,
+                "payload": reading,
+            }))
+            .context("Failed to serialize reading")?
+        };
 
         let stream_id: String = match conn
             .xadd_maxlen(

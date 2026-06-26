@@ -30,6 +30,16 @@ struct DecryptData {
     plaintext: String,
 }
 
+#[derive(Deserialize)]
+struct EncryptResponse {
+    data: EncryptData,
+}
+
+#[derive(Deserialize)]
+struct EncryptData {
+    ciphertext: String,
+}
+
 impl VaultTransitClient {
     /// Build from Vault address, token, and the Transit KEK key name.
     pub fn new(
@@ -95,6 +105,35 @@ impl VaultTransitClient {
             return Err(anyhow!("Vault create-KEK returned {}: {}", status, body));
         }
         Ok(())
+    }
+
+    /// Wrap raw key material with the Transit KEK; returns the `vault:v1:…`
+    /// ciphertext. Used to bootstrap the fleet-wide stream encryption key (SEK)
+    /// — the bridge generates it once, wraps it here, and persists only the
+    /// wrapped form.
+    pub async fn wrap(&self, plaintext: &[u8]) -> Result<String> {
+        let url = format!("{}/v1/transit/encrypt/{}", self.addr, self.kek_name);
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-Vault-Token", &self.token)
+            .json(&serde_json::json!({ "plaintext": STANDARD.encode(plaintext) }))
+            .send()
+            .await
+            .context("Vault Transit encrypt request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Vault encrypt returned {}: {}", status, body));
+        }
+        let parsed: EncryptResponse = resp
+            .json()
+            .await
+            .context("Vault encrypt response was not the expected JSON")?;
+        if parsed.data.ciphertext.is_empty() {
+            return Err(anyhow!("Vault returned empty ciphertext"));
+        }
+        Ok(parsed.data.ciphertext)
     }
 
     /// Unwrap a `vault:v1:…` ciphertext back to the raw 32-byte AES-256 key.
