@@ -126,44 +126,7 @@ impl ZoneEventIngester {
     /// mixed entries both decode. Returns `None` (skip) on a malformed or
     /// undecryptable entry.
     fn decode_entry(&self, raw: &str) -> Option<String> {
-        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-        let enc = match value.get("enc") {
-            Some(enc) => enc,
-            None => return Some(raw.to_string()), // plaintext passthrough
-        };
-        // Encrypted entry but no cipher configured (encryption was disabled while
-        // sealed entries still sit in the stream's maxlen window). Skip — but warn,
-        // so the dropped encrypted backlog is visible rather than silently lost.
-        let cipher = match self.stream_cipher.as_ref() {
-            Some(c) => c,
-            None => {
-                warn!(
-                    "🚫 Skipping encrypted stream entry: no stream cipher configured \
-                     (AGGREGATOR_ENCRYPT_STREAMS disabled while sealed entries remain)"
-                );
-                return None;
-            }
-        };
-        let event_type = value
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let nonce = enc.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
-        let ct = enc.get("ciphertext").and_then(|v| v.as_str()).unwrap_or("");
-        match cipher.decrypt(nonce, ct, event_type.as_bytes()) {
-            Ok(plaintext) => {
-                let payload: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
-                serde_json::to_string(&serde_json::json!({
-                    "event_type": event_type,
-                    "payload": payload,
-                }))
-                .ok()
-            }
-            Err(e) => {
-                warn!("🚫 Skipping undecryptable stream entry: {}", e);
-                None
-            }
-        }
+        decode_entry(raw, self.stream_cipher.as_deref())
     }
 
     async fn create_connection_manager(client: &Client) -> Result<ConnectionManager> {
@@ -361,27 +324,43 @@ impl ZoneEventIngester {
                         let fields: std::collections::BTreeMap<String, String> =
                             redis::from_redis_value(&parts[1])?;
 
-                        if let Some(json) = fields.get("event").and_then(|j| self.decode_entry(j)) {
-                            match serde_json::from_str::<Event>(&json)
-                                .context("Failed to parse reclaimed event JSON")
-                            {
-                                Ok(Event::SmartMeterReading(reading))
-                                | Ok(Event::EvCharging(reading))
-                                | Ok(Event::BatteryStateUpdate(reading)) => {
-                                    if let Err(e) =
-                                        self.handle_iot_reading(reading, stream, &entry_id).await
-                                    {
-                                        error!("❌ Failed to handle reclaimed IoT reading: {}", e);
+                        match fields.get("event").and_then(|j| self.decode_entry(j)) {
+                            Some(json) => {
+                                match serde_json::from_str::<Event>(&json)
+                                    .context("Failed to parse reclaimed event JSON")
+                                {
+                                    Ok(Event::SmartMeterReading(reading))
+                                    | Ok(Event::EvCharging(reading))
+                                    | Ok(Event::BatteryStateUpdate(reading)) => {
+                                        if let Err(e) = self
+                                            .handle_iot_reading(reading, stream, &entry_id)
+                                            .await
+                                        {
+                                            error!(
+                                                "❌ Failed to handle reclaimed IoT reading: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        let mut conn = self.connection_manager.clone();
+                                        let _: redis::RedisResult<()> =
+                                            conn.xack(stream, &self.group_name, &[&entry_id]).await;
+                                    }
+                                    Err(e) => {
+                                        error!("❌ Reclaim error: {}", e);
                                     }
                                 }
-                                Ok(_) => {
-                                    let mut conn = self.connection_manager.clone();
-                                    let _: redis::RedisResult<()> =
-                                        conn.xack(stream, &self.group_name, &[&entry_id]).await;
-                                }
-                                Err(e) => {
-                                    error!("❌ Reclaim error: {}", e);
-                                }
+                            }
+                            // Undecodable/undecryptable entry (decode_entry already
+                            // warned). ACK to evict it from the PEL — otherwise the
+                            // redelivery loop reclaims and re-warns it every cycle
+                            // forever. These entries can never decode, so dropping
+                            // them is the only terminal state.
+                            None => {
+                                let mut conn = self.connection_manager.clone();
+                                let _: redis::RedisResult<()> =
+                                    conn.xack(stream, &self.group_name, &[&entry_id]).await;
                             }
                         }
                     }
@@ -445,51 +424,67 @@ impl ZoneEventIngester {
                             tokio::spawn(async move {
                                 // Process entry
                                 if let Some(event_value) = entry.map.get("event") {
-                                    if let Some(json) =
-                                        redis::from_redis_value::<String>(event_value)
-                                            .ok()
-                                            .and_then(|raw| ingester.decode_entry(&raw))
-                                    {
-                                        match serde_json::from_str::<Event>(&json).with_context(
-                                            || {
-                                                format!(
-                                                    "Failed to parse event JSON for entry {}",
-                                                    entry_id
-                                                )
-                                            },
-                                        ) {
-                                            Ok(Event::SmartMeterReading(reading))
-                                            | Ok(Event::EvCharging(reading))
-                                            | Ok(Event::BatteryStateUpdate(reading)) => {
-                                                let serial = reading.serial_number.clone();
-                                                if let Err(e) = ingester
-                                                    .handle_iot_reading(
-                                                        reading,
-                                                        &stream_name,
-                                                        &entry_id,
+                                    let decoded = redis::from_redis_value::<String>(event_value)
+                                        .ok()
+                                        .and_then(|raw| ingester.decode_entry(&raw));
+                                    match decoded {
+                                        Some(json) => {
+                                            match serde_json::from_str::<Event>(&json).with_context(
+                                                || {
+                                                    format!(
+                                                        "Failed to parse event JSON for entry {}",
+                                                        entry_id
                                                     )
-                                                    .await
-                                                {
-                                                    error!(
-                                                        "❌ Error handling IoT reading [{}]: {}",
-                                                        serial, e
-                                                    );
+                                                },
+                                            ) {
+                                                Ok(Event::SmartMeterReading(reading))
+                                                | Ok(Event::EvCharging(reading))
+                                                | Ok(Event::BatteryStateUpdate(reading)) => {
+                                                    let serial = reading.serial_number.clone();
+                                                    if let Err(e) = ingester
+                                                        .handle_iot_reading(
+                                                            reading,
+                                                            &stream_name,
+                                                            &entry_id,
+                                                        )
+                                                        .await
+                                                    {
+                                                        error!(
+                                                            "❌ Error handling IoT reading [{}]: {}",
+                                                            serial, e
+                                                        );
+                                                    }
+                                                }
+                                                Ok(_) => {
+                                                    // Unknown event, ACK it so it doesn't block
+                                                    let mut conn =
+                                                        ingester.connection_manager.clone();
+                                                    let _: redis::RedisResult<()> = conn
+                                                        .xack(
+                                                            &stream_name,
+                                                            &ingester.group_name,
+                                                            &[&entry_id],
+                                                        )
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    error!("❌ Event processing error: {}", e);
                                                 }
                                             }
-                                            Ok(_) => {
-                                                // Unknown event, ACK it so it doesn't block
-                                                let mut conn = ingester.connection_manager.clone();
-                                                let _: redis::RedisResult<()> = conn
-                                                    .xack(
-                                                        &stream_name,
-                                                        &ingester.group_name,
-                                                        &[&entry_id],
-                                                    )
-                                                    .await;
-                                            }
-                                            Err(e) => {
-                                                error!("❌ Event processing error: {}", e);
-                                            }
+                                        }
+                                        // Undecodable/undecryptable entry (decode_entry
+                                        // already warned). ACK to drop it from the PEL so
+                                        // the redelivery loop doesn't reclaim and re-warn
+                                        // it every cycle forever.
+                                        None => {
+                                            let mut conn = ingester.connection_manager.clone();
+                                            let _: redis::RedisResult<()> = conn
+                                                .xack(
+                                                    &stream_name,
+                                                    &ingester.group_name,
+                                                    &[&entry_id],
+                                                )
+                                                .await;
                                         }
                                     }
                                 }
@@ -634,6 +629,59 @@ impl ZoneEventIngester {
     }
 }
 
+/// Resolve a raw stream entry to the plaintext `{event_type, payload}` JSON the
+/// [`Event`](crate::ingester::Event) decoder expects.
+///
+/// Encrypted entries arrive as `{event_type, enc:{nonce, ciphertext}}`; with a
+/// cipher configured they are AES-256-GCM decrypted (AAD = event_type) and
+/// rebuilt as `{event_type, payload}`. Plaintext entries (no `enc`, or no
+/// cipher) pass through unchanged — so a flag flip and the maxlen window of
+/// mixed entries both decode. Returns `None` (skip) on a malformed or
+/// undecryptable entry; callers ACK such entries to evict them from the PEL.
+fn decode_entry(
+    raw: &str,
+    cipher: Option<&crate::infra::stream_cipher::StreamCipher>,
+) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let enc = match value.get("enc") {
+        Some(enc) => enc,
+        None => return Some(raw.to_string()), // plaintext passthrough
+    };
+    // Encrypted entry but no cipher configured (encryption was disabled while
+    // sealed entries still sit in the stream's maxlen window). Skip — but warn,
+    // so the dropped encrypted backlog is visible rather than silently lost.
+    let cipher = match cipher {
+        Some(c) => c,
+        None => {
+            warn!(
+                "🚫 Skipping encrypted stream entry: no stream cipher configured \
+                 (AGGREGATOR_ENCRYPT_STREAMS disabled while sealed entries remain)"
+            );
+            return None;
+        }
+    };
+    let event_type = value
+        .get("event_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let nonce = enc.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+    let ct = enc.get("ciphertext").and_then(|v| v.as_str()).unwrap_or("");
+    match cipher.decrypt(nonce, ct, event_type.as_bytes()) {
+        Ok(plaintext) => {
+            let payload: serde_json::Value = serde_json::from_slice(&plaintext).ok()?;
+            serde_json::to_string(&serde_json::json!({
+                "event_type": event_type,
+                "payload": payload,
+            }))
+            .ok()
+        }
+        Err(e) => {
+            warn!("🚫 Skipping undecryptable stream entry: {}", e);
+            None
+        }
+    }
+}
+
 /// Pull a grid-frequency sample (Hz) out of reading metadata. Accepts both the
 /// REST/simulator key (`frequency`) and the explicit-unit variant
 /// (`frequency_hz`), as number or numeric string.
@@ -675,9 +723,58 @@ fn extract_tariff_demand(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_frequency, extract_tariff_demand};
+    use super::{decode_entry, extract_frequency, extract_tariff_demand};
+    use crate::infra::stream_cipher::StreamCipher;
     use rust_decimal::Decimal;
     use std::collections::HashMap;
+
+    #[test]
+    fn plaintext_entry_passes_through() {
+        let raw = r#"{"event_type":"SmartMeterReading","payload":{"x":1}}"#;
+        // No `enc` envelope -> returned verbatim, with or without a cipher.
+        assert_eq!(decode_entry(raw, None).as_deref(), Some(raw));
+        let cipher = StreamCipher::new([7u8; 32]);
+        assert_eq!(decode_entry(raw, Some(&cipher)).as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn sealed_entry_with_no_cipher_is_dropped() {
+        // Encryption disabled while a sealed entry remains -> None (caller ACKs).
+        let raw = r#"{"event_type":"SmartMeterReading","enc":{"nonce":"a","ciphertext":"b"}}"#;
+        assert_eq!(decode_entry(raw, None), None);
+    }
+
+    #[test]
+    fn undecryptable_entry_is_dropped() {
+        // Wrong key / garbage ciphertext under a configured cipher -> None.
+        let cipher = StreamCipher::new([1u8; 32]);
+        let raw = r#"{"event_type":"SmartMeterReading","enc":{"nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAA"}}"#;
+        assert_eq!(decode_entry(raw, Some(&cipher)), None);
+    }
+
+    #[test]
+    fn malformed_json_is_dropped() {
+        assert_eq!(decode_entry("not json", None), None);
+    }
+
+    #[test]
+    fn encrypted_roundtrip_decodes() {
+        let cipher = StreamCipher::new([9u8; 32]);
+        let event_type = "SmartMeterReading";
+        let payload = serde_json::json!({"serial":"M1","kwh":1.5});
+        let (nonce, ct) = cipher
+            .encrypt(payload.to_string().as_bytes(), event_type.as_bytes())
+            .expect("encrypt");
+        let raw = serde_json::json!({
+            "event_type": event_type,
+            "enc": {"nonce": nonce, "ciphertext": ct},
+        })
+        .to_string();
+        let decoded: serde_json::Value =
+            serde_json::from_str(&decode_entry(&raw, Some(&cipher)).expect("decoded")).unwrap();
+        assert_eq!(decoded["event_type"], event_type);
+        assert_eq!(decoded["payload"], payload);
+    }
 
     fn meta(key: &str, value: serde_json::Value) -> HashMap<String, serde_json::Value> {
         HashMap::from([(key.to_string(), value)])
