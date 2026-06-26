@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# -----------------------------------------------------------------------------
+# Aggregator Bridge — DEV image for the cargo-watch hot-reload loop.
+# Toolchain + native build deps + cargo-watch baked in (one-time, cached). The
+# app itself is NOT built here: source is bind-mounted and compiled at runtime
+# by cargo-watch against a persistent target/ volume. See docker-compose.dev.yml.
+# -----------------------------------------------------------------------------
+FROM rust:1.91-bookworm
+
+# Same native build deps as the prod builder stage (libclang for bindgen via
+# zstd-sys/rdkafka, protobuf-compiler, cmake, libssl).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libssl-dev \
+        cmake \
+        clang \
+        git \
+        curl \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# File-watching rebuild+rerun driver, baked so container start is instant.
+RUN cargo install cargo-watch --locked
+
+WORKDIR /app/gridtokenx-aggregator-bridge
