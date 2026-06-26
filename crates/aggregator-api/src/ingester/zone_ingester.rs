@@ -131,7 +131,19 @@ impl ZoneEventIngester {
             Some(enc) => enc,
             None => return Some(raw.to_string()), // plaintext passthrough
         };
-        let cipher = self.stream_cipher.as_ref()?; // enc present but no key ⇒ skip
+        // Encrypted entry but no cipher configured (encryption was disabled while
+        // sealed entries still sit in the stream's maxlen window). Skip — but warn,
+        // so the dropped encrypted backlog is visible rather than silently lost.
+        let cipher = match self.stream_cipher.as_ref() {
+            Some(c) => c,
+            None => {
+                warn!(
+                    "🚫 Skipping encrypted stream entry: no stream cipher configured \
+                     (AGGREGATOR_ENCRYPT_STREAMS disabled while sealed entries remain)"
+                );
+                return None;
+            }
+        };
         let event_type = value
             .get("event_type")
             .and_then(|v| v.as_str())
