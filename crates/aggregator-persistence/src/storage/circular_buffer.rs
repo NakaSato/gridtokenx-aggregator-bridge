@@ -137,3 +137,87 @@ impl CircularBuffer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Private in-memory SQLite DB — sqlite treats the `:memory:` filename as a
+    /// per-connection in-memory database, so no temp file / cleanup is needed.
+    fn buf() -> CircularBuffer {
+        CircularBuffer::new(Path::new(":memory:")).expect("open in-memory buffer")
+    }
+
+    #[test]
+    fn push_then_get_unsynced_returns_row() {
+        let mut b = buf();
+        let ts = Utc::now();
+        b.push("meter-1", ts, &json!({"kwh": 1.5})).unwrap();
+
+        let rows = b.get_unsynced(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (id, meter, _ts, payload) = &rows[0];
+        assert_eq!(*id, 1);
+        assert_eq!(meter, "meter-1");
+        assert_eq!(payload, &json!({"kwh": 1.5}));
+    }
+
+    #[test]
+    fn get_unsynced_empty_when_nothing_pushed() {
+        let b = buf();
+        assert!(b.get_unsynced(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_unsynced_orders_by_id_and_respects_limit() {
+        let mut b = buf();
+        let ts = Utc::now();
+        for i in 0..3 {
+            b.push(&format!("m{i}"), ts, &json!({"i": i})).unwrap();
+        }
+
+        let rows = b.get_unsynced(2).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Ordered by ascending id (insertion order), not whichever sqlite returns first.
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[0].1, "m0");
+        assert_eq!(rows[1].1, "m1");
+    }
+
+    #[test]
+    fn mark_as_synced_removes_from_unsynced() {
+        let mut b = buf();
+        let ts = Utc::now();
+        b.push("m0", ts, &json!({})).unwrap();
+        b.push("m1", ts, &json!({})).unwrap();
+
+        let ids: Vec<i64> = b.get_unsynced(10).unwrap().iter().map(|r| r.0).collect();
+        b.mark_as_synced(&ids[..1]).unwrap(); // sync only the first
+
+        let remaining = b.get_unsynced(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].1, "m1");
+    }
+
+    #[test]
+    fn mark_as_synced_empty_is_noop() {
+        let mut b = buf();
+        b.push("m0", Utc::now(), &json!({})).unwrap();
+        b.mark_as_synced(&[]).unwrap();
+        assert_eq!(b.get_unsynced(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn payload_roundtrips_through_json() {
+        let mut b = buf();
+        let payload = json!({
+            "nested": {"a": [1, 2, 3], "b": "x"},
+            "float": 1.625,
+            "flag": true,
+        });
+        b.push("m", Utc::now(), &payload).unwrap();
+        assert_eq!(b.get_unsynced(1).unwrap()[0].3, payload);
+    }
+}

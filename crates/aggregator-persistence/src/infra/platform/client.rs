@@ -63,3 +63,34 @@ impl PlatformClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `PlatformClient::new` opens a real HTTP/2 socket (`connect_plaintext`), so
+    // it can't be unit-tested without a live OracleService. Both construction and
+    // the batch submit are exercised here as `#[ignore]` integration tests.
+
+    #[tokio::test]
+    #[ignore = "requires a live OracleService gRPC server (PLATFORM_GRPC_URL)"]
+    async fn new_connects_to_real_oracle_service() {
+        let url = std::env::var("PLATFORM_GRPC_URL")
+            .unwrap_or_else(|_| "http://localhost:5030".to_string());
+        assert!(PlatformClient::new(&url).await.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live OracleService gRPC server (PLATFORM_GRPC_URL)"]
+    async fn submit_batch_against_real_oracle_service() {
+        let url = std::env::var("PLATFORM_GRPC_URL")
+            .unwrap_or_else(|_| "http://localhost:5030".to_string());
+        let client = PlatformClient::new(&url).await.expect("connect");
+        let reading = MeterReading {
+            meter_serial: "__test_meter__".to_string(),
+            ..Default::default()
+        };
+        // Smoke: a reachable server returns a response (accept/reject), not a panic.
+        let _ = client.submit_meter_reading_batch(vec![reading]).await;
+    }
+}

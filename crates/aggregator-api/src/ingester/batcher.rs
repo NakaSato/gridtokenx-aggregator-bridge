@@ -272,3 +272,80 @@ impl BatchWorker {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // BatchWorker::run() drives a ConnectionManager (real Redis) for XACK, so it
+    // can't be unit-tested without infra. These tests cover the BatchHandle wire
+    // contract instead: every public method maps to the correct BatchMessage and
+    // surfaces a channel-closed error when the worker is gone.
+
+    fn reading(serial: &str) -> MeterReading {
+        MeterReading {
+            meter_serial: serial.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_sends_add_message_with_fields() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = BatchHandle::new(tx);
+
+        handle
+            .add(reading("SN-1"), "stream-a".into(), "1-0".into())
+            .await
+            .unwrap();
+
+        match rx.recv().await {
+            Some(BatchMessage::Add(entry)) => {
+                assert_eq!(entry.request.meter_serial, "SN-1");
+                assert_eq!(entry.stream_name, "stream-a");
+                assert_eq!(entry.entry_id, "1-0");
+            }
+            other => panic!("expected Add, got {:?}", other.is_some()),
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_sends_flush_message() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = BatchHandle::new(tx);
+
+        handle.flush().await.unwrap();
+        assert!(matches!(rx.recv().await, Some(BatchMessage::Flush)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_shutdown_and_waits_for_ack() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = BatchHandle::new(tx);
+
+        // Stand in for the worker: receive Shutdown, ack the oneshot so the
+        // handle's `done_rx.await` resolves.
+        let worker = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(BatchMessage::Shutdown(done)) => done.send(()).unwrap(),
+                _ => panic!("expected Shutdown"),
+            }
+        });
+
+        handle.shutdown().await.unwrap();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_errors_when_worker_channel_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx); // worker gone
+        let handle = BatchHandle::new(tx);
+
+        let err = handle
+            .add(reading("SN"), "s".into(), "id".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Batch worker channel closed"));
+    }
+}

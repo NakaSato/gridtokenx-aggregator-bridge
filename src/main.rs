@@ -936,3 +936,50 @@ async fn main() -> Result<()> {
     // telemetry::shutdown_telemetry(&telemetry_guard);
     server_result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::expand_env;
+
+    // expand_env reads process env, so these tests use uniquely-named vars to
+    // avoid colliding with anything real or each other under parallel runs.
+
+    #[test]
+    fn expands_a_set_variable() {
+        std::env::set_var("AGG_TEST_EXPAND_HOST", "redis-host");
+        assert_eq!(
+            expand_env("tcp://${AGG_TEST_EXPAND_HOST}:6379"),
+            "tcp://redis-host:6379"
+        );
+        std::env::remove_var("AGG_TEST_EXPAND_HOST");
+    }
+
+    #[test]
+    fn unset_variable_expands_to_empty() {
+        std::env::remove_var("AGG_TEST_EXPAND_UNSET");
+        assert_eq!(expand_env("a${AGG_TEST_EXPAND_UNSET}b"), "ab");
+    }
+
+    #[test]
+    fn expands_multiple_variables() {
+        std::env::set_var("AGG_TEST_EXPAND_A", "1");
+        std::env::set_var("AGG_TEST_EXPAND_B", "2");
+        assert_eq!(
+            expand_env("${AGG_TEST_EXPAND_A}-${AGG_TEST_EXPAND_B}"),
+            "1-2"
+        );
+        std::env::remove_var("AGG_TEST_EXPAND_A");
+        std::env::remove_var("AGG_TEST_EXPAND_B");
+    }
+
+    #[test]
+    fn no_placeholder_is_returned_verbatim() {
+        assert_eq!(expand_env("plain-string:6379"), "plain-string:6379");
+    }
+
+    #[test]
+    fn unterminated_placeholder_is_left_untouched() {
+        // No closing brace ⇒ the loop breaks, returning the input as-is (no hang).
+        assert_eq!(expand_env("prefix${UNCLOSED"), "prefix${UNCLOSED");
+    }
+}

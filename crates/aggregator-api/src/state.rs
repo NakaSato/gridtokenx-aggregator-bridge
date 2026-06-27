@@ -67,3 +67,50 @@ pub struct AppState {
     pub device_key_registry: Arc<crate::infra::crypto::DeviceKeyRegistry>,
     pub meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_new_is_zeroed() {
+        let m = Metrics::new();
+        assert_eq!(m.total_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(m.authorized_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(m.failed_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(m.last_grpc_latency_us.load(Ordering::Relaxed), 0);
+        assert_eq!(m.total_grpc_latency_us.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn record_request_authorized_bumps_total_and_authorized() {
+        let m = Metrics::new();
+        m.record_request(true, 120);
+        assert_eq!(m.total_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(m.authorized_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(m.failed_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(m.last_grpc_latency_us.load(Ordering::Relaxed), 120);
+    }
+
+    #[test]
+    fn record_request_unauthorized_bumps_failed() {
+        let m = Metrics::new();
+        m.record_request(false, 50);
+        assert_eq!(m.total_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(m.authorized_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(m.failed_requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn record_request_accumulates_latency_and_tracks_last() {
+        let m = Metrics::new();
+        m.record_request(true, 100);
+        m.record_request(false, 300);
+        assert_eq!(m.total_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(m.authorized_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(m.failed_requests.load(Ordering::Relaxed), 1);
+        // total accumulates, last reflects the most recent call.
+        assert_eq!(m.total_grpc_latency_us.load(Ordering::Relaxed), 400);
+        assert_eq!(m.last_grpc_latency_us.load(Ordering::Relaxed), 300);
+    }
+}

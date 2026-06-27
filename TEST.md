@@ -2,8 +2,9 @@
 
 Test inventory for the **Aggregator Bridge** service.
 
-> This submodule ships **unit tests only** — inline `#[cfg(test)] mod tests`, no `tests/` dirs,
-> **no e2e or integration tests in-repo**. The e2e/integration suite is **not** part of this submodule;
+> This submodule ships **inline unit tests** (`#[cfg(test)] mod tests`, no `tests/` dirs) plus a set of
+> `#[ignore]`-gated **integration tests** that hit live infra (Redis/Vault/Postgres/RabbitMQ/Kafka/gRPC) —
+> run on demand with `cargo test -- --ignored`. The cross-service **e2e suite** is **not** in this submodule;
 > it lives in the **superproject** (`gridtokenx-coresystem/tests/e2e/`, pytest, run via `run.sh` / `just e2e`)
 > and is listed below for reference only.
 
@@ -13,8 +14,27 @@ Test inventory for the **Aggregator Bridge** service.
 
 Inline `#[cfg(test)] mod tests`, no `tests/` dirs. Run from this submodule root.
 
+> Some files carry `#[ignore]` tests that need live infra (Redis/Vault/RabbitMQ) — skipped by
+> default, run with `cargo test -- --ignored` once the broker is up (e.g. `just orb-up`).
+> Affected: `crypto.rs` (real Redis), `vault.rs` (real Vault), `meter_registry.rs` (real Postgres),
+> `rabbitmq.rs` (real broker, self-heal), `kafka.rs` (real broker, produce→consume; default `localhost:29001`),
+> `dispatch/grpc_client.rs` + `platform/client.rs` (live gRPC server, default `localhost:5030`).
+
 | Crate | File | Covers |
 | --- | --- | --- |
+| aggregator-core | `src/numeric.rs` | `f64_to_decimal`/`to_positive_decimal`: finite convert, NaN/inf reject, negative reject, label in error |
+| aggregator-core | `src/models.rs` | `DeviceType::target_stream` map, snake_case serde, tagged `DeviceMetrics` roundtrip |
+| aggregator-persistence | `src/storage/circular_buffer.rs` | SQLite ring buffer: push/get_unsynced order+limit, mark_as_synced, JSON roundtrip (in-mem `:memory:`) |
+| aggregator-persistence | `src/infra/rabbitmq.rs` | validation-job payload wire shape; `#[ignore]` real-broker connect + channel self-heal |
+| aggregator-persistence | `src/infra/kafka.rs` | `MeterReadingEvent`/`GridStatusEvent` serde roundtrip + malformed/empty reject; `#[ignore]` real-broker produce→consume |
+| aggregator-persistence | `src/infra/influxdb.rs` | `TelemetryPoint`→`DataPoint` map (zone some/none), disabled-when-no-URL, drop-on-closed-queue |
+| aggregator-persistence | `src/storage/sync_manager.rs` | replay request shaping: `replay_url` endpoint path, `replay_body` contract shape (meter/ts RFC3339/payload) |
+| aggregator-api | `src/ingester/batcher.rs` | `BatchHandle` wire contract: add/flush/shutdown → `BatchMessage`, channel-closed error |
+| aggregator-api | `src/state.rs` | `Metrics` atomics: zeroed-new, authorized/failed branches, latency accumulate + last |
+| aggregator-persistence | `src/infra/platform/client.rs` | `#[ignore]` real OracleService connect + batch submit |
+| aggregator-logic | `src/metrics/mod.rs` | recorder smoke (no-panic, all label sets, success+failure branches, HttpMetricsTimer lifecycle) |
+| aggregator-logic | `src/dispatch/grpc_client.rs` | `DispatchClient::new` URI parse (valid/malformed); `#[ignore]` real-server dispatch |
+| (binary) | `src/main.rs` | `expand_env` `${VAR}` interpolation: set/unset/multi/verbatim/unterminated |
 | aggregator-stacks | `src/binary_decoder.rs` | secure v4 binary frame decode |
 | aggregator-stacks | `src/stacks/dlms.rs` | DLMS/COSEM OBIS register → metadata mapping |
 | aggregator-logic | `src/aggregator.rs` | 15-min billing bins, window/accumulate/peek, TOU split, max-demand |
@@ -22,6 +42,7 @@ Inline `#[cfg(test)] mod tests`, no `tests/` dirs. Run from this submodule root.
 | aggregator-logic | `src/router.rs` | dissemination (Redis Streams + InfluxDB) |
 | aggregator-logic | `src/grid_status.rs` | grid status event parse |
 | aggregator-logic | `src/dispatch/engine.rs` | dispatch engine |
+| aggregator-logic | `src/standards/ieee2030_5.rs` | DERControl mapping (FLEX_UP→ReducePower), `is_simulation`, stub dispatch Ok |
 | aggregator-logic | `src/standards/openleadr.rs` | OpenADR 3 (VTN-side) dispatch adapter |
 | aggregator-logic | `src/standards/openleadr_ven.rs` | OpenADR VEN-side polling listener |
 | aggregator-persistence | `src/infra/crypto.rs` | Ed25519 verify (valid / wrong-key / bad-len), fail-closed |
@@ -32,10 +53,16 @@ Inline `#[cfg(test)] mod tests`, no `tests/` dirs. Run from this submodule root.
 | aggregator-api | `src/ingester/zone_ingester.rs` | zone-partitioned ingest |
 
 ```bash
-cargo test                       # whole workspace
+cargo test --workspace           # all crates (root is a package — bare `cargo test` runs the binary only)
 cargo test -p aggregator-logic   # single crate
 cargo test test_name -- --nocapture
+cargo test -- --ignored          # integration only (needs live infra: just orb-up)
+cargo test -- --include-ignored  # unit + integration
 ```
+
+**Intentionally untested** (no unit-testable logic): `aggregator-protocol/build.rs` (prost codegen),
+`aggregator-stacks/src/stacks/mod.rs` + `aggregator-logic/src/dispatch/mod.rs` are trait definitions
+(only the `DispatchAdapter::is_simulation` default is covered). All other source files carry tests.
 
 ---
 

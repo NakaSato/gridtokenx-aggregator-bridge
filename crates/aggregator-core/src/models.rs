@@ -141,3 +141,72 @@ pub struct IngestResponse {
     pub device_type: DeviceType,
     pub stream: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_stream_maps_each_device_type() {
+        assert_eq!(
+            DeviceType::SmartMeter.target_stream(),
+            "gridtokenx:events:v1"
+        );
+        assert_eq!(DeviceType::EvCharger.target_stream(), "gridtokenx:ev:v1");
+        assert_eq!(DeviceType::Battery.target_stream(), "gridtokenx:battery:v1");
+    }
+
+    #[test]
+    fn device_type_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DeviceType::SmartMeter).unwrap(),
+            r#""smart_meter""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DeviceType::EvCharger).unwrap(),
+            r#""ev_charger""#
+        );
+    }
+
+    #[test]
+    fn device_metrics_energy_is_internally_tagged() {
+        let m = DeviceMetrics::Energy {
+            generated_kwh: 5.0,
+            consumed_kwh: 2.0,
+            net_kwh: 3.0,
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(v["type"], "energy");
+        assert_eq!(v["net_kwh"], 3.0);
+    }
+
+    #[test]
+    fn device_metrics_roundtrips_through_tag() {
+        let m = DeviceMetrics::BatteryState {
+            soc_percent: 80.0,
+            power_kw: -1.5,
+            temperature_c: 25.0,
+            mode: BatteryMode::Discharging,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: DeviceMetrics = serde_json::from_str(&json).unwrap();
+        match back {
+            DeviceMetrics::BatteryState {
+                soc_percent, mode, ..
+            } => {
+                assert_eq!(soc_percent, 80.0);
+                assert_eq!(mode, BatteryMode::Discharging);
+            }
+            _ => panic!("expected BatteryState"),
+        }
+    }
+
+    #[test]
+    fn ev_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EvStatus::SuspendedEvse).unwrap(),
+            r#""suspended_evse""#
+        );
+    }
+}

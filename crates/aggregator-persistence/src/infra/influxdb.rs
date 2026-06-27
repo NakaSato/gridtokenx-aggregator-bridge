@@ -192,3 +192,62 @@ async fn flush(client: &Client, bucket: &str, batch: &mut Vec<TelemetryPoint>) {
         Err(e) => error!("❌ InfluxDB write failed ({} points dropped): {}", count, e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `connect`/`run_writer`/`flush` drive a live InfluxDB client, so the pure
+    // tests cover what doesn't need a server: the `TelemetryPoint -> DataPoint`
+    // mapping, the disabled (no-URL) branch, and the drop-on-full-queue path.
+
+    fn point(zone: Option<&str>) -> TelemetryPoint {
+        TelemetryPoint {
+            measurement: "energy",
+            device_id: "dev-1".to_string(),
+            device_type: "meter".to_string(),
+            serial_number: "SN-1".to_string(),
+            zone_code: zone.map(|z| z.to_string()),
+            extra_tags: vec![("status", "active".to_string())],
+            fields: vec![("generated_kwh", 1.5), ("consumed_kwh", 0.25)],
+            timestamp_ns: 1_700_000_000_000_000_000,
+        }
+    }
+
+    #[test]
+    fn into_data_point_full_ok() {
+        // zone + extra_tags + multiple fields all build into a DataPoint.
+        assert!(point(Some("Z1")).into_data_point().is_ok());
+    }
+
+    #[test]
+    fn into_data_point_zone_none_ok() {
+        // Missing zone simply omits the tag — still a valid point.
+        assert!(point(None).into_data_point().is_ok());
+    }
+
+    #[test]
+    fn record_drops_when_queue_closed_without_panic() {
+        // Drop the receiver so try_send fails: record must swallow it (warn), not panic.
+        let (tx, rx) = mpsc::channel::<TelemetryPoint>(1);
+        drop(rx);
+        let writer = InfluxWriter { tx };
+        writer.record(point(Some("Z1"))); // no panic = pass
+    }
+
+    #[tokio::test]
+    async fn connect_disabled_when_url_unset() {
+        // Degraded-by-design: no INFLUXDB_URL ⇒ Ok(None), service still starts.
+        // NOTE: mutates process env — run serially if other tests read INFLUXDB_URL
+        // (none currently do).
+        let prev = std::env::var("INFLUXDB_URL").ok();
+        std::env::remove_var("INFLUXDB_URL");
+
+        let result = InfluxWriter::connect().await;
+
+        if let Some(v) = prev {
+            std::env::set_var("INFLUXDB_URL", v);
+        }
+        assert!(matches!(result, Ok(None)));
+    }
+}

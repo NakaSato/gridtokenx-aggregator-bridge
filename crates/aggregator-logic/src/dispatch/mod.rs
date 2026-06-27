@@ -18,3 +18,26 @@ pub trait DispatchAdapter: Send + Sync {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Adapter that doesn't override `is_simulation` — must inherit the
+    /// trait default of `false` (a real adapter attests actuation, so the
+    /// VEN listener will send execution reports). Counterpart to the
+    /// `Ieee2030_5Adapter` stub which overrides it to `true`.
+    struct RealAdapter;
+
+    #[async_trait]
+    impl DispatchAdapter for RealAdapter {
+        async fn execute_dispatch(&self, _action: DispatchType, _capacity_kw: f64) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn is_simulation_defaults_to_false() {
+        assert!(!RealAdapter.is_simulation());
+    }
+}

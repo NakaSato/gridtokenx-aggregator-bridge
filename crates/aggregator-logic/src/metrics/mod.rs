@@ -333,3 +333,60 @@ pub fn record_batch_failure(reason: &str) {
     )
     .increment(1);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These recorders emit into the global `metrics` facade. With no recorder
+    // installed (the unit-test default) every emit is a no-op — the contract
+    // being asserted is that they never panic and accept their full label set,
+    // for both success and failure branches. A live recorder + scrape is an
+    // integration concern (the running service's /metrics endpoint).
+
+    #[test]
+    fn ingestion_recorders_do_not_panic() {
+        record_ingestion_request("smart_meter", true, 1.0);
+        record_ingestion_request("ev_charger", false, 2.0);
+        record_meter_reading(true, 1.0);
+        record_meter_reading(false, 1.0); // failure branch
+        record_ev_charger_data(true, 1.0);
+        record_battery_data(true, 1.0);
+        record_energy_reading("generated", 12.5, "dev-1");
+    }
+
+    #[test]
+    fn pipeline_recorders_do_not_panic() {
+        record_redis_stream_processing("zone:1", 10, true, 5.0);
+        record_redis_stream_processing("zone:1", 0, false, 5.0); // failure branch
+        record_aggregator_forwarding(true, 3.0);
+        record_aggregator_forwarding(false, 3.0); // failure branch
+        record_batch_forward(50, 48, 2, 7.0);
+        record_batch_failure("grpc_error");
+        record_protocol_adapter("dlms", "decode", true, 1.0);
+        record_grpc_client_call("iam", "verify", false, 2.0);
+    }
+
+    #[test]
+    fn device_and_validation_recorders_do_not_panic() {
+        record_device_connection("smart_meter", true);
+        record_device_connection("smart_meter", false); // disconnect branch
+        record_active_devices("battery", 3);
+        record_data_validation(true, "ok");
+        record_data_validation(false, "bad_sig"); // failure branch
+        record_api_key_auth(true, 1.0, "iam");
+        record_api_key_auth(false, 1.0, "static"); // failure branch
+    }
+
+    #[test]
+    fn dispatch_recorders_do_not_panic() {
+        record_dispatch_outcome("FLEX_UP", "openleadr", "fired");
+        record_ven_event("executed");
+    }
+
+    #[test]
+    fn http_metrics_timer_full_lifecycle_does_not_panic() {
+        HttpMetricsTimer::new("POST", "/v1/ingest/telemetry").finish(200);
+        HttpMetricsTimer::new("GET", "/health").finish(500); // 5xx error branch
+    }
+}

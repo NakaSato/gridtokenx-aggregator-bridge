@@ -6,6 +6,22 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+/// Replay endpoint for unsynced telemetry, derived from the gateway base URL.
+/// Pure so the path can be pinned in tests without an HTTP round-trip.
+fn replay_url(base: &str) -> String {
+    format!("{}/api/v1/telemetry/replay", base)
+}
+
+/// JSON body for a single replayed reading. Pure — kept in sync with the
+/// gateway's `/api/v1/telemetry/replay` contract.
+fn replay_body(meter_id: &str, timestamp: chrono::DateTime<chrono::Utc>, payload: &Value) -> Value {
+    serde_json::json!({
+        "meter_id": meter_id,
+        "timestamp": timestamp,
+        "payload": payload,
+    })
+}
+
 /// SyncManager handles the replay of unsynced telemetry from the local buffer to the API Gateway.
 pub struct SyncManager {
     buffer: Arc<Mutex<CircularBuffer>>,
@@ -66,16 +82,12 @@ impl SyncManager {
         timestamp: chrono::DateTime<chrono::Utc>,
         payload: &Value,
     ) -> Result<()> {
-        let url = format!("{}/api/v1/telemetry/replay", self.api_services_url);
+        let url = replay_url(&self.api_services_url);
 
         let response = self
             .client
             .post(&url)
-            .json(&serde_json::json!({
-                "meter_id": meter_id,
-                "timestamp": timestamp,
-                "payload": payload,
-            }))
+            .json(&replay_body(meter_id, timestamp, payload))
             .send()
             .await?;
 
@@ -87,5 +99,44 @@ impl SyncManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    // `run`/`send_to_gateway` drive a real HTTP gateway, so the unit tests cover
+    // the pure request-shaping (`replay_url`/`replay_body`) that defines the
+    // gateway contract. The send path itself is exercised by the superproject e2e.
+
+    #[test]
+    fn replay_url_appends_endpoint_path() {
+        assert_eq!(
+            replay_url("http://gateway:4000"),
+            "http://gateway:4000/api/v1/telemetry/replay"
+        );
+    }
+
+    #[test]
+    fn replay_body_has_expected_contract_shape() {
+        let ts = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let payload = json!({"kwh": 2.5, "nested": {"a": 1}});
+        let body = replay_body("METER-1", ts, &payload);
+
+        assert_eq!(body["meter_id"], "METER-1");
+        assert_eq!(body["payload"], payload);
+        // timestamp serializes to RFC3339 (chrono's serde repr).
+        assert_eq!(body["timestamp"], "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn replay_body_preserves_arbitrary_payload_json() {
+        let ts = chrono::Utc.timestamp_opt(0, 0).unwrap();
+        let payload = json!([1, 2, {"x": true}]);
+        let body = replay_body("m", ts, &payload);
+        assert_eq!(body["payload"], payload);
     }
 }
