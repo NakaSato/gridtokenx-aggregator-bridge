@@ -18,14 +18,24 @@ use crate::state::{
 /// How long a *successful* API-key verification is trusted before re-checking IAM.
 /// Sustained ingest (e.g. a meter fleet at N readings/window) would otherwise call
 /// IAM `VerifyApiKey` once per request — each triggering a Redis event + a DB write —
-/// and saturate IAM, timing out unrelated callers. A short positive-only cache bounds
+/// and saturate IAM, timing out unrelated callers. A short positive cache bounds
 /// that to one IAM round-trip per key per TTL. Trade-off: a revoked/rotated key stays
-/// accepted until its entry expires (≤ TTL). Rejections are NEVER cached, so a freshly
-/// authorized key is picked up immediately.
-const API_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
+/// accepted until its entry expires (≤ TTL).
+const API_KEY_POSITIVE_TTL: Duration = Duration::from_secs(60);
+
+/// How long a *definitive IAM reject* is trusted before re-checking IAM.
+/// A wrong/rotated key replayed on every reading is the symmetric flood vector to a
+/// good key: each request misses the positive cache and hits IAM `VerifyApiKey`. A
+/// short negative cache bounds repeated rejects to one IAM round-trip per key per TTL.
+/// Kept much shorter than the positive TTL so a key that gets authorized right after a
+/// failed first attempt is picked up quickly. Only *definitive IAM rejects* are cached
+/// negatively — an IAM connection error is transient and MUST still fall through to the
+/// static-key fallback, so it is never cached.
+const API_KEY_NEGATIVE_TTL: Duration = Duration::from_secs(10);
 
 struct CachedAuth {
     expires: Instant,
+    valid: bool,
 }
 
 fn api_key_cache() -> &'static Mutex<HashMap<String, CachedAuth>> {
@@ -33,25 +43,32 @@ fn api_key_cache() -> &'static Mutex<HashMap<String, CachedAuth>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Returns true if `key` has a non-expired positive verdict cached.
-fn cache_hit(key: &str) -> bool {
+/// Returns the cached verdict for `key` (`Some(true)` = authorized, `Some(false)` =
+/// rejected) when a non-expired entry exists, else `None`.
+fn cache_lookup(key: &str) -> Option<bool> {
     let mut cache = match api_key_cache().lock() {
         Ok(c) => c,
         Err(p) => p.into_inner(), // poisoned: recover, the map is still usable
     };
     match cache.get(key) {
-        Some(entry) if entry.expires > Instant::now() => true,
+        Some(entry) if entry.expires > Instant::now() => Some(entry.valid),
         Some(_) => {
             cache.remove(key); // expired — drop it so the map doesn't grow unbounded
-            false
+            None
         }
-        None => false,
+        None => None,
     }
 }
 
-/// Record a positive verdict for `key`, valid for `API_KEY_CACHE_TTL`.
-fn cache_store(key: &str) {
+/// Record a verdict for `key`. Positive verdicts last `API_KEY_POSITIVE_TTL`,
+/// negative verdicts the shorter `API_KEY_NEGATIVE_TTL`.
+fn cache_store(key: &str, valid: bool) {
     let now = Instant::now();
+    let ttl = if valid {
+        API_KEY_POSITIVE_TTL
+    } else {
+        API_KEY_NEGATIVE_TTL
+    };
     let mut cache = match api_key_cache().lock() {
         Ok(c) => c,
         Err(p) => p.into_inner(),
@@ -62,7 +79,8 @@ fn cache_store(key: &str) {
     cache.insert(
         key.to_string(),
         CachedAuth {
-            expires: now + API_KEY_CACHE_TTL,
+            expires: now + ttl,
+            valid,
         },
     );
 }
@@ -88,10 +106,19 @@ pub async fn api_key_auth(
         }
     };
 
-    // 1b. Fast path: a recently-verified key skips the IAM round-trip entirely.
-    if cache_hit(&api_key) {
-        state.metrics.record_request(true, 0);
-        return Ok(next.run(req).await);
+    // 1b. Fast path: a recently-decided key skips the IAM round-trip entirely.
+    // A cached reject short-circuits to 401 so a wrong/rotated key replayed every
+    // reading can't flood IAM (symmetric to the positive fast-path below).
+    match cache_lookup(&api_key) {
+        Some(true) => {
+            state.metrics.record_request(true, 0);
+            return Ok(next.run(req).await);
+        }
+        Some(false) => {
+            state.metrics.record_request(false, 0);
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        None => {}
     }
 
     // 2. Verify with IAM Service (gRPC) if available
@@ -112,7 +139,7 @@ pub async fn api_key_auth(
                         res.role, latency_us
                     );
                     state.metrics.record_request(true, latency_us);
-                    cache_store(&api_key);
+                    cache_store(&api_key, true);
                     return Ok(next.run(req).await);
                 } else {
                     warn!(
@@ -120,6 +147,11 @@ pub async fn api_key_auth(
                         res.error_message, latency_us
                     );
                     state.metrics.record_request(false, latency_us);
+                    // Definitive IAM reject: cache it briefly so a replayed bad key
+                    // doesn't re-hit IAM every reading. NOT cached on the Err branch
+                    // below — that is a transient connection failure that must still
+                    // fall through to the static-key fallback.
+                    cache_store(&api_key, false);
                     return Err(StatusCode::UNAUTHORIZED);
                 }
             }
@@ -139,7 +171,7 @@ pub async fn api_key_auth(
     if state.api_keys.iter().any(|k| k == &api_key) {
         info!("✅ API Key authorized via static fallback");
         state.metrics.record_request(true, 0);
-        cache_store(&api_key);
+        cache_store(&api_key, true);
         return Ok(next.run(req).await);
     }
 
@@ -160,14 +192,39 @@ mod tests {
     #[test]
     fn stored_key_is_a_cache_hit() {
         let key = "test-stored-key-unique-1";
-        assert!(!cache_hit(key), "unknown key must miss before store");
-        cache_store(key);
-        assert!(cache_hit(key), "key must hit immediately after store");
+        assert_eq!(cache_lookup(key), None, "unknown key must miss before store");
+        cache_store(key, true);
+        assert_eq!(
+            cache_lookup(key),
+            Some(true),
+            "key must hit positive immediately after store"
+        );
     }
 
     #[test]
     fn unknown_key_is_a_miss() {
-        assert!(!cache_hit("test-never-stored-key-unique-2"));
+        assert_eq!(cache_lookup("test-never-stored-key-unique-2"), None);
+    }
+
+    #[test]
+    fn rejected_key_is_cached_negative() {
+        let key = "test-rejected-key-unique-neg";
+        assert_eq!(cache_lookup(key), None, "unknown key must miss before store");
+        cache_store(key, false);
+        assert_eq!(
+            cache_lookup(key),
+            Some(false),
+            "rejected key must hit negative within TTL so it doesn't re-flood IAM"
+        );
+    }
+
+    #[test]
+    fn negative_ttl_is_shorter_than_positive() {
+        // A rotated/authorized-late key must be re-checked sooner than a trusted one.
+        assert!(
+            API_KEY_NEGATIVE_TTL < API_KEY_POSITIVE_TTL,
+            "negative cache must expire faster than positive"
+        );
     }
 
     #[test]
@@ -180,10 +237,11 @@ mod tests {
                 key.to_string(),
                 CachedAuth {
                     expires: Instant::now() - Duration::from_secs(1),
+                    valid: true,
                 },
             );
         }
-        assert!(!cache_hit(key), "expired entry must miss");
+        assert_eq!(cache_lookup(key), None, "expired entry must miss");
         // And the lookup must have removed it (no unbounded growth of stale keys).
         let cache = api_key_cache().lock().expect("cache lock");
         assert!(
@@ -202,10 +260,11 @@ mod tests {
                 stale.to_string(),
                 CachedAuth {
                     expires: Instant::now() - Duration::from_secs(1),
+                    valid: true,
                 },
             );
         }
-        cache_store(live); // retain() in cache_store should drop the stale entry
+        cache_store(live, true); // retain() in cache_store should drop the stale entry
         let cache = api_key_cache().lock().expect("cache lock");
         assert!(cache.contains_key(live));
         assert!(

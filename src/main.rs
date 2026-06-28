@@ -12,8 +12,8 @@ use tracing::{error, info, warn};
 // aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
 use aggregator_api::{
-    aggregator, auth, dispatch, grid_status, grpc, handlers, infra, ingester, protocol, router,
-    standards, state, telemetry,
+    aggregator, auth, dispatch, grid_status, grpc, handlers, infra, ingester, metrics, protocol,
+    router, standards, state, telemetry,
 };
 
 use tokio::signal;
@@ -330,6 +330,8 @@ async fn main() -> Result<()> {
     } else {
         info!("⚡ Surplus mint DISABLED (needs MINT_VIA_CHAIN_BRIDGE=true + NATS_URL)");
     }
+    // NOTE: the settlement-path gauge is emitted in step 7b, AFTER the global metrics
+    // recorder is installed — emitting here (before set_global_recorder) is a no-op.
 
     // Settlement sink: periodically drains completed 15-minute billing bins. For
     // each bin it (1) writes the TOU/demand `billing` point to InfluxDB (if
@@ -407,11 +409,16 @@ async fn main() -> Result<()> {
                                         let wallet = match reg.resolve_wallet(&serial).await {
                                             Ok(Some(w)) => w,
                                             Ok(None) => {
+                                                // Unregistered meter: aggregates but mints
+                                                // nothing. Counted so this silent skip is
+                                                // visible on dashboards, not just in logs.
                                                 warn!("surplus mint skipped: no wallet registered for meter {serial}");
+                                                metrics::record_mint_outcome("skipped", "no_wallet");
                                                 return;
                                             }
                                             Err(e) => {
                                                 warn!("surplus mint skipped: wallet lookup failed for {serial}: {e}");
+                                                metrics::record_mint_outcome("skipped", "resolve_err");
                                                 return;
                                             }
                                         };
@@ -419,15 +426,23 @@ async fn main() -> Result<()> {
                                             .mint(&wallet, kwh, meter_id, &serial, window_start_ms)
                                             .await
                                         {
-                                            Ok(out) => info!(
-                                                "⚡ minted {kwh} kWh surplus for meter {serial} (sig={}, slot={})",
-                                                out.signature, out.slot
-                                            ),
+                                            Ok(out) => {
+                                                info!(
+                                                    "⚡ minted {kwh} kWh surplus for meter {serial} (sig={}, slot={})",
+                                                    out.signature, out.slot
+                                                );
+                                                metrics::record_mint_outcome("settled", "ok");
+                                            }
                                             Err(e) => {
-                                                warn!("surplus mint failed for meter {serial}: {e}")
+                                                warn!("surplus mint failed for meter {serial}: {e}");
+                                                metrics::record_mint_outcome("failed", "mint_err");
                                             }
                                         }
                                     });
+                                } else {
+                                    // Net consumption — nothing to mint. Counted as the
+                                    // denominator so "skipped" rates are interpretable.
+                                    metrics::record_mint_outcome("no_surplus", "ok");
                                 }
                             }
                         }
@@ -719,6 +734,15 @@ async fn main() -> Result<()> {
     let metrics_handle = metrics_recorder.handle();
     ::metrics::set_global_recorder(metrics_recorder).context("Failed to set metrics recorder")?;
     info!("✅ Prometheus metrics exporter initialized");
+
+    // Publish the active settlement path now that the recorder is installed. Emitted
+    // once at startup (a no-op if done earlier, before set_global_recorder above), so a
+    // silent degrade to mint-disabled is observable on /metrics.
+    metrics::record_settlement_path(if mint_gateway.is_enabled() {
+        "nats"
+    } else {
+        "disabled"
+    });
 
     let app_state = AppState {
         router: iot_router,
