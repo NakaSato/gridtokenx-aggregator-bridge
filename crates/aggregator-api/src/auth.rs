@@ -120,14 +120,24 @@ fn cache_lookup(key: &str) -> Option<bool> {
         Ok(c) => c,
         Err(p) => p.into_inner(), // poisoned: recover, the map is still usable
     };
-    match cache.get(key) {
+    let out = match cache.get(key) {
         Some(entry) if entry.expires > Instant::now() => Some(entry.valid),
         Some(_) => {
             cache.remove(key); // expired — drop it so the map doesn't grow unbounded
             None
         }
         None => None,
-    }
+    };
+    // Track cache effectiveness — mirrors aggregator_cache_lookups_total in
+    // aggregator-persistence (pubkey/enckey/meter_owner). A falling hit-rate flags
+    // key churn or a flood of distinct/bad keys hammering IAM.
+    metrics::counter!(
+        "aggregator_cache_lookups_total",
+        "cache" => "apikey",
+        "result" => if out.is_some() { "hit" } else { "miss" },
+    )
+    .increment(1);
+    out
 }
 
 /// Record a verdict for `key`. Positive verdicts last `API_KEY_POSITIVE_TTL`,
