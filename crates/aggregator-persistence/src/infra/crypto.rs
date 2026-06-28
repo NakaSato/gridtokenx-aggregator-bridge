@@ -17,11 +17,48 @@ use tracing::{debug, warn};
 /// loud `Err` (fail-closed but observable) instead of silently reporting an
 /// invalid signature — a silent `Ok(false)` is indistinguishable from a forged
 /// signature and previously masked a dead connection for hours.
+/// Default seconds a resolved device pubkey is trusted before re-reading Redis.
+/// Override with `PUBKEY_CACHE_TTL_SECS`. SECURITY: this is the device-identity
+/// root, so the TTL **is the revocation latency** — a key removed/rotated in Redis
+/// stays accepted until its cache entry expires. Kept deliberately short (default
+/// 60s) for that reason. The signature itself is still verified on every call; only
+/// the Redis *fetch* of the (static) pubkey is cached, and a cache miss with Redis
+/// unreachable still `Err`s — fail-closed is preserved.
+const PUBKEY_POSITIVE_TTL_SECS: u64 = 60;
+
+/// Default seconds an *absent* pubkey is remembered before re-reading Redis.
+/// Override with `PUBKEY_NEG_CACHE_TTL_SECS`. Bounds the per-reading Redis flood from
+/// an unknown/unprovisioned meter; kept short so a freshly-provisioned device is
+/// accepted within the TTL.
+const PUBKEY_NEGATIVE_TTL_SECS: u64 = 10;
+
+fn pubkey_positive_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_env("PUBKEY_CACHE_TTL_SECS", PUBKEY_POSITIVE_TTL_SECS))
+}
+
+fn pubkey_negative_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_env("PUBKEY_NEG_CACHE_TTL_SECS", PUBKEY_NEGATIVE_TTL_SECS))
+}
+
+/// A cached pubkey verdict: `Some(key)` present+valid, `None` genuinely absent.
+/// Malformed keys are never cached (they `Err` and must re-resolve).
+#[derive(Clone)]
+struct CachedPubkey {
+    key: Option<VerifyingKey>,
+    expires: Instant,
+}
+
 pub struct SignatureVerifier {
     /// Source URL used to (re)build the connection manager after a failure.
     redis_url: Option<String>,
     /// Cached reconnecting manager; `None` until first use or after invalidation.
     conn: Arc<Mutex<Option<ConnectionManager>>>,
+    /// Hot cache of parsed device pubkeys (present/absent) with TTLs, so a device's
+    /// (static) key isn't re-read from Redis on every reading. The signature is still
+    /// verified per call — only the lookup is cached. See [`pubkey_positive_ttl`].
+    pubkey_cache: Arc<Mutex<HashMap<String, CachedPubkey>>>,
 }
 
 impl SignatureVerifier {
@@ -31,6 +68,7 @@ impl SignatureVerifier {
         Self {
             redis_url,
             conn: Arc::new(Mutex::new(None)),
+            pubkey_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -41,6 +79,7 @@ impl SignatureVerifier {
         Self {
             redis_url: None,
             conn: Arc::new(Mutex::new(conn)),
+            pubkey_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -117,46 +156,68 @@ impl SignatureVerifier {
         }
     }
 
+    /// Look up a cached pubkey verdict for `meter_id`, dropping it when expired.
+    async fn pubkey_cache_get(&self, meter_id: &str) -> Option<Option<VerifyingKey>> {
+        let mut cache = self.pubkey_cache.lock().await;
+        match cache.get(meter_id) {
+            Some(e) if e.expires > Instant::now() => Some(e.key),
+            Some(_) => {
+                cache.remove(meter_id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Store a verdict for `meter_id`. Present keys last the positive TTL (= the
+    /// revocation latency), absences the shorter negative TTL. Prunes expired entries.
+    async fn pubkey_cache_put(&self, meter_id: &str, key: Option<VerifyingKey>) {
+        let now = Instant::now();
+        let ttl = if key.is_some() {
+            pubkey_positive_ttl()
+        } else {
+            pubkey_negative_ttl()
+        };
+        let mut cache = self.pubkey_cache.lock().await;
+        cache.retain(|_, v| v.expires > now);
+        cache.insert(
+            meter_id.to_string(),
+            CachedPubkey {
+                key,
+                expires: now + ttl,
+            },
+        );
+    }
+
+    /// Resolve a device's Ed25519 verifying key: hot cache → Redis. Returns
+    /// `Ok(None)` only when the key is genuinely absent (cached negatively); `Err`
+    /// on Redis-unreachable (fail-closed) or a malformed key (never cached). The
+    /// signature is verified by the caller — this only caches the (static) key fetch.
+    async fn resolve_pubkey(&self, meter_id: &str) -> Result<Option<VerifyingKey>> {
+        if let Some(cached) = self.pubkey_cache_get(meter_id).await {
+            return Ok(cached);
+        }
+        let key = format!("gridtokenx:devices:{}:pubkey", meter_id);
+        let resolved: Option<VerifyingKey> = match self.get_with_retry(&key).await? {
+            None => None,
+            Some(raw) => Some(parse_ed25519_pubkey(meter_id, &raw)?),
+        };
+        // Cache only after a clean Redis round-trip + parse (a malformed key Err'd
+        // above and is never cached, so it re-resolves — fail-closed preserved).
+        self.pubkey_cache_put(meter_id, resolved).await;
+        Ok(resolved)
+    }
+
     pub async fn verify_telemetry_signature(
         &self,
         meter_id: &str,
         payload: &[u8],
         signature_base58: &str,
     ) -> Result<bool> {
-        // 1. Lookup device public key from registry (Redis)
-        // Key format: gridtokenx:devices:{meter_id}:pubkey
-        let key = format!("gridtokenx:devices:{}:pubkey", meter_id);
-
-        let public_key_hex: Option<String> = self.get_with_retry(&key).await?;
-
-        let hex_str = public_key_hex
-            .ok_or_else(|| {
-                anyhow!(
-                    "Public key not found in Redis for meter: {} (Key: {})",
-                    meter_id,
-                    key
-                )
-            })?
-            .trim()
-            .to_string();
-
-        let hex_len = hex_str.len();
-
-        // Handle both raw binary and hex string (32 bytes raw or 64 chars hex)
-        let public_key_bytes = if hex_len == 64 {
-            hex::decode(&hex_str)
-                .map_err(|e| anyhow!("Failed to decode hex public key for {}: {}", meter_id, e))?
-        } else {
-            hex_str.into_bytes()
-        };
-
-        if public_key_bytes.is_empty() {
-            return Err(anyhow!(
-                "Decoded public key is empty for meter: {} (Hex length: {})",
-                meter_id,
-                hex_len
-            ));
-        }
+        // 1. Resolve the device public key (hot cache → Redis). Absent ⇒ reject loud.
+        let verifying_key = self.resolve_pubkey(meter_id).await?.ok_or_else(|| {
+            anyhow!("Public key not found in Redis for meter: {}", meter_id)
+        })?;
 
         // 2. Decode signature from base58
         let signature_bytes = bs58::decode(signature_base58)
@@ -174,14 +235,7 @@ impl SignatureVerifier {
 
         let signature = Signature::from_slice(&signature_bytes)?;
 
-        // 3. Verify signature
-        let verifying_key = VerifyingKey::from_bytes(
-            &public_key_bytes
-                .clone()
-                .try_into()
-                .map_err(|_| anyhow!("Invalid key length"))?,
-        )?;
-
+        // 3. Verify signature (always — only the key lookup above is cached)
         let is_valid = verifying_key.verify(payload, &signature).is_ok();
 
         if !is_valid {
@@ -191,7 +245,7 @@ impl SignatureVerifier {
             );
             debug!("   Payload (string): {}", String::from_utf8_lossy(payload));
             debug!("   Payload (hex): {}", hex::encode(payload));
-            debug!("   Public Key (hex): {}", hex::encode(public_key_bytes));
+            debug!("   Public Key (hex): {}", hex::encode(verifying_key.to_bytes()));
             debug!("   Signature (base58): {}", signature_base58);
         }
 
@@ -217,43 +271,87 @@ impl SignatureVerifier {
             return Ok(Vec::new());
         }
 
-        let keys: Vec<String> = meter_ids
-            .iter()
-            .map(|id| format!("gridtokenx:devices:{}:pubkey", id))
-            .collect();
+        // Resolve each pubkey from the hot cache; MGET only the cache-misses. A
+        // resolved key (Some) verifies the signature; absent/malformed ⇒ false (never
+        // fails the whole batch). The signature is always verified — only the key
+        // lookup is cached.
+        let mut vks: Vec<Option<VerifyingKey>> = Vec::with_capacity(meter_ids.len());
+        let mut miss_idx: Vec<usize> = Vec::new();
+        let mut miss_keys: Vec<String> = Vec::new();
+        for (i, id) in meter_ids.iter().enumerate() {
+            match self.pubkey_cache_get(id).await {
+                Some(verdict) => vks.push(verdict),
+                None => {
+                    vks.push(None); // placeholder; filled after MGET
+                    miss_idx.push(i);
+                    miss_keys.push(format!("gridtokenx:devices:{}:pubkey", id));
+                }
+            }
+        }
 
-        // Fetch all public keys in one round-trip (rebuild + retry on failure).
-        let public_keys_hex: Vec<Option<String>> = self.mget_with_retry(&keys).await?;
+        if !miss_keys.is_empty() {
+            let raw: Vec<Option<String>> = self.mget_with_retry(&miss_keys).await?;
+            for (slot, &i) in raw.into_iter().zip(miss_idx.iter()) {
+                let parsed = match slot {
+                    Some(s) => match parse_ed25519_pubkey(&meter_ids[i], &s) {
+                        Ok(vk) => {
+                            self.pubkey_cache_put(&meter_ids[i], Some(vk)).await;
+                            Some(vk)
+                        }
+                        // Malformed ⇒ reject this entry only; don't cache bad data.
+                        Err(e) => {
+                            warn!("🚫 Skipping malformed pubkey in batch: {}", e);
+                            None
+                        }
+                    },
+                    None => {
+                        self.pubkey_cache_put(&meter_ids[i], None).await;
+                        None
+                    }
+                };
+                vks[i] = parsed;
+            }
+        }
 
         let mut results = Vec::with_capacity(meter_ids.len());
-
-        for i in 0..meter_ids.len() {
-            let res = if let Some(hex_str) = &public_keys_hex[i] {
-                let public_key_bytes = if hex_str.len() == 64 {
-                    hex::decode(hex_str.trim()).unwrap_or_default()
-                } else {
-                    hex_str.as_bytes().to_vec()
-                };
-
-                if public_key_bytes.len() != 32 {
-                    false
-                } else {
-                    let vk_res = VerifyingKey::from_bytes(&public_key_bytes.try_into().unwrap());
-                    if let Ok(verifying_key) = vk_res {
-                        let signature = Signature::from_bytes(&signatures[i]);
-                        verifying_key.verify(&payloads[i], &signature).is_ok()
-                    } else {
-                        false
-                    }
+        for (i, vk) in vks.into_iter().enumerate() {
+            let res = match vk {
+                Some(verifying_key) => {
+                    let signature = Signature::from_bytes(&signatures[i]);
+                    verifying_key.verify(&payloads[i], &signature).is_ok()
                 }
-            } else {
-                false
+                None => false,
             };
             results.push(res);
         }
 
         Ok(results)
     }
+}
+
+/// Parse a device Ed25519 verifying key from its Redis value: either 64 hex chars
+/// or 32 raw bytes. Errors loudly on a malformed/wrong-length/invalid-point key —
+/// callers must NOT cache an `Err` (it re-resolves), preserving fail-closed.
+fn parse_ed25519_pubkey(meter_id: &str, raw: &str) -> Result<VerifyingKey> {
+    let s = raw.trim();
+    let bytes = if s.len() == 64 {
+        hex::decode(s)
+            .map_err(|e| anyhow!("Failed to decode hex public key for {}: {}", meter_id, e))?
+    } else {
+        s.as_bytes().to_vec()
+    };
+    if bytes.is_empty() {
+        return Err(anyhow!("Decoded public key is empty for meter: {}", meter_id));
+    }
+    let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+        anyhow!(
+            "Invalid public key length {} (expected 32) for meter: {}",
+            v.len(),
+            meter_id
+        )
+    })?;
+    VerifyingKey::from_bytes(&arr)
+        .map_err(|e| anyhow!("Invalid Ed25519 public key for meter {}: {}", meter_id, e))
 }
 
 /// Decode a hex-encoded AES-256 key to 32 raw bytes. Errors loudly on invalid
@@ -851,6 +949,98 @@ mod tests {
     fn enckey_negative_ttl_shorter_than_positive() {
         assert!(enckey_negative_ttl() < enckey_positive_ttl());
         assert!(ENCKEY_NEGATIVE_TTL_SECS < ENCKEY_POSITIVE_TTL_SECS);
+    }
+
+    /// A cached pubkey verifies a real signature WITHOUT touching Redis (a Redis
+    /// hit would `Err` on a URL-less verifier) — and the signature is still checked.
+    #[tokio::test]
+    async fn cached_pubkey_verifies_without_redis() {
+        let sk = SigningKey::from_bytes(&[21u8; 32]);
+        let vk = sk.verifying_key();
+        let payload = b"telemetry-frame";
+        let sig = sk.sign(payload);
+        let sig_b58 = bs58::encode(sig.to_bytes()).into_string();
+
+        let v = SignatureVerifier::from_manager(None);
+        v.pubkey_cache_put("m-pk", Some(vk)).await;
+        assert!(
+            v.verify_telemetry_signature("m-pk", payload, &sig_b58)
+                .await
+                .expect("cache hit must not reach Redis"),
+            "valid signature over cached key must verify"
+        );
+    }
+
+    /// The signature is verified on every call even on a cache hit: a tampered
+    /// payload against the cached key yields `Ok(false)`, never a cached `true`.
+    #[tokio::test]
+    async fn cached_pubkey_still_rejects_bad_signature() {
+        let sk = SigningKey::from_bytes(&[22u8; 32]);
+        let vk = sk.verifying_key();
+        let sig = sk.sign(b"original");
+        let sig_b58 = bs58::encode(sig.to_bytes()).into_string();
+
+        let v = SignatureVerifier::from_manager(None);
+        v.pubkey_cache_put("m-pk2", Some(vk)).await;
+        assert!(
+            !v.verify_telemetry_signature("m-pk2", b"TAMPERED", &sig_b58)
+                .await
+                .expect("cache hit must not reach Redis"),
+            "signature must still be verified against the (cached) key"
+        );
+    }
+
+    /// A cached *absent* pubkey rejects loud (key not found) without Redis;
+    /// an uncached meter on a URL-less verifier still `Err`s (fail-closed).
+    #[tokio::test]
+    async fn cached_absent_pubkey_errs_without_redis() {
+        let v = SignatureVerifier::from_manager(None);
+        v.pubkey_cache_put("m-absent", None).await;
+        assert!(
+            v.verify_telemetry_signature("m-absent", b"x", DUMMY_SIG_B58)
+                .await
+                .is_err(),
+            "cached absence ⇒ key-not-found Err"
+        );
+        assert!(
+            v.verify_telemetry_signature("m-uncached", b"x", DUMMY_SIG_B58)
+                .await
+                .is_err(),
+            "uncached + no Redis ⇒ fail-closed Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_pubkey_entry_evicted() {
+        let sk = SigningKey::from_bytes(&[23u8; 32]);
+        let v = SignatureVerifier::from_manager(None);
+        v.pubkey_cache.lock().await.insert(
+            "m-old".to_string(),
+            CachedPubkey {
+                key: Some(sk.verifying_key()),
+                expires: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(v.pubkey_cache_get("m-old").await.is_none(), "expired must miss");
+        assert!(
+            !v.pubkey_cache.lock().await.contains_key("m-old"),
+            "expired entry evicted on lookup"
+        );
+    }
+
+    #[test]
+    fn pubkey_negative_ttl_shorter_than_positive() {
+        assert!(pubkey_negative_ttl() < pubkey_positive_ttl());
+        assert!(PUBKEY_NEGATIVE_TTL_SECS < PUBKEY_POSITIVE_TTL_SECS);
+    }
+
+    #[test]
+    fn parse_ed25519_pubkey_accepts_hex_and_rejects_malformed() {
+        let sk = SigningKey::from_bytes(&[24u8; 32]);
+        let hexk = hex::encode(sk.verifying_key().to_bytes());
+        assert!(parse_ed25519_pubkey("m", &format!("  {}\n", hexk)).is_ok());
+        assert!(parse_ed25519_pubkey("m", "nothex!!").is_err());
+        assert!(parse_ed25519_pubkey("m", &"00".repeat(16)).is_err()); // wrong length
     }
 
     async fn seed_enckey(url: &str, meter: &str, hexkey: &str) {
