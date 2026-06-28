@@ -50,6 +50,36 @@ pub fn bin_to_billing_point(bin: &BillingBin) -> Option<TelemetryPoint> {
     })
 }
 
+/// What the settlement flush loop should do with a completed bin's surplus,
+/// given whether minting is enabled. The flush loop (`bin/.../main.rs`) calls
+/// this so the mint-vs-skip policy is a pure, unit-testable decision rather than
+/// branching buried in a `tokio::spawn`. **Eviction is independent of this** —
+/// the loop evicts every completed bin regardless of the decision (bounding the
+/// `active_bins` map); this only governs the mint side effect.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum MintDecision {
+    /// Net generation > consumption — mint this many kWh to the meter owner.
+    Surplus(f64),
+    /// Net consumption / net-zero with minting enabled — nothing to mint, but
+    /// the loop still records a `no_surplus` outcome (the metric denominator).
+    NoSurplus,
+    /// Minting disabled (`MINT_VIA_CHAIN_BRIDGE` off / NATS down) — skip the
+    /// mint path entirely, emit no mint metric.
+    Disabled,
+}
+
+/// Decide what to mint for a completed bin. Pure: mirrors the flush-loop branch
+/// exactly so the loop can be a thin caller.
+pub fn plan_mint(bin: &BillingBin, mint_enabled: bool) -> MintDecision {
+    if !mint_enabled {
+        return MintDecision::Disabled;
+    }
+    match bin.net_surplus_kwh() {
+        Some(kwh) => MintDecision::Surplus(kwh),
+        None => MintDecision::NoSurplus,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +134,42 @@ mod tests {
 
         // Timestamp is the window close (end_time), not start.
         assert_eq!(point.timestamp_ns, 1_700_000_900 * 1_000_000_000);
+    }
+
+    // --- plan_mint: the flush-loop mint-vs-skip policy ---
+
+    #[test]
+    fn plan_mint_disabled_skips_regardless_of_surplus() {
+        // sample_bin is net-import, but even a surplus bin must yield Disabled
+        // when minting is off — no metric, no mint.
+        let mut bin = sample_bin();
+        bin.energy_generated = Decimal::new(100, 1); // 10.0 > consumed 4.0 (surplus)
+        assert_eq!(plan_mint(&bin, false), MintDecision::Disabled);
+    }
+
+    #[test]
+    fn plan_mint_net_import_yields_no_surplus() {
+        // sample_bin: generated 1.5 < consumed 4.0 → nothing to mint.
+        assert_eq!(plan_mint(&sample_bin(), true), MintDecision::NoSurplus);
+    }
+
+    #[test]
+    fn plan_mint_surplus_yields_net_kwh() {
+        let mut bin = sample_bin();
+        bin.energy_generated = Decimal::new(100, 1); // 10.0
+        bin.energy_consumed = Decimal::new(40, 1); // 4.0  → net surplus 6.0
+        assert_eq!(plan_mint(&bin, true), MintDecision::Surplus(6.0));
+    }
+
+    #[test]
+    fn plan_mint_net_zero_is_no_surplus_not_a_zero_mint() {
+        let mut bin = sample_bin();
+        bin.energy_generated = Decimal::new(40, 1);
+        bin.energy_consumed = Decimal::new(40, 1); // exactly net-zero
+        assert_eq!(
+            plan_mint(&bin, true),
+            MintDecision::NoSurplus,
+            "net-zero must not mint a 0 kWh surplus"
+        );
     }
 }

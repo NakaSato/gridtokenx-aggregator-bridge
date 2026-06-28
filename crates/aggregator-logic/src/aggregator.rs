@@ -353,6 +353,40 @@ mod tests {
     }
 
     #[test]
+    fn flush_drain_evicts_completed_bins_but_keeps_open_ones() {
+        // Mirrors the settlement flush loop: peek completed bins, then
+        // remove_bins(their keys). The invariant that bounds the otherwise-
+        // unbounded active_bins map is that EVERY completed bin is evicted while
+        // a still-open window survives for more readings.
+        let mut agg = Aggregator::new();
+        // Two distinct closed windows (different meters → different bins).
+        reading(&mut agg, 30, 0, gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25));
+        reading(&mut agg, 12, 0, gridtokenx_telemetry::time::now() - chrono::Duration::minutes(40));
+        // One open (current-window) bin that must NOT be evicted.
+        reading(&mut agg, 5, 0, gridtokenx_telemetry::time::now());
+
+        let completed = agg.peek_completed_bins(chrono::Duration::zero());
+        assert_eq!(completed.len(), 2, "both closed windows are completed");
+
+        let keys: Vec<_> = completed.iter().map(|b| b.key()).collect();
+        agg.remove_bins(&keys);
+
+        // All completed bins gone (map bounded); the open window remains.
+        assert!(
+            agg.peek_completed_bins(chrono::Duration::zero()).is_empty(),
+            "every completed bin must be evicted by the drain"
+        );
+        // The open bin still accumulates — a later reading folds into it, proving
+        // it survived eviction rather than being dropped.
+        let still_open = reading(&mut agg, 3, 0, gridtokenx_telemetry::time::now());
+        assert_eq!(
+            still_open.energy_generated,
+            Decimal::from(8),
+            "open window survived the drain and kept accumulating (5 + 3)"
+        );
+    }
+
+    #[test]
     fn peek_grace_delays_recently_closed_window() {
         // Grace guard: a window that closed only moments ago is held back so a
         // late/buffered reading can still land in it before a consumer reads the bin.

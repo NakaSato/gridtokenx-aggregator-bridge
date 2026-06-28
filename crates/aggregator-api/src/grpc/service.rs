@@ -169,6 +169,46 @@ fn bulk_skip_verify_allowed(skip_verify_env: bool, secure_mode: bool) -> bool {
     !secure_mode && skip_verify_env
 }
 
+/// Split a packed bulk-raw payload into `(frame_bytes, signature)` pairs.
+///
+/// Wire layout per entry: `[frame_len: 1B][frame: frame_len B][signature: 64B]`.
+/// Parsing stops (and drops the trailing bytes) at the first entry that would run
+/// past the buffer — a truncated tail is ignored, never partially processed, so a
+/// frame can never be paired with the wrong or a truncated signature. Pure (no
+/// Redis/decrypt) so the framing + bounds matrix is unit-testable.
+fn split_bulk_frames(payload: &[u8]) -> Vec<(&[u8], [u8; 64])> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor < payload.len() {
+        let frame_len = payload[cursor] as usize;
+        cursor += 1;
+        // Need the full frame AND its 64-byte signature, or stop.
+        if cursor + frame_len + 64 > payload.len() {
+            break;
+        }
+        let frame_bytes = &payload[cursor..cursor + frame_len];
+        cursor += frame_len;
+        let mut sig = [0u8; 64];
+        sig.copy_from_slice(&payload[cursor..cursor + 64]);
+        cursor += 64;
+        out.push((frame_bytes, sig));
+    }
+    out
+}
+
+/// Canonical Ed25519 sign-target for a gRPC meter reading:
+/// `{meter_id}:{kwh}:{timestamp}`. Mirrors the REST canonical
+/// `{device_id}:{value}:{timestamp}` (see `handlers::canonical_sign_value`) so a
+/// meter signs an identical target on either transport. Pure (one source of the
+/// format) so a drift in the separator/order is caught.
+fn grpc_sign_target(
+    meter_id: impl std::fmt::Display,
+    kwh: impl std::fmt::Display,
+    timestamp: i64,
+) -> String {
+    format!("{meter_id}:{kwh}:{timestamp}")
+}
+
 // Unified Ingestion Pattern: Both Path A and Path B handled through single verified entry
 impl OracleService for AggregatorServiceImpl {
     /// Bulk Raw Ingestion: Optimized for high-throughput simulators.
@@ -179,7 +219,6 @@ impl OracleService for AggregatorServiceImpl {
         request: OwnedView<BulkRawRequestView<'static>>,
     ) -> Result<(BulkRawResponse, Context), ConnectError> {
         let payload = &request.payload;
-        let mut cursor = 0;
         let mut processed_count = 0;
 
         let mut meter_ids = Vec::with_capacity(request.meter_count as usize);
@@ -187,29 +226,12 @@ impl OracleService for AggregatorServiceImpl {
         let mut signatures = Vec::with_capacity(request.meter_count as usize);
         let mut frames = Vec::with_capacity(request.meter_count as usize);
 
-        // 1. Unpack and Pre-parse frames
-        while cursor < payload.len() {
-            let frame_len = payload[cursor] as usize;
-            cursor += 1;
-            if cursor + frame_len + 64 > payload.len() {
-                break;
-            }
-
-            let frame_bytes = &payload[cursor..cursor + frame_len];
-            cursor += frame_len;
-            let mut sig_bytes = [0u8; 64];
-            sig_bytes.copy_from_slice(&payload[cursor..cursor + 64]);
-            cursor += 64;
-
+        // 1. Unpack (pure framing/bounds in split_bulk_frames) and pre-parse frames.
+        for (frame_bytes, sig_bytes) in split_bulk_frames(payload) {
             // Resolve per-device key, decrypt, parse (prod/dev policy in decode_secure_frame).
+            // Bulk verifies against the binary payload for speed (see step 2).
             if let Some(frame) = self.decode_secure_frame(frame_bytes).await {
                 let meter_id = frame.logical_device_name.clone();
-
-                // Note: We need the canonical string for signature verification,
-                // but the current version simply verifies against the binary payload
-                // if the canonical string fails (as seen in ingest()).
-                // For bulk, we'll verify against the binary payload for speed.
-
                 meter_ids.push(meter_id);
                 payloads_for_sig.push(frame_bytes.to_vec());
                 signatures.push(sig_bytes);
@@ -316,7 +338,8 @@ impl OracleService for AggregatorServiceImpl {
         let sig_verified = if let Some(signature) = request.signature.as_deref() {
             // Reconstruct canonical target with sequence/ms support (UTT-H Protocol)
             // Note: In a real deployment, sequence would be tracked in Redis to prevent reuse.
-            let sign_target = format!("{}:{}:{}", request.meter_id, request.kwh, request.timestamp);
+            let sign_target =
+                grpc_sign_target(&request.meter_id, &request.kwh, request.timestamp);
 
             let is_verified = match self
                 .state
@@ -475,7 +498,7 @@ impl OracleService for AggregatorServiceImpl {
             // signed-but-invalid and unsigned are both rejected unless
             // AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY=true.
             let sig_verified = if let Some(signature) = tel.signature.as_deref() {
-                let sign_target = format!("{}:{}:{}", tel.meter_id, tel.kwh, tel.timestamp);
+                let sign_target = grpc_sign_target(tel.meter_id, tel.kwh, tel.timestamp);
                 let is_verified = match self
                     .state
                     .signature_verifier
@@ -702,5 +725,76 @@ mod tests {
         assert!(!bulk_skip_verify_allowed(true, true));
         assert!(bulk_skip_verify_allowed(true, false));
         assert!(!bulk_skip_verify_allowed(false, false));
+    }
+
+    // --- bulk-raw payload framing (security: frame ↔ signature pairing + bounds) ---
+
+    /// Pack one bulk entry: `[len][frame][64-byte sig]`.
+    fn pack_entry(frame: &[u8], sig_fill: u8) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.push(frame.len() as u8);
+        v.extend_from_slice(frame);
+        v.extend_from_slice(&[sig_fill; 64]);
+        v
+    }
+
+    #[test]
+    fn split_bulk_frames_parses_each_entry_with_its_own_signature() {
+        let mut payload = pack_entry(&[0xAA, 0xBB], 1);
+        payload.extend(pack_entry(&[0xCC], 2));
+
+        let out = split_bulk_frames(&payload);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, &[0xAA, 0xBB]);
+        assert_eq!(out[0].1, [1u8; 64]);
+        assert_eq!(out[1].0, &[0xCC]);
+        assert_eq!(out[1].1, [2u8; 64], "each frame keeps its own signature");
+    }
+
+    #[test]
+    fn split_bulk_frames_drops_truncated_tail_not_partial() {
+        // One valid entry followed by a declared len that overruns the buffer.
+        let mut payload = pack_entry(&[0x01], 7);
+        payload.push(50); // claims a 50-byte frame; nowhere near present
+        payload.extend_from_slice(&[0xFF, 0xFF]);
+
+        let out = split_bulk_frames(&payload);
+        assert_eq!(out.len(), 1, "the complete entry parses; the truncated tail is dropped");
+        assert_eq!(out[0].0, &[0x01]);
+    }
+
+    #[test]
+    fn split_bulk_frames_empty_payload_is_empty() {
+        assert!(split_bulk_frames(&[]).is_empty());
+    }
+
+    #[test]
+    fn split_bulk_frames_zero_length_frame_still_consumes_signature() {
+        // A 0-length frame is legal framing: len byte + 0 frame bytes + 64 sig.
+        let payload = pack_entry(&[], 9);
+        let out = split_bulk_frames(&payload);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].0.is_empty());
+        assert_eq!(out[0].1, [9u8; 64]);
+    }
+
+    #[test]
+    fn split_bulk_frames_missing_signature_bytes_is_dropped() {
+        // Frame present but fewer than 64 signature bytes follow ⇒ entry dropped
+        // (never pair a frame with a short/garbage signature).
+        let mut payload = Vec::new();
+        payload.push(1); // len = 1
+        payload.push(0x42); // the frame byte
+        payload.extend_from_slice(&[0u8; 10]); // only 10 of the 64 sig bytes
+        assert!(split_bulk_frames(&payload).is_empty());
+    }
+
+    // --- canonical gRPC sign-target ---
+
+    #[test]
+    fn grpc_sign_target_is_meter_kwh_timestamp() {
+        assert_eq!(grpc_sign_target("METER042", "12.5", 1_700_000_000), "METER042:12.5:1700000000");
+        // Zero / negative timestamps render verbatim (no flooring on the gRPC path).
+        assert_eq!(grpc_sign_target("M", "0", 0), "M:0:0");
     }
 }

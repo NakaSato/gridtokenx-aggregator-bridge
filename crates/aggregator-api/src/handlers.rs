@@ -54,6 +54,58 @@ pub fn simulator_bypass_allowed() -> bool {
     !secure_mode_enabled()
 }
 
+/// Normalize a declared REST protocol to the stack it resolves to: an empty or
+/// `auto` value resolves to `dlms` (the only meter protocol); anything else is
+/// lowercased and honored verbatim (`simulator` is the unsigned dev bypass).
+fn resolve_protocol(raw: &str) -> String {
+    let p = raw.to_lowercase();
+    if p.is_empty() || p == "auto" {
+        "dlms".to_string()
+    } else {
+        p
+    }
+}
+
+/// Whether a *resolved* protocol is one the ingest paths accept. `auto`/empty
+/// must be passed through [`resolve_protocol`] first (they resolve to `dlms`).
+fn is_supported_protocol(resolved: &str) -> bool {
+    matches!(resolved, "dlms" | "simulator")
+}
+
+/// Secure-mode meter-path gate. Returns the status to reject with, or `None` to
+/// proceed. `AGGREGATOR_REQUIRE_SECURE=true` requires an authenticated
+/// `dlms-enc` frame, so any non-encrypted frame (plaintext `dlms`, `simulator`,
+/// downgrade) is refused with `426 UPGRADE_REQUIRED` before it can reach a dev
+/// bypass. The batch path carries no per-frame encryption, so it passes
+/// `was_encrypted = false` (rejected wholesale in secure mode).
+fn secure_mode_gate(secure_mode: bool, was_encrypted: bool) -> Option<StatusCode> {
+    if secure_mode && !was_encrypted {
+        Some(StatusCode::UPGRADE_REQUIRED)
+    } else {
+        None
+    }
+}
+
+/// Status to return for a signature-verification outcome, or `None` to continue
+/// processing (signature valid, OR enforcement disabled so unverified telemetry
+/// is accepted in dev). Encodes the fail-closed default: an invalid signature is
+/// `403 FORBIDDEN`, a verification *error* (e.g. Redis unreachable) is
+/// `401 UNAUTHORIZED` — distinct so a transport failure is not reported as a
+/// forged signature. Both are suppressed when `enforcement_disabled` is true.
+fn sig_failure_status(
+    verified: &anyhow::Result<bool>,
+    enforcement_disabled: bool,
+) -> Option<StatusCode> {
+    if enforcement_disabled {
+        return None;
+    }
+    match verified {
+        Ok(true) => None,
+        Ok(false) => Some(StatusCode::FORBIDDEN),
+        Err(_) => Some(StatusCode::UNAUTHORIZED),
+    }
+}
+
 /// The numeric value a DLMS/COSEM meter signs in its canonical
 /// `{device_id}:{value}:{timestamp}` Ed25519 sign-target.
 ///
@@ -311,13 +363,13 @@ pub async fn ingest_private_network(
     // 0b. Secure mode: the meter path must be an authenticated encrypted frame.
     // Reject any non-`dlms-enc` frame (plaintext `dlms`, `simulator`, downgrade)
     // before it can reach a bypass.
-    if secure_mode_enabled() && !was_encrypted {
+    if let Some(code) = secure_mode_gate(secure_mode_enabled(), was_encrypted) {
         warn!(
             "🚫 Secure mode: rejecting non-encrypted frame (protocol '{}') for {}",
             payload.protocol, payload.device_id
         );
         return (
-            StatusCode::UPGRADE_REQUIRED,
+            code,
             Json(json!({ "error": "secure mode requires an encrypted dlms-enc frame" })),
         )
             .into_response();
@@ -372,13 +424,9 @@ pub async fn ingest_private_network(
     // DLMS/COSEM is the only meter protocol. `auto` or an empty protocol field
     // resolves to `dlms` (no detection needed); `simulator` is the unsigned dev
     // ingest bypass handled below.
-    let mut protocol = payload.protocol.to_lowercase();
-    if protocol.is_empty() || protocol == "auto" {
-        protocol = "dlms".to_string();
-    }
+    let protocol = resolve_protocol(&payload.protocol);
 
-    const SUPPORTED: [&str; 2] = ["dlms", "simulator"];
-    if !SUPPORTED.contains(&protocol.as_str()) {
+    if !is_supported_protocol(&protocol) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Unsupported protocol: {}", protocol) })),
@@ -402,7 +450,7 @@ pub async fn ingest_private_network(
         );
         true
     } else {
-        match verify_rest_signature(
+        let result = verify_rest_signature(
             &state,
             &payload.device_id,
             &payload.payload,
@@ -410,8 +458,19 @@ pub async fn ingest_private_network(
             &canonical_value,
             timestamp_ms,
         )
-        .await
-        {
+        .await;
+        // Fail-closed status decision (403 invalid / 401 verify-error), unless
+        // the dev escape hatch is on — see `sig_failure_status`.
+        if let Some(code) = sig_failure_status(&result, signature_enforcement_disabled()) {
+            let msg = match &result {
+                Ok(false) => "Invalid Ed25519 signature".to_string(),
+                Err(e) => format!("Verification failed: {}", e),
+                Ok(true) => unreachable!("sig_failure_status returns None for Ok(true)"),
+            };
+            warn!("🚫 REST signature rejected for {}: {}", payload.device_id, msg);
+            return (code, Json(json!({ "error": msg }))).into_response();
+        }
+        match result {
             Ok(true) => {
                 info!(
                     "✅ Telemetry signature verified (REST) for {}",
@@ -419,31 +478,8 @@ pub async fn ingest_private_network(
                 );
                 true
             }
-            Ok(false) => {
-                warn!(
-                    "🚫 Invalid telemetry signature (REST) for {}",
-                    payload.device_id
-                );
-                if !signature_enforcement_disabled() {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(json!({ "error": "Invalid Ed25519 signature" })),
-                    )
-                        .into_response();
-                }
-                false
-            }
-            Err(e) => {
-                warn!("⚠️ Verification error for {}: {}", payload.device_id, e);
-                if !signature_enforcement_disabled() {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({ "error": format!("Verification failed: {}", e) })),
-                    )
-                        .into_response();
-                }
-                false
-            }
+            // Enforcement disabled (dev): proceed but mark the reading unverified.
+            _ => false,
         }
     };
 
@@ -593,10 +629,12 @@ pub async fn ingest_private_network_batch(
     // Secure mode: only the encrypted single-frame REST path is permitted. The
     // batch path carries no per-frame encryption, so reject it wholesale rather
     // than accept plaintext telemetry in a locked-down deployment.
-    if secure_mode_enabled() {
+    // Batch carries no per-frame encryption, so it is never "encrypted" — secure
+    // mode rejects it wholesale (use the encrypted single-frame path instead).
+    if let Some(code) = secure_mode_gate(secure_mode_enabled(), false) {
         warn!("🚫 Secure mode: rejecting plaintext batch ingest (use the encrypted REST path)");
         return (
-            StatusCode::UPGRADE_REQUIRED,
+            code,
             Json(json!({ "error": "secure mode: encrypted single-frame REST ingest only" })),
         )
             .into_response();
@@ -607,10 +645,14 @@ pub async fn ingest_private_network_batch(
     );
     let mut responses = Vec::new();
     // DLMS/COSEM is the only meter protocol; `auto`/empty resolve to `dlms`,
-    // `simulator` is the unsigned dev bypass.
+    // `simulator` is the unsigned dev bypass. Validate the declared top protocol
+    // once: empty/`auto` are allowed (they resolve to dlms), else it must be a
+    // supported resolved protocol.
     let top_protocol = payload.protocol.to_lowercase();
-    const SUPPORTED: [&str; 3] = ["dlms", "simulator", "auto"];
-    if !top_protocol.is_empty() && !SUPPORTED.contains(&top_protocol.as_str()) {
+    let top_ok = top_protocol.is_empty()
+        || top_protocol == "auto"
+        || is_supported_protocol(&top_protocol);
+    if !top_ok {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Unsupported protocol: {}", top_protocol) })),
@@ -620,11 +662,7 @@ pub async fn ingest_private_network_batch(
 
     for item in payload.readings {
         // `auto`/empty resolve to dlms; otherwise honor the declared protocol.
-        let protocol = if top_protocol.is_empty() || top_protocol == "auto" {
-            "dlms".to_string()
-        } else {
-            top_protocol.clone()
-        };
+        let protocol = resolve_protocol(&top_protocol);
         let device_id = item
             .get("device_id")
             .or_else(|| item.get("meter_id"))
@@ -765,9 +803,11 @@ pub async fn ingest_private_network_batch(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_sign_value, rest_sign_candidates, secure_mode_enabled,
-        signature_enforcement_disabled, simulator_bypass_allowed,
+        canonical_sign_value, is_supported_protocol, resolve_protocol, rest_sign_candidates,
+        secure_mode_enabled, secure_mode_gate, sig_failure_status, signature_enforcement_disabled,
+        simulator_bypass_allowed,
     };
+    use axum::http::StatusCode;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -797,6 +837,65 @@ mod tests {
 
         std::env::remove_var("AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY");
         std::env::remove_var("AGGREGATOR_REQUIRE_SECURE");
+    }
+
+    // --- REST route status decisions (G1: handler-level status mapping) ---
+
+    #[test]
+    fn resolve_protocol_maps_empty_and_auto_to_dlms() {
+        assert_eq!(resolve_protocol(""), "dlms");
+        assert_eq!(resolve_protocol("auto"), "dlms");
+        assert_eq!(resolve_protocol("AUTO"), "dlms"); // case-insensitive
+        assert_eq!(resolve_protocol("DLMS"), "dlms"); // lowercased
+        assert_eq!(resolve_protocol("simulator"), "simulator");
+        assert_eq!(resolve_protocol("modbus"), "modbus"); // unknown passes through verbatim
+    }
+
+    #[test]
+    fn supported_protocols_are_dlms_and_simulator_only() {
+        assert!(is_supported_protocol("dlms"));
+        assert!(is_supported_protocol("simulator"));
+        assert!(!is_supported_protocol("modbus"));
+        assert!(!is_supported_protocol("auto")); // must be resolved first
+        assert!(!is_supported_protocol(""));
+    }
+
+    #[test]
+    fn secure_mode_gate_426s_only_unencrypted_in_secure_mode() {
+        // Locked-down + non-encrypted frame → 426 UPGRADE_REQUIRED.
+        assert_eq!(
+            secure_mode_gate(true, false),
+            Some(StatusCode::UPGRADE_REQUIRED)
+        );
+        // Locked-down but already encrypted → proceed.
+        assert_eq!(secure_mode_gate(true, true), None);
+        // Not locked-down → never gates, encrypted or not.
+        assert_eq!(secure_mode_gate(false, false), None);
+        assert_eq!(secure_mode_gate(false, true), None);
+    }
+
+    #[test]
+    fn sig_failure_status_is_fail_closed_403_invalid_401_error() {
+        // Enforcing (hatch off): invalid sig → 403, verify error → 401, valid → proceed.
+        assert_eq!(sig_failure_status(&Ok(true), false), None);
+        assert_eq!(
+            sig_failure_status(&Ok(false), false),
+            Some(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            sig_failure_status(&Err(anyhow::anyhow!("redis down")), false),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn sig_failure_status_hatch_open_accepts_unverified() {
+        // Enforcement disabled (dev hatch): every outcome proceeds (None).
+        assert_eq!(sig_failure_status(&Ok(false), true), None);
+        assert_eq!(
+            sig_failure_status(&Err(anyhow::anyhow!("redis down")), true),
+            None
+        );
     }
 
     /// Outside secure mode, signature enforcement is on by default and only the

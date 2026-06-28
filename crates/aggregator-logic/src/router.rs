@@ -12,13 +12,60 @@ use aggregator_persistence::infra::influxdb::{InfluxWriter, TelemetryPoint};
 /// Default maximum number of entries per Redis stream.
 const DEFAULT_MAX_STREAM_LEN: usize = 100_000;
 
+/// Self-healing cache of a reconnecting resource (here a Redis `ConnectionManager`).
+///
+/// Holds the last-built handle; [`invalidate`](Self::invalidate) drops it so the
+/// next [`get_or_build`](Self::get_or_build) rebuilds via the supplied async
+/// builder. This is the state machine behind `Router`'s retry-once self-heal: on a
+/// transport error the caller `invalidate`s then `get_or_build`s, so a Redis
+/// restart is recovered inline instead of freezing the bridge. Generic + builder-
+/// injected so the rebuild/cache/error semantics are unit-testable without Redis.
+struct ReconnectCache<T: Clone> {
+    cached: Mutex<Option<T>>,
+}
+
+impl<T: Clone> ReconnectCache<T> {
+    /// New cache, optionally pre-seeded with an already-built handle.
+    fn new(initial: Option<T>) -> Self {
+        Self {
+            cached: Mutex::new(initial),
+        }
+    }
+
+    /// Return the cached handle if present, else build one via `build`, cache it,
+    /// and return it. The builder runs **only** on a cache miss; a build error
+    /// propagates and leaves the cache empty (so the next call retries).
+    async fn get_or_build<F, Fut, E>(&self, build: F) -> std::result::Result<T, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+    {
+        {
+            let guard = self.cached.lock().await;
+            if let Some(c) = guard.as_ref() {
+                return Ok(c.clone());
+            }
+        }
+        let built = build().await?;
+        let mut guard = self.cached.lock().await;
+        *guard = Some(built.clone());
+        Ok(built)
+    }
+
+    /// Drop the cached handle so the next [`get_or_build`](Self::get_or_build) rebuilds.
+    async fn invalidate(&self) {
+        let mut guard = self.cached.lock().await;
+        *guard = None;
+    }
+}
+
 /// Routes normalized `DeviceReading` events to zone-partitioned Redis Streams.
 pub struct Router {
     /// Redis URL used to rebuild the connection after a server restart.
     redis_url: String,
-    /// Cached reconnecting manager; rebuilt on transport error so a Redis
+    /// Self-healing connection cache; rebuilt on transport error so a Redis
     /// restart is recovered inline rather than failing the first request.
-    conn: Arc<Mutex<Option<ConnectionManager>>>,
+    cache: ReconnectCache<ConnectionManager>,
     /// Approximate cap for each stream (MAXLEN ~).
     max_stream_len: usize,
     /// Number of zone partitions
@@ -50,7 +97,7 @@ impl Router {
 
         Ok(Self {
             redis_url: redis_url.to_string(),
-            conn: Arc::new(Mutex::new(Some(connection_manager))),
+            cache: ReconnectCache::new(Some(connection_manager)),
             max_stream_len,
             num_zones,
             influx,
@@ -70,26 +117,21 @@ impl Router {
     /// Return a live connection manager clone, rebuilding from `redis_url` after
     /// an [`invalidate`](Self::invalidate). Errors loudly when Redis is down.
     async fn conn(&self) -> Result<ConnectionManager> {
-        {
-            let guard = self.conn.lock().await;
-            if let Some(c) = guard.as_ref() {
-                return Ok(c.clone());
-            }
-        }
-        let client = redis::Client::open(self.redis_url.as_str())
-            .map_err(|e| anyhow!("Failed to open Redis client {}: {}", self.redis_url, e))?;
-        let mgr = ConnectionManager::new(client)
+        let url = self.redis_url.clone();
+        self.cache
+            .get_or_build(|| async move {
+                let client = redis::Client::open(url.as_str())
+                    .map_err(|e| anyhow!("Failed to open Redis client {}: {}", url, e))?;
+                ConnectionManager::new(client)
+                    .await
+                    .map_err(|e| anyhow!("Failed to connect to Redis {}: {}", url, e))
+            })
             .await
-            .map_err(|e| anyhow!("Failed to connect to Redis {}: {}", self.redis_url, e))?;
-        let mut guard = self.conn.lock().await;
-        *guard = Some(mgr.clone());
-        Ok(mgr)
     }
 
     /// Drop the cached manager so the next [`conn`](Self::conn) rebuilds it.
     async fn invalidate(&self) {
-        let mut guard = self.conn.lock().await;
-        *guard = None;
+        self.cache.invalidate().await;
     }
 
     /// Determine zone index for a reading
@@ -344,6 +386,70 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    // --- ReconnectCache: the Redis self-heal state machine (no Redis needed) ---
+
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    #[tokio::test]
+    async fn reconnect_cache_serves_seeded_handle_without_building() {
+        let cache = ReconnectCache::new(Some("initial".to_string()));
+        let builds = AtomicUsize::new(0);
+        let got = cache
+            .get_or_build(|| {
+                builds.fetch_add(1, SeqCst);
+                async { Ok::<_, ()>("rebuilt".to_string()) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, "initial", "cached handle is served as-is");
+        assert_eq!(builds.load(SeqCst), 0, "builder must not run on a cache hit");
+    }
+
+    #[tokio::test]
+    async fn reconnect_cache_rebuilds_exactly_once_after_invalidate_then_caches() {
+        let cache = ReconnectCache::new(Some(1u32));
+        cache.invalidate().await; // simulate a transport error dropping the conn
+        let builds = AtomicUsize::new(0);
+
+        let v = cache
+            .get_or_build(|| {
+                builds.fetch_add(1, SeqCst);
+                async { Ok::<_, ()>(42u32) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(v, 42, "rebuilt handle returned");
+        assert_eq!(builds.load(SeqCst), 1, "rebuilt exactly once");
+
+        // A subsequent call hits the freshly-cached handle — no second rebuild.
+        let v2 = cache
+            .get_or_build(|| {
+                builds.fetch_add(1, SeqCst);
+                async { Ok::<_, ()>(99u32) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(v2, 42, "second call serves the cached rebuild, not a new build");
+        assert_eq!(builds.load(SeqCst), 1, "no rebuild on the cached path");
+    }
+
+    #[tokio::test]
+    async fn reconnect_cache_propagates_build_error_and_stays_empty_for_retry() {
+        let cache = ReconnectCache::<u32>::new(None);
+        // First build fails (Redis still down) → error surfaces, cache stays empty.
+        let err = cache
+            .get_or_build(|| async { Err::<u32, &str>("redis down") })
+            .await;
+        assert_eq!(err, Err("redis down"));
+        // Because the cache stayed empty, the next attempt retries the builder
+        // (a failed rebuild must never poison the cache with a stale/None hit).
+        let ok = cache
+            .get_or_build(|| async { Ok::<u32, &str>(7) })
+            .await
+            .unwrap();
+        assert_eq!(ok, 7);
+    }
+
     #[tokio::test]
     async fn test_router_hashing_consistency() {
         let reading = DeviceReading {
@@ -476,5 +582,49 @@ mod tests {
             ..reading
         };
         assert!(calculate_zone_index(10, &reading_out_of_bounds) < 10);
+    }
+
+    /// Live XADD + self-heal end-to-end. Disseminates once on the seeded
+    /// connection, then `invalidate`s and disseminates again — exercising the
+    /// `ReconnectCache` rebuild path (the same recovery used after a Redis
+    /// restart) against a real server, and verifies both entries land in the
+    /// zone stream. Complements the Redis-free `reconnect_cache_*` unit tests.
+    #[tokio::test]
+    #[ignore = "requires a running Redis (default redis://127.0.0.1:6379, override REDIS_URL)"]
+    async fn disseminate_and_self_heal_against_real_redis() {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        // 4 zones; ZONE1 (from the helper) resolves to zone index 1 deterministically.
+        let router = Router::new(&url, 4, None)
+            .await
+            .expect("router connects to Redis");
+        let reading = energy_reading_with_metadata(std::collections::HashMap::new());
+        let zone_stream = "gridtokenx:events:zone_1";
+
+        let before: usize = {
+            let mut conn = router.conn().await.expect("conn");
+            conn.xlen(zone_stream).await.unwrap_or(0)
+        };
+
+        // 1) XADD on the seeded connection.
+        let id1 = router.disseminate(&reading).await.expect("first disseminate");
+        assert!(!id1.is_empty());
+
+        // 2) Drop the cached manager, then disseminate again — must rebuild from
+        //    the URL and succeed (the self-heal that survives a Redis restart).
+        router.invalidate().await;
+        let id2 = router
+            .disseminate(&reading)
+            .await
+            .expect("disseminate after invalidate must rebuild the connection");
+        assert!(!id2.is_empty());
+
+        // Both readings actually landed in the zone stream.
+        let mut conn = router.conn().await.expect("conn");
+        let after: usize = conn.xlen(zone_stream).await.expect("xlen");
+        assert!(
+            after >= before + 2,
+            "both disseminated readings present in {zone_stream} (before={before}, after={after})"
+        );
     }
 }

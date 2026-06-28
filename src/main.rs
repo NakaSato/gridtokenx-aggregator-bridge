@@ -39,6 +39,18 @@ fn expand_env(s: &str) -> String {
     result
 }
 
+/// Parse the comma-separated `GRIDTOKENX_API_KEYS` value into the static
+/// fallback key list. Empty entries are dropped — critical, because the seeded
+/// IAM key is a placeholder (empty-string hash) and an empty static key would
+/// otherwise authorize a request that sends a blank `X-API-KEY`. Splitting an
+/// empty string yields one empty element, so an unset/blank var ⇒ no keys.
+fn parse_api_keys(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Build a rustls `ServerConfig` that requires and verifies client certificates
 /// (mTLS) against `client_ca_path`, presenting the server identity from
 /// `cert_path`/`key_path`. Used when `IOT_GATEWAY_TLS_CLIENT_CA` is set so the
@@ -397,9 +409,10 @@ async fn main() -> Result<()> {
                             // (2) Surplus mint — fire-and-forget so a slow bridge
                             // never stalls the sweep. The bridge idempotency key
                             // mint:{serial}:{window_start_ms} + on-chain PDA dedup
-                            // any replay (e.g. a crash before eviction).
-                            if settle_mint.is_enabled() {
-                                if let Some(kwh) = bin.net_surplus_kwh() {
+                            // any replay (e.g. a crash before eviction). The
+                            // mint-vs-skip decision is the pure `plan_mint`.
+                            match aggregator_api::billing_sink::plan_mint(bin, settle_mint.is_enabled()) {
+                                aggregator_api::billing_sink::MintDecision::Surplus(kwh) => {
                                     let gw = settle_mint.clone();
                                     let reg = settle_registry.clone();
                                     let serial = bin.meter_serial.clone();
@@ -439,11 +452,13 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     });
-                                } else {
+                                }
+                                aggregator_api::billing_sink::MintDecision::NoSurplus => {
                                     // Net consumption — nothing to mint. Counted as the
                                     // denominator so "skipped" rates are interpretable.
                                     metrics::record_mint_outcome("no_surplus", "ok");
                                 }
+                                aggregator_api::billing_sink::MintDecision::Disabled => {}
                             }
                         }
                         if written > 0 {
@@ -458,11 +473,7 @@ async fn main() -> Result<()> {
         });
     }
     let api_keys_raw = std::env::var("GRIDTOKENX_API_KEYS").unwrap_or_default();
-    let api_keys: Vec<String> = api_keys_raw
-        .split(',')
-        .map(|s| s.to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let api_keys = parse_api_keys(&api_keys_raw);
 
     // 7. Initialize New Architecture Infrastructure
     info!("🏗️ Initializing New Architecture Infrastructure...");
@@ -963,7 +974,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::expand_env;
+    use super::{build_mtls_server_config, expand_env, parse_api_keys};
 
     // expand_env reads process env, so these tests use uniquely-named vars to
     // avoid colliding with anything real or each other under parallel runs.
@@ -1005,5 +1016,83 @@ mod tests {
     fn unterminated_placeholder_is_left_untouched() {
         // No closing brace ⇒ the loop breaks, returning the input as-is (no hang).
         assert_eq!(expand_env("prefix${UNCLOSED"), "prefix${UNCLOSED");
+    }
+
+    // --- parse_api_keys: static-fallback key list (G5 config) ---
+
+    #[test]
+    fn parse_api_keys_unset_or_blank_yields_no_keys() {
+        // Splitting "" gives one empty element, which is filtered → no keys. This
+        // is why a blank GRIDTOKENX_API_KEYS can't authorize a blank X-API-KEY.
+        assert!(parse_api_keys("").is_empty());
+        assert!(parse_api_keys(",").is_empty());
+        assert!(parse_api_keys(",,").is_empty());
+    }
+
+    #[test]
+    fn parse_api_keys_splits_and_drops_empty_entries() {
+        assert_eq!(parse_api_keys("a,b,c"), vec!["a", "b", "c"]);
+        // Empty entries between/around commas are dropped.
+        assert_eq!(parse_api_keys("a,,b"), vec!["a", "b"]);
+        assert_eq!(parse_api_keys("a,"), vec!["a"]);
+        assert_eq!(parse_api_keys(",a"), vec!["a"]);
+    }
+
+    #[test]
+    fn parse_api_keys_does_not_trim_whitespace() {
+        // No trimming: keys are matched verbatim, so a stray space is its own key
+        // (documents the behavior — keep commas tight in config).
+        assert_eq!(parse_api_keys(" a , b "), vec![" a ", " b "]);
+    }
+
+    // --- build_mtls_server_config: fail-loud on bad cert material (G5 startup) ---
+    // The happy path needs a valid CA-signed chain (exercised by e2e); these lock
+    // the error branches — a misconfigured mTLS gateway must Err, never panic.
+    // All three bail before the rustls builder, so no crypto provider is needed.
+
+    fn tmp_file(name: &str, content: &[u8]) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("agg_mtls_test_{}_{}", std::process::id(), name));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn build_mtls_rejects_missing_cert_file() {
+        let mut missing = std::env::temp_dir();
+        missing.push(format!("agg_mtls_absent_{}.pem", std::process::id()));
+        let r = build_mtls_server_config(
+            missing.to_str().unwrap(),
+            missing.to_str().unwrap(),
+            missing.to_str().unwrap(),
+        );
+        assert!(r.is_err(), "missing cert file must Err, not panic");
+    }
+
+    #[test]
+    fn build_mtls_rejects_missing_key_file() {
+        // Cert present (non-PEM ⇒ empty chain, no open error) but key file absent.
+        let cert = tmp_file("cert_for_missing_key.pem", b"not a real pem\n");
+        let mut absent_key = std::env::temp_dir();
+        absent_key.push(format!("agg_mtls_nokey_{}.pem", std::process::id()));
+        let r = build_mtls_server_config(
+            cert.to_str().unwrap(),
+            absent_key.to_str().unwrap(),
+            cert.to_str().unwrap(),
+        );
+        let _ = std::fs::remove_file(&cert);
+        assert!(r.is_err(), "missing key file must Err");
+    }
+
+    #[test]
+    fn build_mtls_rejects_garbage_pem_with_no_private_key() {
+        // All files exist but contain no PEM key ⇒ "no private key" Err.
+        let cert = tmp_file("garbage_cert.pem", b"garbage\n");
+        let key = tmp_file("garbage_key.pem", b"also garbage\n");
+        let r =
+            build_mtls_server_config(cert.to_str().unwrap(), key.to_str().unwrap(), cert.to_str().unwrap());
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+        assert!(r.is_err(), "no parseable private key must Err");
     }
 }

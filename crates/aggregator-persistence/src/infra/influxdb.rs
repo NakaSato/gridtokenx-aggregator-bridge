@@ -168,6 +168,22 @@ async fn run_writer(client: Client, bucket: String, mut rx: mpsc::Receiver<Telem
     }
 }
 
+/// Drain `batch`, converting each point to a `DataPoint` and skipping (logging)
+/// any that fail to build (e.g. a point with no fields). Pure — no client — so
+/// the convert/skip/drain behavior is unit-testable. The batch is **always**
+/// emptied, even when every point is malformed, so a bad batch can't wedge the
+/// queue.
+fn drain_to_data_points(batch: &mut Vec<TelemetryPoint>) -> Vec<DataPoint> {
+    let mut points = Vec::with_capacity(batch.len());
+    for tp in batch.drain(..) {
+        match tp.into_data_point() {
+            Ok(dp) => points.push(dp),
+            Err(e) => warn!("⚠️ Skipping malformed InfluxDB point: {}", e),
+        }
+    }
+    points
+}
+
 /// Write the current batch, draining it regardless of outcome (a write failure
 /// drops that batch loudly rather than retrying forever and stalling the queue).
 async fn flush(client: &Client, bucket: &str, batch: &mut Vec<TelemetryPoint>) {
@@ -175,13 +191,7 @@ async fn flush(client: &Client, bucket: &str, batch: &mut Vec<TelemetryPoint>) {
         return;
     }
     let count = batch.len();
-    let mut points = Vec::with_capacity(count);
-    for tp in batch.drain(..) {
-        match tp.into_data_point() {
-            Ok(dp) => points.push(dp),
-            Err(e) => warn!("⚠️ Skipping malformed InfluxDB point: {}", e),
-        }
-    }
+    let points = drain_to_data_points(batch);
 
     if points.is_empty() {
         return;
@@ -224,6 +234,37 @@ mod tests {
     fn into_data_point_zone_none_ok() {
         // Missing zone simply omits the tag — still a valid point.
         assert!(point(None).into_data_point().is_ok());
+    }
+
+    /// A point with no fields: InfluxDB requires ≥1 field, so `into_data_point`
+    /// fails to build — the canonical "malformed" case the flush path must skip.
+    fn malformed_point() -> TelemetryPoint {
+        let mut p = point(None);
+        p.fields = vec![];
+        p
+    }
+
+    #[test]
+    fn malformed_point_fails_to_build() {
+        // Guards the test premise: a fields-less point really is unbuildable.
+        assert!(malformed_point().into_data_point().is_err());
+    }
+
+    #[test]
+    fn drain_to_data_points_keeps_valid_skips_malformed_and_empties_batch() {
+        let mut batch = vec![point(Some("Z1")), malformed_point(), point(None)];
+        let points = drain_to_data_points(&mut batch);
+        assert_eq!(points.len(), 2, "2 valid kept, 1 malformed skipped");
+        assert!(batch.is_empty(), "batch is drained regardless of skips");
+    }
+
+    #[test]
+    fn drain_to_data_points_all_malformed_yields_empty_but_drains() {
+        // Even an all-bad batch must drain — otherwise it would wedge the queue.
+        let mut batch = vec![malformed_point(), malformed_point()];
+        let points = drain_to_data_points(&mut batch);
+        assert!(points.is_empty());
+        assert!(batch.is_empty(), "all-malformed batch still fully drained");
     }
 
     #[test]

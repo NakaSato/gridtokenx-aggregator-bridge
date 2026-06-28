@@ -85,6 +85,23 @@ impl BatchHandle {
     }
 }
 
+/// Group entry IDs by their Redis stream, for batched XACK. Pure (no Redis) so
+/// the ACK grouping is unit-testable: every entry's id is mapped under its own
+/// stream and none is dropped — a mis-group would leave messages unacked (→
+/// redelivered) or ack the wrong stream.
+fn group_entry_ids_by_stream(
+    entries: &[BatchEntry],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for entry in entries {
+        map.entry(entry.stream_name.clone())
+            .or_default()
+            .push(entry.entry_id.clone());
+    }
+    map
+}
+
 /// Worker that manages the batching and forwarding logic (UTT Pipeline)
 pub struct BatchWorker {
     // Vestigial: the live forward path is a Redis-ACK bypass (see `flush`), so the
@@ -233,15 +250,8 @@ impl BatchWorker {
         let count = entries.len();
         let mut conn = self.connection_manager.clone();
 
-        // Group by stream for efficient XACK
-        let mut stream_id_map: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        for entry in &entries {
-            stream_id_map
-                .entry(entry.stream_name.clone())
-                .or_default()
-                .push(entry.entry_id.clone());
-        }
+        // Group by stream for efficient XACK (pure — see group_entry_ids_by_stream).
+        let stream_id_map = group_entry_ids_by_stream(&entries);
 
         for (stream_name, ids) in stream_id_map {
             let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
@@ -287,6 +297,32 @@ mod tests {
             meter_serial: serial.to_string(),
             ..Default::default()
         }
+    }
+
+    fn entry(stream: &str, id: &str) -> BatchEntry {
+        BatchEntry {
+            request: reading("SN"),
+            stream_name: stream.to_string(),
+            entry_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn group_entry_ids_by_stream_groups_per_stream_preserving_all_ids() {
+        let entries = vec![
+            entry("stream-a", "1-0"),
+            entry("stream-b", "2-0"),
+            entry("stream-a", "3-0"),
+        ];
+        let map = group_entry_ids_by_stream(&entries);
+        assert_eq!(map.len(), 2, "one bucket per distinct stream");
+        assert_eq!(map["stream-a"], vec!["1-0", "3-0"], "ids kept in order, none dropped");
+        assert_eq!(map["stream-b"], vec!["2-0"]);
+    }
+
+    #[test]
+    fn group_entry_ids_by_stream_empty_is_empty() {
+        assert!(group_entry_ids_by_stream(&[]).is_empty());
     }
 
     #[tokio::test]

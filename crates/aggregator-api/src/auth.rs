@@ -54,6 +54,55 @@ fn negative_ttl() -> Duration {
     *T.get_or_init(|| ttl_from_env("API_KEY_NEG_CACHE_TTL_SECS", API_KEY_NEGATIVE_TTL_SECS))
 }
 
+/// Normalized result of the IAM `VerifyApiKey` round-trip, collapsing the
+/// gRPC `Ok`/`Err` + `valid` flag into the three cases the auth policy cares
+/// about. Keeping this separate from the action keeps the reject-vs-error
+/// security invariant a single, pure, unit-testable decision.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum IamVerdict {
+    /// IAM affirmatively authorized the key.
+    Authorized,
+    /// IAM affirmatively *rejected* the key — definitive, NOT a transport
+    /// failure. Must NOT fall through to the static-key fallback.
+    Rejected,
+    /// IAM could not be reached (connection error) or no client is configured.
+    /// Transient: MUST fall through to the static-key fallback and is never
+    /// cached (the next request re-checks once IAM is back).
+    Unavailable,
+}
+
+/// What the middleware does after consulting IAM, before any static-key check.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PostIam {
+    /// Cache positive, run the request.
+    Allow,
+    /// Cache negative, return 401 — no static fallback.
+    Deny,
+    /// Do not cache; fall through to the static-key check.
+    TryStatic,
+}
+
+/// Map an IAM verdict to the next action. Encodes the security invariant: only a
+/// *connection failure* (`Unavailable`) reaches the static-key fallback — a
+/// definitive IAM reject is final (401, no fallback).
+fn post_iam_action(verdict: IamVerdict) -> PostIam {
+    match verdict {
+        IamVerdict::Authorized => PostIam::Allow,
+        IamVerdict::Rejected => PostIam::Deny,
+        IamVerdict::Unavailable => PostIam::TryStatic,
+    }
+}
+
+/// Whether a post-IAM action should be written to the verdict cache, and with
+/// what validity. `None` = don't cache (transient IAM failure must re-check).
+fn cache_verdict_for(action: PostIam) -> Option<bool> {
+    match action {
+        PostIam::Allow => Some(true),
+        PostIam::Deny => Some(false),
+        PostIam::TryStatic => None,
+    }
+}
+
 struct CachedAuth {
     expires: Instant,
     valid: bool,
@@ -138,8 +187,10 @@ pub async fn api_key_auth(
         None => {}
     }
 
-    // 2. Verify with IAM Service (gRPC) if available
-    if let Some(ref identity_client) = state.identity_client {
+    // 2. Verify with IAM Service (gRPC) if available, normalizing the outcome to
+    //    an `IamVerdict` so the reject-vs-error policy is one pure, tested
+    //    decision (`post_iam_action`) rather than tangled control flow.
+    let verdict = if let Some(ref identity_client) = state.identity_client {
         let start = std::time::Instant::now();
         let request = ApiKeyRequest {
             key: api_key.clone(),
@@ -156,20 +207,14 @@ pub async fn api_key_auth(
                         res.role, latency_us
                     );
                     state.metrics.record_request(true, latency_us);
-                    cache_store(&api_key, true);
-                    return Ok(next.run(req).await);
+                    IamVerdict::Authorized
                 } else {
                     warn!(
                         "🚫 API Key rejected by IAM: {} [{}us]",
                         res.error_message, latency_us
                     );
                     state.metrics.record_request(false, latency_us);
-                    // Definitive IAM reject: cache it briefly so a replayed bad key
-                    // doesn't re-hit IAM every reading. NOT cached on the Err branch
-                    // below — that is a transient connection failure that must still
-                    // fall through to the static-key fallback.
-                    cache_store(&api_key, false);
-                    return Err(StatusCode::UNAUTHORIZED);
+                    IamVerdict::Rejected
                 }
             }
             Err(e) => {
@@ -179,9 +224,25 @@ pub async fn api_key_auth(
                     e, latency_us
                 );
                 state.metrics.record_request(false, latency_us);
-                // Fall through to static key check
+                IamVerdict::Unavailable
             }
         }
+    } else {
+        // No IAM client configured behaves like an unreachable IAM: fall through
+        // to the static-key fallback (never a silent deny).
+        IamVerdict::Unavailable
+    };
+
+    let action = post_iam_action(verdict);
+    // Cache the decision per `cache_verdict_for` — positive/negative are cached
+    // (bound IAM load on replays), a transient `TryStatic` is never cached.
+    if let Some(valid) = cache_verdict_for(action) {
+        cache_store(&api_key, valid);
+    }
+    match action {
+        PostIam::Allow => return Ok(next.run(req).await),
+        PostIam::Deny => return Err(StatusCode::UNAUTHORIZED),
+        PostIam::TryStatic => {} // fall through to the static-key check below
     }
 
     // 3. Fallback to static keys
@@ -266,6 +327,48 @@ mod tests {
         assert!(
             !cache.contains_key(key),
             "expired entry must be evicted on lookup"
+        );
+    }
+
+    // --- reject-vs-error policy (the documented security invariant) ---
+    // The static-key fallback exists ONLY for a transient IAM outage. A
+    // definitive IAM reject must be final (401, no fallback), or a key IAM
+    // explicitly revoked could still be honored by a stale static key.
+
+    #[test]
+    fn iam_authorized_allows() {
+        assert_eq!(post_iam_action(IamVerdict::Authorized), PostIam::Allow);
+    }
+
+    #[test]
+    fn iam_reject_denies_and_never_tries_static() {
+        let action = post_iam_action(IamVerdict::Rejected);
+        assert_eq!(action, PostIam::Deny);
+        assert_ne!(
+            action,
+            PostIam::TryStatic,
+            "a definitive IAM reject must NOT fall through to the static-key fallback"
+        );
+    }
+
+    #[test]
+    fn iam_unavailable_falls_through_to_static() {
+        // Connection error OR no client configured → both map to Unavailable,
+        // which is the ONLY verdict permitted to reach the static-key fallback.
+        assert_eq!(post_iam_action(IamVerdict::Unavailable), PostIam::TryStatic);
+    }
+
+    #[test]
+    fn reject_is_cached_but_transient_failure_is_not() {
+        // Allow/Deny are cached (bound IAM load on replays); a transient
+        // TryStatic must NOT be cached, or one IAM blip would pin a key to the
+        // static path until the (uncached) entry it never wrote expired.
+        assert_eq!(cache_verdict_for(PostIam::Allow), Some(true));
+        assert_eq!(cache_verdict_for(PostIam::Deny), Some(false));
+        assert_eq!(
+            cache_verdict_for(PostIam::TryStatic),
+            None,
+            "a transient IAM failure must never be cached"
         );
     }
 
