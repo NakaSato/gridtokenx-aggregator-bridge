@@ -304,6 +304,38 @@ pub fn record_ven_event(outcome: &str) {
 }
 
 // =============================================================================
+// Settlement / Surplus-Mint Metrics
+// =============================================================================
+
+/// Records a surplus-mint settlement outcome per completed billing bin:
+/// "settled" (minted on-chain via Chain Bridge), "skipped" (the bin aggregated
+/// but no token was issued — most often an unregistered meter with no recipient
+/// wallet, which otherwise fails silently), "failed" (the bridge/NATS mint call
+/// errored), or "no_surplus" (net consumption — nothing to mint). `reason`
+/// qualifies the outcome ("no_wallet", "resolve_err", "mint_err", "ok").
+pub fn record_mint_outcome(outcome: &str, reason: &str) {
+    counter!("aggregator_mint_total",
+        "outcome" => outcome.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Records which settlement path is active for surplus-mint dissemination:
+/// "nats" (signed `chain.tx.mint` over NATS request-reply) or "disabled"
+/// (minting off — `MINT_VIA_CHAIN_BRIDGE` unset or NATS unreachable). Set once
+/// at startup; a future direct-gRPC mint path would report "grpc". Emits the
+/// active path as `1` and the others as `0` so a single
+/// `aggregator_settlement_path{path="..."} == 1` series names the mode without a
+/// stale label lingering at 1 after a mode change.
+pub fn record_settlement_path(path: &str) {
+    for candidate in ["nats", "grpc", "disabled"] {
+        gauge!("aggregator_settlement_path", "path" => candidate.to_string())
+            .set(if candidate == path { 1.0 } else { 0.0 });
+    }
+}
+
+// =============================================================================
 // Batch Forwarding Metrics
 // =============================================================================
 
@@ -382,6 +414,17 @@ mod tests {
     fn dispatch_recorders_do_not_panic() {
         record_dispatch_outcome("FLEX_UP", "openleadr", "fired");
         record_ven_event("executed");
+    }
+
+    #[test]
+    fn settlement_recorders_do_not_panic() {
+        record_mint_outcome("settled", "ok");
+        record_mint_outcome("skipped", "no_wallet"); // unregistered meter
+        record_mint_outcome("skipped", "resolve_err");
+        record_mint_outcome("failed", "mint_err");
+        record_mint_outcome("no_surplus", "ok");
+        record_settlement_path("nats");
+        record_settlement_path("disabled");
     }
 
     #[test]
