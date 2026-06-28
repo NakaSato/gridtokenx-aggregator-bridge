@@ -48,6 +48,28 @@ ZK-rollup "Path B" was removed).
   dev/legacy plaintext fallback is gated behind `ALLOW_PLAINTEXT_DLMS=true` and
   logged loud. Redis-unreachable / malformed key ⇒ loud skip, never a silent
   plaintext decode.
+- **REST `dlms-enc` envelope (the JSON counterpart of the binary frame).** The
+  HTTP IoT gateway is mTLS; a meter POSTs `{"protocol":"dlms-enc","device_id":…,
+  "payload":{"enc":{"counter":<i64>,"nonce":<b64 12B>,"ciphertext":<b64>,"kid":<i64?>}}}`.
+  `decrypt_dlms_envelope` (`crates/aggregator-api/src/handlers.rs:178`) AES-256-GCM
+  decrypts with AAD `device_id:counter`; the plaintext is the canonical
+  (sorted-keys, no-space) OBIS JSON — the same object a plaintext `dlms` frame
+  carries, including its inner Ed25519 signature — so post-decrypt the path is
+  identical to plaintext (`payload.protocol` is rewritten to `dlms`). **Order
+  matters:** authenticate (GCM) BEFORE touching the replay store, so a forged
+  frame never advances the counter; only an authenticated frame bumps it via
+  `check_and_bump_counter` (`handlers.rs:258`). Outcomes: decrypt/contract
+  failure ⇒ `400`, replayed/non-increasing counter ⇒ `409`, and under secure
+  mode a non-`dlms-enc` meter frame ⇒ `426` (`handlers.rs:314`).
+- **Rotated (versioned) per-device key.** When the envelope carries a `kid`, the
+  key is the Vault-Transit-wrapped GUEK at `gridtokenx:devices:{meter_id}:enckey:v{kid}`
+  (absent `kid` ⇒ the legacy unversioned `enckey`). `get_device_aes_key_versioned`
+  (`crates/aggregator-persistence/src/infra/crypto.rs:611`) reads the wrapped blob
+  (`:624`), unwraps via Vault, and caches by `(meter_id, kid)`. The sender keeps a
+  small **grace window** of prior versions live so frames signed under the previous
+  key still decode across a rotation; the simulator reconciles its prune state from
+  Redis on restart so old `enckey:v*` versions are bounded to the grace count
+  rather than leaking across restarts.
 - **Protocol resolution.** DLMS/COSEM is the only meter protocol. An ingest
   request with `protocol = "auto"` (or omitted) resolves to `dlms`; the only
   other accepted value is `simulator` (unsigned dev bypass). Wired into single
