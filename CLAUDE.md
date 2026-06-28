@@ -129,6 +129,20 @@ Tunables: `BILLING_FLUSH_INTERVAL_SECS` (default 30), `BILLING_FLUSH_GRACE_SECS`
 `MINT_VIA_CHAIN_BRIDGE`, `NATS_URL`, `CHAIN_BRIDGE_SERVICE_IDENTITY`. `BillingBin` carries `#[serde(default)]`
 TOU/demand fields so bins persisted before these existed still deserialize on crash recovery.
 
+Durability (two crash-safety closures, both degrade-safe):
+- **Durable billing bins** (`DURABLE_BINS`, default **on** when Redis reachable). The in-flight 15-min bins
+  are write-through'd to a Redis hash `gridtokenx:billing:bins` (field `{meter_id}:{window_start_ms}` =
+  JSON bin) by the ingest edge, deleted on settlement eviction, and **restored** into the aggregator at
+  startup — so a crash mid-window no longer loses the partial gen/cons totals (`BinStore`,
+  `crates/aggregator-logic/src/bin_store.rs`; restore in `src/main.rs`). The write is fire-and-forget
+  (mirrors the InfluxDB sink) so Redis latency never blocks ingest; a Redis fault degrades to memory-only
+  with a `warn!`. `DURABLE_BINS=false` forces memory-only.
+- **JetStream mint emit.** The mint intent is published to JetStream and **awaits the PubAck** (durable
+  store in the bridge's `chain.tx.*` stream) before awaiting the reply, instead of a fire-and-forget core
+  NATS publish — closing the prior silent-drop gap if the consumer was momentarily absent
+  (`NatsMintGateway`, `crates/aggregator-persistence/src/infra/mint.rs`). The reply still rides core NATS;
+  the signed envelope, idempotency key, and request/reply timeout are unchanged.
+
 > SECURITY: `NatsMintGateway` **signs** the mint envelope with this service's mTLS client key
 > (P-256/ECDSA over the canonical bytes) and attaches an `EnvelopeAuth` (cert PEM + signature), so the
 > bridge binds the self-asserted `service_identity` to a CA-issued cert and rejects spoofed identities

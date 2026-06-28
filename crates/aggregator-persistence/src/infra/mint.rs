@@ -281,6 +281,11 @@ impl MintGateway {
 /// generation mint over NATS request-reply. Carries only intent — no Solana types.
 pub struct NatsMintGateway {
     client: async_nats::Client,
+    /// JetStream context over the same connection. Mint intents are published
+    /// here (not core NATS) so the broker persists them in the `chain.tx.*`
+    /// stream and returns a PubAck — closing the prior fire-and-forget gap where
+    /// a mint could vanish if the consumer was momentarily absent.
+    jetstream: async_nats::jetstream::Context,
     service_identity: String,
     request_timeout: std::time::Duration,
     /// Mint-envelope signer; `None` in insecure dev (no client cert) ⇒ unsigned.
@@ -288,7 +293,9 @@ pub struct NatsMintGateway {
 }
 
 impl NatsMintGateway {
-    /// Creates a gateway over a connected NATS client.
+    /// Creates a gateway over a connected NATS client. Builds a JetStream
+    /// context over the same connection for durable, acked mint publishes; the
+    /// core client is retained for the reply-subject subscription.
     #[must_use]
     fn new(
         client: async_nats::Client,
@@ -296,8 +303,10 @@ impl NatsMintGateway {
         request_timeout: std::time::Duration,
         signer: Option<EnvelopeSigner>,
     ) -> Self {
+        let jetstream = async_nats::jetstream::new(client.clone());
         Self {
             client,
+            jetstream,
             service_identity,
             request_timeout,
             signer,
@@ -338,17 +347,26 @@ impl NatsMintGateway {
         let payload = serde_json::to_vec(&msg).context("encode mint intent")?;
 
         // Subscribe to the reply BEFORE publishing so the result can't be missed.
+        // The reply rides core NATS (the bridge replies to this ephemeral
+        // subject); only the durable mint *intent* below goes through JetStream.
         let mut sub = self
             .client
             .subscribe(reply_subject.clone())
             .await
             .map_err(|e| anyhow!("subscribe mint reply: {e}"))?;
 
-        self.client
+        // Publish the mint intent to JetStream and AWAIT the PubAck — this
+        // confirms the broker durably stored the message in the `chain.tx.*`
+        // stream before we wait for a reply. A missing stream / broker fault
+        // surfaces as `Err` here (caller logs; the bin still evicts and the
+        // idempotency key dedups any later retry) rather than a silent drop.
+        let ack = self
+            .jetstream
             .publish(MINT_SUBJECT, payload.into())
             .await
-            .map_err(|e| anyhow!("publish mint intent: {e}"))?;
-        let _ = self.client.flush().await;
+            .map_err(|e| anyhow!("publish mint intent (jetstream): {e}"))?;
+        ack.await
+            .map_err(|e| anyhow!("mint intent not acked by jetstream: {e}"))?;
 
         let reply = tokio::time::timeout(self.request_timeout, sub.next())
             .await

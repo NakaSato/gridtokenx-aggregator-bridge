@@ -10,7 +10,7 @@
 
 pub use aggregator_core::models;
 pub use aggregator_logic::{
-    aggregator, billing_sink, dispatch, grid_status, metrics, router, standards,
+    aggregator, billing_sink, bin_store, dispatch, grid_status, metrics, router, standards,
 };
 pub use aggregator_persistence::infra;
 pub use aggregator_stacks as protocol;

@@ -176,6 +176,17 @@ impl Aggregator {
         }
     }
 
+    /// Bulk-loads bins recovered from the durable store at startup (crash
+    /// recovery). Each bin is keyed by its `(meter_id, window_start)` so it
+    /// resumes accumulating from its persisted totals; an already-present key is
+    /// overwritten by the restored bin. Pure (no I/O) — the caller fetches the
+    /// bins from the async durable store and hands them in.
+    pub fn restore_bins(&mut self, bins: Vec<BillingBin>) {
+        for bin in bins {
+            self.active_bins.insert(bin.key(), bin);
+        }
+    }
+
     /// Helper to calculate the start of the 15-minute window for a given timestamp
     fn get_window_start(&self, time: DateTime<Utc>) -> DateTime<Utc> {
         let minute = (time.minute() / WINDOW_MINUTES) * WINDOW_MINUTES;
@@ -384,6 +395,37 @@ mod tests {
             Decimal::from(8),
             "open window survived the drain and kept accumulating (5 + 3)"
         );
+    }
+
+    #[test]
+    fn restore_bins_reloads_windows_that_keep_accumulating() {
+        // Crash-recovery path: a bin persisted by the durable store is restored
+        // into a fresh aggregator, then a later reading in the same window folds
+        // into the restored totals (proves it re-keyed correctly).
+        let mut agg = Aggregator::new();
+        let restored = BillingBin {
+            meter_id: Uuid::nil(),
+            user_id: Uuid::nil(),
+            meter_serial: "M1".to_string(),
+            start_time: at(10, 0, 0),
+            end_time: at(10, 15, 0),
+            energy_generated: Decimal::from(10),
+            energy_consumed: Decimal::from(2),
+            reading_count: 3,
+            energy_generated_peak: Decimal::ZERO,
+            energy_generated_offpeak: Decimal::ZERO,
+            energy_consumed_peak: Decimal::ZERO,
+            energy_consumed_offpeak: Decimal::ZERO,
+            max_demand_kw: Decimal::ZERO,
+        };
+        agg.restore_bins(vec![restored]);
+
+        // A new reading in the SAME [10:00,10:15) window must fold into the
+        // restored bin, not start a fresh one.
+        let bin = reading(&mut agg, 5, 1, at(10, 7, 0));
+        assert_eq!(bin.energy_generated, Decimal::from(15), "restored 10 + new 5");
+        assert_eq!(bin.energy_consumed, Decimal::from(3), "restored 2 + new 1");
+        assert_eq!(bin.reading_count, 4, "restored count carried forward (3 + 1)");
     }
 
     #[test]

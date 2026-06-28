@@ -208,6 +208,39 @@ async fn main() -> Result<()> {
         pg_pool,
     ));
 
+    // 4c. Durable billing-bin store (crash recovery of in-flight 15-min windows).
+    // Enabled when Redis is reachable AND DURABLE_BINS != "false" (default on).
+    // Degrade-safe: no Redis ⇒ None ⇒ the aggregator runs memory-only exactly as
+    // before. The ingest edge write-throughs each updated bin; this loop's
+    // eviction deletes the durable entry; startup restores the rest.
+    let durable_bins_enabled =
+        std::env::var("DURABLE_BINS").map_or(true, |v| !v.eq_ignore_ascii_case("false"));
+    let bin_store = match (durable_bins_enabled, early_redis_conn.clone()) {
+        (true, Some(conn)) => Some(Arc::new(aggregator_api::bin_store::BinStore::new(conn))),
+        (true, None) => {
+            warn!("⚠️ DURABLE_BINS requested but Redis unavailable — billing bins are memory-only (a crash mid-window loses the partial bin).");
+            None
+        }
+        (false, _) => {
+            info!("ℹ️ Durable billing bins DISABLED (DURABLE_BINS=false) — memory-only.");
+            None
+        }
+    };
+
+    // Restore any in-flight bins persisted before a restart, so the settlement
+    // loop sees windows that were accumulating when the process last stopped.
+    if let Some(store) = &bin_store {
+        match store.load_all().await {
+            Ok(bins) if !bins.is_empty() => {
+                let n = bins.len();
+                aggregator.lock().await.restore_bins(bins);
+                info!("♻️ Restored {n} in-flight billing bin(s) from durable store");
+            }
+            Ok(_) => info!("✅ Durable billing bins ENABLED (no in-flight bins to restore)"),
+            Err(e) => warn!("⚠️ Could not restore durable billing bins ({e}); starting empty (memory-only until next write)."),
+        }
+    }
+
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
 
@@ -260,6 +293,7 @@ async fn main() -> Result<()> {
         meter_registry.clone(),
         frequency_monitor.clone(),
         stream_cipher.clone(),
+        bin_store.clone(),
     )
     .await
     {
@@ -350,6 +384,7 @@ async fn main() -> Result<()> {
         let settle_mint = mint_gateway.clone();
         let settle_registry = meter_registry.clone();
         let billing_influx = billing_influx;
+        let settle_bin_store = bin_store.clone();
         let interval_secs = std::env::var("BILLING_FLUSH_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -377,7 +412,7 @@ async fn main() -> Result<()> {
                     _ = ticker.tick() => {
                         // Drain and evict under the lock, then process the owned
                         // snapshot without holding the mutex (mint may be slow).
-                        let bins = {
+                        let (bins, settled_keys) = {
                             let mut agg = billing_agg.lock().await;
                             let bins = agg.peek_completed_bins(grace);
                             if bins.is_empty() {
@@ -385,8 +420,19 @@ async fn main() -> Result<()> {
                             }
                             let keys: Vec<_> = bins.iter().map(|b| b.key()).collect();
                             agg.remove_bins(&keys);
-                            bins
+                            (bins, keys)
                         };
+
+                        // Drop the durable entries for the bins we just settled +
+                        // evicted from memory. After this point the bin is fully
+                        // processed (Influx written, mint spawned), so deleting is
+                        // safe; a delete fault only leaves a stale entry that the
+                        // mint idempotency key dedups on the next restart.
+                        if let Some(store) = &settle_bin_store {
+                            if let Err(e) = store.remove(&settled_keys).await {
+                                warn!("durable bin eviction failed (stale entries remain, deduped by idempotency key): {e}");
+                            }
+                        }
 
                         let mut written = 0usize;
                         for bin in &bins {

@@ -47,6 +47,10 @@ pub struct ZoneEventIngester {
     /// At-rest stream encryption. When set, stream entries arrive as an `enc`
     /// envelope that is AES-256-GCM decrypted back to the reading before decode.
     stream_cipher: Option<Arc<crate::infra::stream_cipher::StreamCipher>>,
+    /// Durable billing-bin store. When set, each updated bin is write-through'd
+    /// to Redis (fire-and-forget) so a restart recovers in-flight windows. `None`
+    /// ⇒ memory-only (durable bins disabled or Redis unavailable).
+    bin_store: Option<Arc<aggregator_logic::bin_store::BinStore>>,
 }
 
 impl ZoneEventIngester {
@@ -60,6 +64,7 @@ impl ZoneEventIngester {
         meter_registry: Arc<crate::infra::meter_registry::MeterRegistry>,
         frequency_monitor: Option<Arc<aggregator_logic::grid_status::FrequencyMonitor>>,
         stream_cipher: Option<Arc<crate::infra::stream_cipher::StreamCipher>>,
+        bin_store: Option<Arc<aggregator_logic::bin_store::BinStore>>,
     ) -> Result<Self> {
         let client = Client::open(redis_url)?;
         let connection_manager = Self::create_connection_manager(&client).await?;
@@ -113,6 +118,7 @@ impl ZoneEventIngester {
             meter_registry,
             frequency_monitor,
             stream_cipher,
+            bin_store,
         })
     }
 
@@ -597,8 +603,9 @@ impl ZoneEventIngester {
         let (tariff_period, demand_kw) = extract_tariff_demand(&reading.metadata);
 
         // 1. Update Aggregator (local stats). Feeds the dispatch engine's
-        // completed-window capacity query (VPP flex dispatch).
-        {
+        // completed-window capacity query (VPP flex dispatch). The returned bin
+        // snapshot is write-through'd to the durable store below.
+        let updated_bin = {
             let mut agg = self.aggregator.lock().await;
             agg.handle_reading(
                 meter_id,
@@ -609,7 +616,21 @@ impl ZoneEventIngester {
                 reading.timestamp,
                 tariff_period,
                 demand_kw,
-            );
+            )
+        };
+
+        // 1b. Durable write-through (crash recovery of the in-flight window).
+        // Fire-and-forget so Redis latency never blocks ingest — mirrors the
+        // InfluxDB sink. A write fault degrades to memory-only (logged), never
+        // fatal. The store is keyed by (meter, window) so this overwrites the
+        // bin's prior persisted state as it accumulates.
+        if let Some(store) = &self.bin_store {
+            let store = store.clone();
+            tokio::spawn(async move {
+                if let Err(e) = store.write(&updated_bin).await {
+                    debug!("durable bin write-through failed (memory-only): {e}");
+                }
+            });
         }
 
         // 2. ACK in Redis to prevent redelivery. (The legacy HTTP/gRPC
