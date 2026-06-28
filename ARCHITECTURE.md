@@ -70,6 +70,35 @@ ZK-rollup "Path B" was removed).
   retries the `XADD` once on transport error (`Router::disseminate`, verified
   `crates/aggregator-logic/src/router.rs:84`).
 
+### Routing: latency & degraded behavior
+
+End-to-end hop timing (steady state). The security path is synchronous and
+fail-closed; every downstream sink is fire-and-forget so a sink outage never
+stalls realtime ingest. Only the zone `XADD` can back-pressure the caller —
+it is the operational spine.
+
+| Hop | Mechanism | Steady-state latency |
+| --- | --- | --- |
+| ingress → verify | in-proc Ed25519 / DLMS, Redis key fetch | sub-ms |
+| verify → zone `XADD` | sync `XADD` to Redis Streams | sub-ms |
+| stream → zone ingester | `XREAD` block 2000ms, batch count 25 | 0–2 s |
+| ingester → InfluxDB `energy` | fire-and-forget, batched flush | ~0–2 s |
+| completed bin → InfluxDB `billing` | flush loop `BILLING_FLUSH_INTERVAL_SECS` (30) + `BILLING_FLUSH_GRACE_SECS` (120) | ~120–150 s after window close |
+| completed bin → surplus mint (NATS → Chain Bridge) | spawned task, NATS req-reply 30 s timeout | seconds, off critical path |
+| grid status → Kafka | publisher every `GRID_STATUS_PUBLISH_SECS` (30) | ~30 s |
+
+Failure policy per hop — **fail-closed** (refuse) vs **fire-and-forget** (drop, keep going):
+
+| Hop | Policy | Behavior when its backend is down |
+| --- | --- | --- |
+| Signature / DLMS-key verify | **fail-closed** | Redis-unreachable ⇒ loud `Err`, never silent `Ok(false)`; prod missing `enckey` ⇒ frame skipped (`crates/aggregator-persistence/src/infra/crypto.rs:81`) |
+| Zone `XADD` | sync + **retry-once** | rebuild connection, retry once; persistent fail surfaces to caller as back-pressure (`crates/aggregator-logic/src/router.rs:84`) |
+| InfluxDB (`energy` / `billing`) | **fire-and-forget** | drop batch, `warn!`, ingest continues — InfluxDB latency/outage never blocks Redis dissemination |
+| Kafka (`meter.readings` / grid status) | async best-effort | publish error logged, message dropped |
+| Surplus mint (NATS) | **fire-and-forget spawn** | missing wallet ⇒ skip + evict bin; bridge slow/down ⇒ bin still evicts (idempotency key backstops replay) |
+| Meter registry (Postgres tier) | **degraded tiers** | PG down ⇒ Redis-only; neither configured ⇒ nil-user fallback (`crates/aggregator-persistence/src/infra/meter_registry.rs`) |
+| API-key auth (IAM) | **degraded** | IAM connection error ⇒ static `GRIDTOKENX_API_KEYS`; a definitive IAM reject ⇒ 401 (no static retry) |
+
 ### Dispatch layer (VPP flex)
 
 Frequency-driven demand response. The fleet itself is the frequency sensor —
