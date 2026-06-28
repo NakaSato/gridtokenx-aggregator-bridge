@@ -143,6 +143,7 @@ dependencies = [
  "http 1.4.0",
  "influxdb2",
  "lapin",
+ "metrics",
  "p256",
  "rdkafka",
  "redis",

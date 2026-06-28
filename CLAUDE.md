@@ -67,7 +67,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 ## Runtime shape (from src/main.rs)
 
 - Two servers run concurrently: **HTTP IoT gateway** on `IOT_GATEWAY_PORT` (default `4010`) and **gRPC ingestion** on `GRPC_PORT` (default **5030**, the canonical mesh port — `50051` in `.env.example` is the simulator override).
-- HTTP routes: `/health`, `/v1/private-network/ingest[/batch]`, `/v1/ingest/telemetry[/batch]`.
+- HTTP routes: `/health` + `/metrics` (both auth-exempt), and the `api_key_auth`-gated ingest routes `/v1/private-network/ingest[/batch]` + `/v1/ingest/telemetry[/batch]` (`src/main.rs` route block).
 - **Degraded-mode by design**: Redis (3s timeout), Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
 - Background tasks: zone ingester, Kafka dispatch listener, gRPC server, billing-sink flush loop (only when InfluxDB enabled) — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
 - Env interpolation: values support `${VAR}` expansion via `expand_env`.
