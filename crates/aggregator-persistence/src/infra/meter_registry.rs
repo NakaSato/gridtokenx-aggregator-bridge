@@ -3,9 +3,30 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Default seconds an *unattributed* meter serial is remembered as "not found" before
+/// re-querying the backends. Override with `METER_REGISTRY_NEG_CACHE_TTL_SECS`.
+/// `resolve_user_id` runs once per inbound reading; without this, a fleet of
+/// unregistered meters re-queries Redis **and** Postgres on every reading, flooding
+/// both. The TTL is kept short so a meter registered out-of-band (meter-service writes
+/// Postgres directly — the bridge never sees `register_meter`) is picked up within ≤ TTL.
+const METER_NEG_CACHE_TTL_SECS: u64 = 30;
+
+fn neg_cache_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        let secs = std::env::var("METER_REGISTRY_NEG_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(METER_NEG_CACHE_TTL_SECS);
+        Duration::from_secs(secs)
+    })
+}
 
 /// Cached meter-to-owner resolver.
 ///
@@ -29,6 +50,11 @@ pub struct MeterRegistry {
     /// meter_serial → owner wallet address (mint recipient). Backfilled from Redis
     /// (`gridtokenx:meters:{serial}:wallet`) or Postgres on first resolve.
     wallet_cache: RwLock<HashMap<String, String>>,
+    /// meter_serial → expiry for serials that missed *every* tier. Bounds the
+    /// Redis+Postgres re-query rate for unattributed meters under sustained ingest.
+    /// Entries expire after [`neg_cache_ttl`] and are dropped on a later positive
+    /// resolution / registration.
+    neg_cache: RwLock<HashMap<String, Instant>>,
 }
 
 impl MeterRegistry {
@@ -38,7 +64,36 @@ impl MeterRegistry {
             pg,
             local_cache: RwLock::new(HashMap::new()),
             wallet_cache: RwLock::new(HashMap::new()),
+            neg_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// True if `serial` has a live "not found" marker. Drops the entry when expired.
+    async fn negatively_cached(&self, serial: &str) -> bool {
+        {
+            let cache = self.neg_cache.read().await;
+            match cache.get(serial) {
+                Some(exp) if *exp > Instant::now() => return true,
+                Some(_) => {}      // expired — fall through to remove under write lock
+                None => return false,
+            }
+        }
+        self.neg_cache.write().await.remove(serial);
+        false
+    }
+
+    /// Mark `serial` as "not found" for [`neg_cache_ttl`]. Opportunistically prunes
+    /// expired entries so the map stays bounded to currently-unattributed serials.
+    async fn cache_negative(&self, serial: &str) {
+        let now = Instant::now();
+        let mut cache = self.neg_cache.write().await;
+        cache.retain(|_, exp| *exp > now);
+        cache.insert(serial.to_string(), now + neg_cache_ttl());
+    }
+
+    /// Drop any "not found" marker for `serial` (it just resolved / registered).
+    async fn clear_negative(&self, serial: &str) {
+        self.neg_cache.write().await.remove(serial);
     }
 
     /// Fetch `(user_id, wallet)` for a serial from the durable Postgres source.
@@ -68,6 +123,8 @@ impl MeterRegistry {
     /// hit, so subsequent resolves are served from the hot tiers. Redis write
     /// failures are logged but never fail resolution — Redis is only a cache here.
     async fn backfill(&self, meter_serial: &str, user_id: Uuid, wallet: Option<&str>) {
+        // A positive resolution supersedes any prior "not found" marker.
+        self.clear_negative(meter_serial).await;
         self.local_cache
             .write()
             .await
@@ -113,6 +170,12 @@ impl MeterRegistry {
             }
         }
 
+        // 1b. Recently-missed serial: skip the Redis + Postgres round-trips. Bounds
+        //     the backend query rate for unattributed meters under sustained ingest.
+        if self.negatively_cached(meter_serial).await {
+            return Ok(None);
+        }
+
         // 2. Check Redis (hot cache, shared across instances)
         if let Some(conn) = &self.redis {
             let mut conn = conn.clone();
@@ -155,6 +218,9 @@ impl MeterRegistry {
             return Ok(Some(Uuid::nil()));
         }
 
+        // Backend(s) configured but the serial is unknown everywhere — remember the
+        // miss briefly so the next readings don't re-hit Redis + Postgres.
+        self.cache_negative(meter_serial).await;
         Ok(None)
     }
 
@@ -245,6 +311,10 @@ impl MeterRegistry {
                 .insert(meter_serial.to_string(), w.to_string());
         }
 
+        // Newly registered — drop any stale "not found" marker so the next read
+        // resolves immediately instead of waiting out the negative TTL.
+        self.clear_negative(meter_serial).await;
+
         info!("📝 Registered meter {} → user {}", meter_serial, user_id);
         Ok(())
     }
@@ -318,6 +388,56 @@ mod tests {
             reg.resolve_user_id("UNKNOWN").await.unwrap(),
             Some(Uuid::nil())
         );
+    }
+
+    #[tokio::test]
+    async fn negative_cache_marks_and_clears() {
+        let reg = MeterRegistry::new(None, None);
+        assert!(!reg.negatively_cached("MTR-X").await, "unknown serial not cached");
+        reg.cache_negative("MTR-X").await;
+        assert!(
+            reg.negatively_cached("MTR-X").await,
+            "missed serial must be negatively cached within TTL"
+        );
+        reg.clear_negative("MTR-X").await;
+        assert!(
+            !reg.negatively_cached("MTR-X").await,
+            "clear_negative must drop the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_negative_entry_misses_and_is_evicted() {
+        let reg = MeterRegistry::new(None, None);
+        // Insert an already-expired marker directly, bypassing cache_negative's TTL.
+        reg.neg_cache
+            .write()
+            .await
+            .insert("MTR-OLD".to_string(), Instant::now() - Duration::from_secs(1));
+        assert!(!reg.negatively_cached("MTR-OLD").await, "expired marker must miss");
+        assert!(
+            !reg.neg_cache.read().await.contains_key("MTR-OLD"),
+            "expired marker must be evicted on lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_clears_negative_marker() {
+        let reg = MeterRegistry::new(None, None);
+        reg.cache_negative("MTR-REG").await;
+        reg.register_meter("MTR-REG", Uuid::from_u128(9), None)
+            .await
+            .unwrap();
+        assert!(
+            !reg.negatively_cached("MTR-REG").await,
+            "registration must drop the stale not-found marker"
+        );
+    }
+
+    #[test]
+    fn neg_cache_ttl_is_positive() {
+        assert!(neg_cache_ttl() > Duration::ZERO);
+        assert!(METER_NEG_CACHE_TTL_SECS > 0);
     }
 
     /// With NO Redis, the Postgres tier alone resolves a registered meter to its

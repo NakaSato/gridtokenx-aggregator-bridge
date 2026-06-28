@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -279,6 +281,43 @@ fn decode_aes_key_hex(meter_id: &str, raw: &str) -> Result<[u8; 32]> {
 /// genuinely-unreachable Redis returns a loud `Err` (fail-closed), never a
 /// silent `Ok(None)` — an absent key and a dead connection must stay
 /// distinguishable, exactly as for signature verification.
+/// Default seconds a resolved unversioned enckey verdict is trusted before
+/// re-reading Redis. Override with `DEVICE_ENCKEY_CACHE_TTL_SECS`. The legacy
+/// unversioned key is effectively static (rotation goes through the *versioned*
+/// path), so a moderate positive TTL turns a per-frame Redis GET into one GET per
+/// device per TTL — the dominant decrypt-path flood under sustained ingest.
+const ENCKEY_POSITIVE_TTL_SECS: u64 = 300;
+
+/// Default seconds an *absent* enckey is remembered before re-reading Redis.
+/// Override with `DEVICE_ENCKEY_NEG_CACHE_TTL_SECS`. Bounds the flood from frames
+/// of an unkeyed device; kept short so a freshly-provisioned key is picked up soon.
+const ENCKEY_NEGATIVE_TTL_SECS: u64 = 10;
+
+fn enckey_positive_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_env("DEVICE_ENCKEY_CACHE_TTL_SECS", ENCKEY_POSITIVE_TTL_SECS))
+}
+
+fn enckey_negative_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_env("DEVICE_ENCKEY_NEG_CACHE_TTL_SECS", ENCKEY_NEGATIVE_TTL_SECS))
+}
+
+fn ttl_env(var: &'static str, default_secs: u64) -> Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+/// A cached enckey verdict: `Some(key)` present, `None` genuinely absent.
+#[derive(Clone)]
+struct CachedEncKey {
+    key: Option<[u8; 32]>,
+    expires: Instant,
+}
+
 pub struct DeviceKeyRegistry {
     redis_url: Option<String>,
     conn: Arc<Mutex<Option<ConnectionManager>>>,
@@ -288,6 +327,10 @@ pub struct DeviceKeyRegistry {
     /// Cache of unwrapped versioned keys, keyed by `(meter_id, kid)`. A wrapped
     /// GUEK version is immutable, so caching avoids re-hitting Vault per frame.
     versioned_cache: Arc<Mutex<std::collections::HashMap<(String, i64), [u8; 32]>>>,
+    /// Hot cache of *unversioned* enckey verdicts (present/absent) with TTLs, so a
+    /// keyed device isn't re-read from Redis on every frame. Positive verdicts last
+    /// [`enckey_positive_ttl`], absences the shorter [`enckey_negative_ttl`].
+    key_cache: Arc<Mutex<HashMap<String, CachedEncKey>>>,
 }
 
 impl DeviceKeyRegistry {
@@ -299,6 +342,7 @@ impl DeviceKeyRegistry {
             conn: Arc::new(Mutex::new(None)),
             vault: None,
             versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            key_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -310,6 +354,7 @@ impl DeviceKeyRegistry {
             conn: Arc::new(Mutex::new(conn)),
             vault: None,
             versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            key_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -389,15 +434,57 @@ impl DeviceKeyRegistry {
         }
     }
 
+    /// Look up a cached enckey verdict for `meter_id`, dropping it when expired.
+    async fn key_cache_get(&self, meter_id: &str) -> Option<Option<[u8; 32]>> {
+        let mut cache = self.key_cache.lock().await;
+        match cache.get(meter_id) {
+            Some(e) if e.expires > Instant::now() => Some(e.key),
+            Some(_) => {
+                cache.remove(meter_id); // expired — drop so the map stays bounded
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Store a verdict for `meter_id`. Present keys last the positive TTL, absences
+    /// the shorter negative TTL. Opportunistically prunes expired entries.
+    async fn key_cache_put(&self, meter_id: &str, key: Option<[u8; 32]>) {
+        let now = Instant::now();
+        let ttl = if key.is_some() {
+            enckey_positive_ttl()
+        } else {
+            enckey_negative_ttl()
+        };
+        let mut cache = self.key_cache.lock().await;
+        cache.retain(|_, v| v.expires > now);
+        cache.insert(
+            meter_id.to_string(),
+            CachedEncKey {
+                key,
+                expires: now + ttl,
+            },
+        );
+    }
+
     /// Fetch one device's AES-256 key. `Ok(None)` only when the key is genuinely
     /// absent; `Err` on Redis-unreachable (fail-closed) or a malformed/wrong-length
-    /// key (never truncate or pad).
+    /// key (never truncate or pad). A recently-resolved verdict (present or absent)
+    /// is served from the hot cache, bounding per-frame Redis reads to one per device
+    /// per TTL.
     pub async fn get_device_aes_key(&self, meter_id: &str) -> Result<Option<[u8; 32]>> {
-        let key = format!("gridtokenx:devices:{}:enckey", meter_id);
-        match self.get_with_retry(&key).await? {
-            Some(hex_str) => Ok(Some(decode_aes_key_hex(meter_id, &hex_str)?)),
-            None => Ok(None),
+        if let Some(cached) = self.key_cache_get(meter_id).await {
+            return Ok(cached);
         }
+        let key = format!("gridtokenx:devices:{}:enckey", meter_id);
+        let resolved = match self.get_with_retry(&key).await? {
+            Some(hex_str) => Some(decode_aes_key_hex(meter_id, &hex_str)?),
+            None => None,
+        };
+        // Only cache after a successful Redis round-trip (a malformed key returns
+        // Err above and is never cached, preserving fail-closed semantics).
+        self.key_cache_put(meter_id, resolved).await;
+        Ok(resolved)
     }
 
     /// Fetch a device's **versioned** AES-256 key (rotated GUEK) for `kid`.
@@ -449,26 +536,45 @@ impl DeviceKeyRegistry {
     /// for that entry so one bad key cannot fail the whole batch; Redis-unreachable
     /// still fails the whole call loudly.
     pub async fn get_device_aes_keys(&self, meter_ids: &[String]) -> Result<Vec<Option<[u8; 32]>>> {
-        let keys: Vec<String> = meter_ids
-            .iter()
-            .map(|id| format!("gridtokenx:devices:{}:enckey", id))
-            .collect();
+        // Start from the hot cache; only the cache-misses need a Redis MGET.
+        let mut out: Vec<Option<[u8; 32]>> = Vec::with_capacity(meter_ids.len());
+        let mut miss_idx: Vec<usize> = Vec::new();
+        let mut miss_keys: Vec<String> = Vec::new();
+        for (i, id) in meter_ids.iter().enumerate() {
+            match self.key_cache_get(id).await {
+                Some(verdict) => out.push(verdict),
+                None => {
+                    out.push(None); // placeholder, filled after MGET
+                    miss_idx.push(i);
+                    miss_keys.push(format!("gridtokenx:devices:{}:enckey", id));
+                }
+            }
+        }
+        if miss_keys.is_empty() {
+            return Ok(out);
+        }
 
-        let raw: Vec<Option<String>> = self.mget_with_retry(&keys).await?;
-
-        let mut out = Vec::with_capacity(meter_ids.len());
-        for (i, slot) in raw.into_iter().enumerate() {
+        let raw: Vec<Option<String>> = self.mget_with_retry(&miss_keys).await?;
+        for (slot, &i) in raw.into_iter().zip(miss_idx.iter()) {
             let parsed = match slot {
                 Some(hex_str) => match decode_aes_key_hex(&meter_ids[i], &hex_str) {
-                    Ok(k) => Some(k),
+                    Ok(k) => {
+                        self.key_cache_put(&meter_ids[i], Some(k)).await;
+                        Some(k)
+                    }
                     Err(e) => {
+                        // Malformed → None for this entry (don't fail the batch) and
+                        // don't cache it as "absent": the data is present-but-bad.
                         warn!("🚫 Skipping malformed enckey in batch: {}", e);
                         None
                     }
                 },
-                None => None,
+                None => {
+                    self.key_cache_put(&meter_ids[i], None).await;
+                    None
+                }
             };
-            out.push(parsed);
+            out[i] = parsed;
         }
         Ok(out)
     }
@@ -694,6 +800,57 @@ mod tests {
 
         del_enckey(&url, good).await;
         del_enckey(&url, bad).await;
+    }
+
+    /// A cached *present* verdict is served without touching Redis — proven by
+    /// using a registry with no URL/connection (a Redis hit would `Err`).
+    #[tokio::test]
+    async fn cached_enckey_served_without_redis() {
+        let r = DeviceKeyRegistry::from_manager(None);
+        r.key_cache_put("m-cached", Some([0x11u8; 32])).await;
+        let got = r
+            .get_device_aes_key("m-cached")
+            .await
+            .expect("cache hit must not reach Redis");
+        assert_eq!(got, Some([0x11u8; 32]));
+    }
+
+    /// A cached *absent* verdict is also served from cache (negative caching).
+    #[tokio::test]
+    async fn cached_absent_enckey_served_without_redis() {
+        let r = DeviceKeyRegistry::from_manager(None);
+        r.key_cache_put("m-absent", None).await;
+        let got = r
+            .get_device_aes_key("m-absent")
+            .await
+            .expect("cached absence must not reach Redis");
+        assert_eq!(got, None);
+        // Uncached meter on a URL-less registry must still Err (fail-closed).
+        assert!(r.get_device_aes_key("m-uncached").await.is_err());
+    }
+
+    /// An expired cache entry misses and is evicted on lookup.
+    #[tokio::test]
+    async fn expired_enckey_entry_evicted() {
+        let r = DeviceKeyRegistry::from_manager(None);
+        r.key_cache.lock().await.insert(
+            "m-old".to_string(),
+            CachedEncKey {
+                key: Some([0x22u8; 32]),
+                expires: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(r.key_cache_get("m-old").await.is_none(), "expired must miss");
+        assert!(
+            !r.key_cache.lock().await.contains_key("m-old"),
+            "expired entry evicted on lookup"
+        );
+    }
+
+    #[test]
+    fn enckey_negative_ttl_shorter_than_positive() {
+        assert!(enckey_negative_ttl() < enckey_positive_ttl());
+        assert!(ENCKEY_NEGATIVE_TTL_SECS < ENCKEY_POSITIVE_TTL_SECS);
     }
 
     async fn seed_enckey(url: &str, meter: &str, hexkey: &str) {
