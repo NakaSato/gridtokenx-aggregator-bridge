@@ -141,6 +141,11 @@ TOU/demand fields so bins persisted before these existed still deserialize on cr
 
 OpenADR 3 dispatch (OpenLEADR): setting `OPENLEADR_VTN_URL` enables the `openleadr` dispatch adapter
 (`crates/aggregator-logic/src/standards/openleadr.rs`), preferred over `ieee` in the dispatch engine.
+**Adapter selection / fan-out:** `DISPATCH_ADAPTERS` (csv of `grpc`/`ieee`/`openleadr`) dispatches each
+frequency excursion to **every** listed adapter at once (e.g. a downstream in-mesh VTN **and** a utility
+VTN) — partial-failure isolated (one adapter erroring never stops the others; `Err` only when all fail),
+cooldown tracked per `(action, adapter)`. The legacy single-value `DISPATCH_ADAPTER` is still honored as a
+one-element list when `DISPATCH_ADAPTERS` is unset (`select_adapters`, `crates/aggregator-logic/src/dispatch/engine.rs`).
 Optional: `OPENLEADR_CLIENT_ID`/`OPENLEADR_CLIENT_SECRET` (OAuth pair), `OPENLEADR_PROGRAM_ID`,
 `OPENLEADR_PROGRAM_NAME` (default `gridtokenx-flex-dispatch`), `OPENLEADR_TARGET`,
 `OPENLEADR_EVENT_DURATION_HOURS` (default 1.0). A local VTN for testing runs as the superproject's

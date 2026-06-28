@@ -158,18 +158,29 @@ no external SCADA feed:
   every `GRID_STATUS_PUBLISH_SECS` (default 30s; verified `src/main.rs:243`).
 - **Dispatch engine.** A Kafka listener (verified `src/main.rs:316`) feeds each
   grid-status frequency to `DispatchEngine::evaluate_and_dispatch` (verified
-  `crates/aggregator-logic/src/dispatch/engine.rs:133`): below
+  `crates/aggregator-logic/src/dispatch/engine.rs:192`): below
   `DISPATCH_FREQ_LOW_HZ` ⇒ FLEX_UP, above `DISPATCH_FREQ_HIGH_HZ` ⇒ FLEX_DOWN,
   capacity `DISPATCH_CAPACITY_KW`. Dispatch refuses to fire with zero completed
-  aggregation capacity. Repeat suppression is tracked **per action**: a
-  re-dispatch of the same action waits out `DISPATCH_COOLDOWN_SECS` (default
-  900 = one 15-minute aggregation window); a flipped action fires immediately on its own
-  independent timer, so an oscillating frequency cannot reset the cooldown by
-  alternating directions; a cooldown starts only on success (`cooldown_allows`,
-  verified `crates/aggregator-logic/src/dispatch/engine.rs:41`).
-- **Adapters.** `DISPATCH_ADAPTER` picks `grpc` (ConnectRPC to edge
-  controllers), `ieee` (IEEE 2030.5 DERControl), or `openleadr` (default when
-  configured, else `ieee`).
+  aggregation capacity (checked once for the whole fan-out, `has_dispatch_capacity`).
+  Repeat suppression is tracked **per (action, adapter)**: a re-dispatch of the
+  same action to the same adapter waits out `DISPATCH_COOLDOWN_SECS` (default
+  900 = one 15-minute aggregation window); a flipped action — or the same action
+  to a *different* adapter — fires immediately on its own independent timer, so
+  an oscillating frequency cannot reset the cooldown by alternating directions
+  and one fan-out target cannot suppress another; a cooldown starts only on
+  success (`cooldown_allows`, verified
+  `crates/aggregator-logic/src/dispatch/engine.rs:46`).
+- **Adapters (single or fan-out).** `DISPATCH_ADAPTERS` (csv) dispatches each
+  excursion to **every** listed adapter at once — e.g. a downstream in-mesh VTN
+  **and** a utility VTN — with per-(action,adapter) cooldown and partial-failure
+  isolation (one adapter erroring never stops the others; `evaluate_and_dispatch`
+  returns `Err` only when *all* targets fail). The legacy single-value
+  `DISPATCH_ADAPTER` is still honored as a one-element list (back-compat); when
+  neither is set, the default is `openleadr` (when configured) else `ieee`.
+  Adapter names: `grpc` (ConnectRPC to edge controllers), `ieee` (IEEE 2030.5
+  DERControl), `openleadr` (OpenADR 3 BL). Unknown names are dropped loud;
+  selection logic is the pure `select_adapters_from` (verified
+  `crates/aggregator-logic/src/dispatch/engine.rs:126`).
 - **OpenADR 3, BL side (outbound).** `OpenLeadrAdapter` (verified
   `crates/aggregator-logic/src/standards/openleadr.rs:25`) acts as business
   logic against a VTN (`OPENLEADR_VTN_URL`): each dispatch becomes an OpenADR
@@ -204,6 +215,16 @@ no external SCADA feed:
   resource, SETPOINT payload; best-effort — a report failure never fails or
   retries the dispatch; `post_execution_report`, verified
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:392`).
+- **Why the VEN polls (not webhook).** OpenADR 3.1 defines push subscriptions,
+  but the backing library (`openleadr-rs` v0.2.3 — the spec floor for 3.1;
+  3.0 ended at v0.1) does **not** implement real-time webhook subscriptions
+  (≈166/168 OpenADR Alliance tests pass; the 38 failures are all the unsupported
+  subscriptions feature). So the listener falls back to a poll loop every
+  `OPENLEADR_VEN_POLL_SECS` (default 30, verified
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:51`). The polling
+  cadence is a dependency constraint, not a design preference — `poll_interval`
+  bounds dispatch latency to one poll; lower it for tighter response, raise it
+  to spare the VTN. Revisit if openleadr-rs ships subscriptions.
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
   (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
