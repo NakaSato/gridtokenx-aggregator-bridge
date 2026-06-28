@@ -17,6 +17,18 @@ use uuid::Uuid;
 /// Postgres directly — the bridge never sees `register_meter`) is picked up within ≤ TTL.
 const METER_NEG_CACHE_TTL_SECS: u64 = 30;
 
+/// Emit a meter-owner lookup outcome: `hit` = served from the local or negative
+/// cache (no backend round-trip), `miss` = fell through to Redis/Postgres. Feeds
+/// `aggregator_cache_lookups_total{cache="meter_owner"}`.
+fn record_owner_lookup(hit: bool) {
+    metrics::counter!(
+        "aggregator_cache_lookups_total",
+        "cache" => "meter_owner",
+        "result" => if hit { "hit" } else { "miss" },
+    )
+    .increment(1);
+}
+
 fn neg_cache_ttl() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -166,6 +178,7 @@ impl MeterRegistry {
         {
             let cache = self.local_cache.read().await;
             if let Some(uid) = cache.get(meter_serial) {
+                record_owner_lookup(true);
                 return Ok(Some(*uid));
             }
         }
@@ -173,8 +186,12 @@ impl MeterRegistry {
         // 1b. Recently-missed serial: skip the Redis + Postgres round-trips. Bounds
         //     the backend query rate for unattributed meters under sustained ingest.
         if self.negatively_cached(meter_serial).await {
+            record_owner_lookup(true);
             return Ok(None);
         }
+
+        // Cache miss — this resolve will hit Redis and/or Postgres below.
+        record_owner_lookup(false);
 
         // 2. Check Redis (hot cache, shared across instances)
         if let Some(conn) = &self.redis {

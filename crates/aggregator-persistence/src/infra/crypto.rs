@@ -159,14 +159,16 @@ impl SignatureVerifier {
     /// Look up a cached pubkey verdict for `meter_id`, dropping it when expired.
     async fn pubkey_cache_get(&self, meter_id: &str) -> Option<Option<VerifyingKey>> {
         let mut cache = self.pubkey_cache.lock().await;
-        match cache.get(meter_id) {
+        let out = match cache.get(meter_id) {
             Some(e) if e.expires > Instant::now() => Some(e.key),
             Some(_) => {
                 cache.remove(meter_id);
                 None
             }
             None => None,
-        }
+        };
+        record_cache_lookup("pubkey", out.is_some());
+        out
     }
 
     /// Store a verdict for `meter_id`. Present keys last the positive TTL (= the
@@ -409,6 +411,18 @@ fn ttl_env(var: &'static str, default_secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Emit a hot-cache lookup outcome. `cache` ∈ {pubkey, enckey, ...}; `result` =
+/// hit|miss. Lets `aggregator_cache_lookups_total` track cache effectiveness (a
+/// falling hit-rate flags key churn / revocation activity / an attack on unknown ids).
+fn record_cache_lookup(cache: &'static str, hit: bool) {
+    metrics::counter!(
+        "aggregator_cache_lookups_total",
+        "cache" => cache,
+        "result" => if hit { "hit" } else { "miss" },
+    )
+    .increment(1);
+}
+
 /// A cached enckey verdict: `Some(key)` present, `None` genuinely absent.
 #[derive(Clone)]
 struct CachedEncKey {
@@ -535,14 +549,16 @@ impl DeviceKeyRegistry {
     /// Look up a cached enckey verdict for `meter_id`, dropping it when expired.
     async fn key_cache_get(&self, meter_id: &str) -> Option<Option<[u8; 32]>> {
         let mut cache = self.key_cache.lock().await;
-        match cache.get(meter_id) {
+        let out = match cache.get(meter_id) {
             Some(e) if e.expires > Instant::now() => Some(e.key),
             Some(_) => {
                 cache.remove(meter_id); // expired — drop so the map stays bounded
                 None
             }
             None => None,
-        }
+        };
+        record_cache_lookup("enckey", out.is_some());
+        out
     }
 
     /// Store a verdict for `meter_id`. Present keys last the positive TTL, absences
