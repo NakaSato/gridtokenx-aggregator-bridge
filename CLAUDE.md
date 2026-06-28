@@ -17,9 +17,8 @@ smart grid. Decoupled from edge hardware; it verifies, aggregates, and dissemina
   history — async fire-and-forget, so a slow/down InfluxDB never blocks ingest (`Router::disseminate` →
   `InfluxWriter`, `crates/aggregator-persistence/src/infra/influxdb.rs`).
 
-> **Surplus minting lives here (Chain Bridge over NATS), chain-light.** The former "Path B" (Plonky2
-> ZK-rollup → HyperEVM) and the NATS `MintForwardReading` handoff to meter-service were both removed.
-> Minting was re-added directly: when a 15-min billing window closes with net surplus generation, the
+> **Surplus minting lives here (Chain Bridge over NATS), chain-light.** When a 15-min billing window
+> closes with net surplus generation, the
 > settlement sink mints it to the meter owner via **Chain Bridge over NATS** (`chain.tx.mint`). The
 > service carries **no Solana / blockchain-core dependency** — it sends intent only and mirrors the wire
 > types locally (`crates/aggregator-persistence/src/infra/mint.rs`). Disabled by default; gated on

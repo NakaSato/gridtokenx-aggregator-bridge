@@ -208,12 +208,6 @@ async fn main() -> Result<()> {
         pg_pool,
     ));
 
-    // NOTE: the on-chain settlement/mint path (former "Path B") was removed. The
-    // aggregator now accumulates billing bins purely to feed the dispatch engine's
-    // completed-window capacity query. With settlement gone, nothing evicts bins —
-    // `active_bins` grows unbounded over time (known leak; acceptable for the
-    // operational/dispatch role, revisit with a time-based reaper if needed).
-
     // 5. Initialize Zone-based Event Ingester (parallel processing by microgrid zone)
     info!("🔷 Zone-based ingester ENABLED");
 

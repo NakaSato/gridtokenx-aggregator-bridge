@@ -106,7 +106,7 @@ fn group_entry_ids_by_stream(
 pub struct BatchWorker {
     // Vestigial: the live forward path is a Redis-ACK bypass (see `flush`), so the
     // gRPC platform client is never invoked. Optional so the zone ingester can start
-    // even when no OracleService target is reachable (Path B bins still fill locally).
+    // even when no OracleService target is reachable (billing bins still fill locally).
     #[allow(dead_code)]
     platform_client: Option<PlatformClient>,
     connection_manager: ConnectionManager,

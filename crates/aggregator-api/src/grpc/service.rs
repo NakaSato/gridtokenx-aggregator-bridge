@@ -209,7 +209,7 @@ fn grpc_sign_target(
     format!("{meter_id}:{kwh}:{timestamp}")
 }
 
-// Unified Ingestion Pattern: Both Path A and Path B handled through single verified entry
+// Unified Ingestion Pattern: all telemetry handled through a single verified entry point
 impl OracleService for AggregatorServiceImpl {
     /// Bulk Raw Ingestion: Optimized for high-throughput simulators.
     /// Payload is packed binary frames: [FrameLen(1b)] + [ProtocolV4Frame] + [Ed25519Signature(64b)]

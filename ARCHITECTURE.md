@@ -15,8 +15,7 @@
 
 The **central connection point for every device node** in the smart grid: it
 verifies, aggregates, and disseminates inbound telemetry, and drives VPP flex
-dispatch. It does **not** mint tokens or settle on-chain (the former Plonky2
-ZK-rollup "Path B" was removed).
+dispatch.
 
 - **UTT Ingestion:** Verified entry point for all device telemetry.
 
@@ -210,17 +209,15 @@ no external SCADA feed:
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
   → dispatch → VTN event → VEN execution.
 
-> **No settlement here.** On-chain generation-mint / settlement (the former
-> "Path B": 15-min billing bins → Plonky2 ZK-rollup → Merkle root → HyperEVM)
-> was removed from this service. The Aggregator Bridge produces verified,
-> aggregated telemetry and drives flex dispatch only; downstream token issuance
-> and settlement are the Market Layer's concern (below), reached through other
-> platform services, not from this bridge.
+> **Surplus minting (Chain Bridge over NATS, chain-light).** When a 15-min
+> billing window closes with net surplus generation, the settlement sink mints
+> it to the meter owner via Chain Bridge over NATS (`chain.tx.mint`). The
+> service carries no Solana / blockchain-core dependency — it sends intent only.
+> Disabled by default; gated on `MINT_VIA_CHAIN_BRIDGE` + `NATS_URL`.
 
 ## 4. Market Layer (downstream — external to this service)
-- **Settlement:** HyperEVM.
-- **Tokens:** ERC-1155 (Energy Tokens), veW2T (Governance).
-- **Market Engines:** P2P Order Book, I-REC Minting, HIP-3 Derivatives.
+- **Tokens:** GRID / GRX / REC, issued on Solana via Chain Bridge.
+- **Market Engines:** P2P Order Book, REC minting.
 
 ## 5. Testing
 - See [TEST.md](TEST.md) — unit-test inventory (per crate/file) + the superproject pytest e2e suite (`20_oracle`, `30_settlement`, `90_golden_path` cover this layer).

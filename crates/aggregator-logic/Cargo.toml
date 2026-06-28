@@ -2,7 +2,7 @@
 name = "aggregator-logic"
 version = "0.1.0"
 edition = "2021"
-description = "GridTokenX Aggregator Bridge - domain services & orchestration (aggregator, router, dispatch, standards, zk, metrics)"
+description = "GridTokenX Aggregator Bridge - domain services & orchestration (aggregator, router, dispatch, standards, metrics)"
 
 [dependencies]
 aggregator-core = { path = "../aggregator-core" }

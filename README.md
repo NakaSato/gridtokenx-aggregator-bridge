@@ -11,7 +11,7 @@ The **GridTokenX Aggregator Bridge** is a **Private Cloud-Native** Convergence L
 - **Production Mode Enforcement** - Strict signature verification when `ENVIRONMENT=production`.
 - **Performance Driven** - Optimized Rust/Tokio implementation with Redis/Kafka streaming.
 
-> **No on-chain settlement.** The former ZK-rollup / HyperEVM settlement ("Path B") was removed. This service verifies, aggregates, disseminates telemetry, and drives dispatch — it does not mint tokens or settle on-chain.
+> **Chain-light surplus minting.** This service verifies, aggregates, disseminates telemetry, and drives dispatch. On a 15-min surplus window it sends a mint intent to Chain Bridge over NATS (`chain.tx.mint`) — no Solana / blockchain-core dependency. Disabled by default (`MINT_VIA_CHAIN_BRIDGE` + `NATS_URL`).
 
 ---
 
