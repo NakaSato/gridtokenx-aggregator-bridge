@@ -15,23 +15,44 @@ use crate::state::{
     AppState,
 };
 
-/// How long a *successful* API-key verification is trusted before re-checking IAM.
-/// Sustained ingest (e.g. a meter fleet at N readings/window) would otherwise call
-/// IAM `VerifyApiKey` once per request — each triggering a Redis event + a DB write —
-/// and saturate IAM, timing out unrelated callers. A short positive cache bounds
-/// that to one IAM round-trip per key per TTL. Trade-off: a revoked/rotated key stays
-/// accepted until its entry expires (≤ TTL).
-const API_KEY_POSITIVE_TTL: Duration = Duration::from_secs(60);
+/// Default seconds a *successful* API-key verification is trusted before re-checking
+/// IAM. Override with `API_KEY_POS_CACHE_TTL_SECS`. Sustained ingest (a meter fleet at
+/// N readings/window) would otherwise call IAM `VerifyApiKey` once per request — each
+/// triggering a Redis event + a DB write — and saturate IAM, timing out unrelated
+/// callers. A short positive cache bounds that to one IAM round-trip per key per TTL.
+/// Trade-off: a revoked/rotated key stays accepted until its entry expires (≤ TTL).
+const API_KEY_POSITIVE_TTL_SECS: u64 = 60;
 
-/// How long a *definitive IAM reject* is trusted before re-checking IAM.
-/// A wrong/rotated key replayed on every reading is the symmetric flood vector to a
-/// good key: each request misses the positive cache and hits IAM `VerifyApiKey`. A
-/// short negative cache bounds repeated rejects to one IAM round-trip per key per TTL.
-/// Kept much shorter than the positive TTL so a key that gets authorized right after a
-/// failed first attempt is picked up quickly. Only *definitive IAM rejects* are cached
-/// negatively — an IAM connection error is transient and MUST still fall through to the
-/// static-key fallback, so it is never cached.
-const API_KEY_NEGATIVE_TTL: Duration = Duration::from_secs(10);
+/// Default seconds a *definitive IAM reject* is trusted before re-checking IAM.
+/// Override with `API_KEY_NEG_CACHE_TTL_SECS`. A wrong/rotated key replayed on every
+/// reading is the symmetric flood vector to a good key: each request misses the positive
+/// cache and hits IAM `VerifyApiKey`. A short negative cache bounds repeated rejects to
+/// one IAM round-trip per key per TTL. Kept much shorter than the positive TTL so a key
+/// authorized right after a failed first attempt is picked up quickly. Only *definitive
+/// IAM rejects* are cached negatively — an IAM connection error is transient and MUST
+/// still fall through to the static-key fallback, so it is never cached.
+const API_KEY_NEGATIVE_TTL_SECS: u64 = 10;
+
+/// Resolve a TTL from `var` (seconds), falling back to `default_secs` when unset or
+/// unparseable. Read once at first use and memoized — the cache TTLs don't change at
+/// runtime, and this keeps the hot path allocation-free.
+fn ttl_from_env(var: &'static str, default_secs: u64) -> Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+fn positive_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_from_env("API_KEY_POS_CACHE_TTL_SECS", API_KEY_POSITIVE_TTL_SECS))
+}
+
+fn negative_ttl() -> Duration {
+    static T: OnceLock<Duration> = OnceLock::new();
+    *T.get_or_init(|| ttl_from_env("API_KEY_NEG_CACHE_TTL_SECS", API_KEY_NEGATIVE_TTL_SECS))
+}
 
 struct CachedAuth {
     expires: Instant,
@@ -64,11 +85,7 @@ fn cache_lookup(key: &str) -> Option<bool> {
 /// negative verdicts the shorter `API_KEY_NEGATIVE_TTL`.
 fn cache_store(key: &str, valid: bool) {
     let now = Instant::now();
-    let ttl = if valid {
-        API_KEY_POSITIVE_TTL
-    } else {
-        API_KEY_NEGATIVE_TTL
-    };
+    let ttl = if valid { positive_ttl() } else { negative_ttl() };
     let mut cache = match api_key_cache().lock() {
         Ok(c) => c,
         Err(p) => p.into_inner(),
@@ -221,10 +238,12 @@ mod tests {
     #[test]
     fn negative_ttl_is_shorter_than_positive() {
         // A rotated/authorized-late key must be re-checked sooner than a trusted one.
+        // Defaults (env unset in tests) must preserve this ordering.
         assert!(
-            API_KEY_NEGATIVE_TTL < API_KEY_POSITIVE_TTL,
+            negative_ttl() < positive_ttl(),
             "negative cache must expire faster than positive"
         );
+        assert!(API_KEY_NEGATIVE_TTL_SECS < API_KEY_POSITIVE_TTL_SECS);
     }
 
     #[test]

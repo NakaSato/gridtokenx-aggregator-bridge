@@ -99,6 +99,29 @@ Failure policy per hop — **fail-closed** (refuse) vs **fire-and-forget** (drop
 | Meter registry (Postgres tier) | **degraded tiers** | PG down ⇒ Redis-only; neither configured ⇒ nil-user fallback (`crates/aggregator-persistence/src/infra/meter_registry.rs`) |
 | API-key auth (IAM) | **degraded** | IAM connection error ⇒ static `GRIDTOKENX_API_KEYS`; a definitive IAM reject ⇒ 401 (no static retry) |
 
+### Observability (Prometheus `/metrics`)
+
+The Prometheus exporter is installed at startup (`src/main.rs`, step 7b) and
+rendered on the IoT gateway at `/metrics` (behind the same mTLS as ingest — a
+scraper presents a CA-issued client cert; the superproject's prometheus job uses
+`reporting-service.crt`). Settlement-path observability:
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `aggregator_settlement_path` | gauge | `path` = `nats` \| `grpc` \| `disabled` | The active surplus-mint path, set once at startup **after** the recorder is installed. Active path = `1`, others = `0`. `disabled` = `MINT_VIA_CHAIN_BRIDGE` unset or NATS unreachable. |
+| `aggregator_mint_total` | counter | `outcome` = `settled` \| `skipped` \| `failed` \| `no_surplus`; `reason` = `ok` \| `no_wallet` \| `resolve_err` \| `mint_err` | One increment per completed billing bin in the settlement sweep. `skipped/no_wallet` surfaces the otherwise-silent unregistered-meter case; `no_surplus` is the net-consumption denominator. |
+
+Alert rules live in the superproject `monitoring/prometheus_rules.yml`
+(`AggregatorSurplusMintDisabled`, `AggregatorMintSkipSpike`).
+
+**API-key auth cache.** `crates/aggregator-api/src/auth.rs` caches the IAM
+`VerifyApiKey` verdict to keep sustained ingest from flooding IAM (each call is a
+Redis event + DB write). Positive verdicts are trusted for
+`API_KEY_POS_CACHE_TTL_SECS` (default 60); **definitive IAM rejects** for the
+shorter `API_KEY_NEG_CACHE_TTL_SECS` (default 10) so a replayed bad/rotated key is
+also bounded to one IAM round-trip per TTL. IAM *connection errors* are never
+cached — they must still fall through to the static-key fallback.
+
 ### Dispatch layer (VPP flex)
 
 Frequency-driven demand response. The fleet itself is the frequency sensor —
