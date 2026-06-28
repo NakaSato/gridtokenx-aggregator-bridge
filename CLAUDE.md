@@ -142,6 +142,18 @@ Durability (two crash-safety closures, both degrade-safe):
   NATS publish — closing the prior silent-drop gap if the consumer was momentarily absent
   (`NatsMintGateway`, `crates/aggregator-persistence/src/infra/mint.rs`). The reply still rides core NATS;
   the signed envelope, idempotency key, and request/reply timeout are unchanged.
+- **Durable mint outbox** (on when minting enabled AND Redis reachable). The killer case — a settled
+  surplus that **can't land on-chain yet** (Chain Bridge or validator down, a sim rejection like
+  `Custom(6000)`, a lost reply) — no longer evaporates. Instead of fire-and-forget minting then evicting
+  the bin, the settlement loop **enqueues** a `PendingMint` to a Redis hash `gridtokenx:billing:mint_outbox`
+  (field `{serial}:{window_start_ms}` = JSON) and a **drain loop** (`MINT_RETRY_INTERVAL_SECS`, default 30)
+  retries each entry until the mint is *confirmed on-chain*, then removes it. The outbox survives a restart
+  (`load_all` reads Redis), and the recipient wallet is resolved fresh per attempt so a meter that registers
+  **after** its window still mints on a later retry. Retries are safe — the bridge dedups on
+  `mint:{serial}:{window_start_ms}` + the on-chain `(meter_id, window_start_ms)` PDA, so a retry of a mint
+  that actually landed (but whose reply was lost) does not double-mint (`MintOutbox` +
+  `aggregator_logic::mint_outbox`, drain loop + `attempt_mint` in `src/main.rs`). No Redis ⇒ falls back to
+  the prior best-effort fire-and-forget mint (no durability, no regression).
 
 > SECURITY: `NatsMintGateway` **signs** the mint envelope with this service's mTLS client key
 > (P-256/ECDSA over the canonical bytes) and attaches an `EnvelopeAuth` (cert PEM + signature), so the

@@ -100,6 +100,69 @@ fn build_mtls_server_config(
         .context("build mTLS server config")
 }
 
+/// Attempts one on-chain mint for a pending surplus. Resolves the recipient
+/// wallet fresh (so a meter that registers after its window still mints on a
+/// retry), then asks Chain Bridge to mint. Returns `true` only when the mint is
+/// **confirmed** — the caller then drops the outbox entry. Returns `false`
+/// (keep + retry) for an unregistered wallet, a lookup error, or a mint failure
+/// (bridge/validator down, sim rejection). Idempotent: the bridge dedups on
+/// `mint:{serial}:{window_start_ms}` + the on-chain PDA, so a retry of a mint
+/// that already landed does not double-mint.
+async fn attempt_mint(
+    gw: &infra::mint::MintGateway,
+    reg: &infra::meter_registry::MeterRegistry,
+    p: &aggregator_api::mint_outbox::PendingMint,
+) -> bool {
+    let wallet = match reg.resolve_wallet(&p.meter_serial).await {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            // Unregistered meter: kept in the outbox so it mints once the owner
+            // registers a wallet. Counted so the skip is visible on dashboards.
+            warn!(
+                "surplus mint deferred: no wallet registered for meter {} (kept for retry)",
+                p.meter_serial
+            );
+            metrics::record_mint_outcome("skipped", "no_wallet");
+            return false;
+        }
+        Err(e) => {
+            warn!(
+                "surplus mint deferred: wallet lookup failed for {} ({e}); kept for retry",
+                p.meter_serial
+            );
+            metrics::record_mint_outcome("skipped", "resolve_err");
+            return false;
+        }
+    };
+    match gw
+        .mint(
+            &wallet,
+            p.energy_kwh,
+            *p.meter_id.as_bytes(),
+            &p.meter_serial,
+            p.window_start_ms,
+        )
+        .await
+    {
+        Ok(out) => {
+            info!(
+                "⚡ minted {} kWh surplus for meter {} (sig={}, slot={})",
+                p.energy_kwh, p.meter_serial, out.signature, out.slot
+            );
+            metrics::record_mint_outcome("settled", "ok");
+            true
+        }
+        Err(e) => {
+            warn!(
+                "surplus mint failed for meter {} ({e}); kept in outbox for retry",
+                p.meter_serial
+            );
+            metrics::record_mint_outcome("failed", "mint_err");
+            false
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install default crypto provider for rustls (required for rustls 0.23+ when both
@@ -373,6 +436,26 @@ async fn main() -> Result<()> {
     // NOTE: the settlement-path gauge is emitted in step 7b, AFTER the global metrics
     // recorder is installed — emitting here (before set_global_recorder) is a no-op.
 
+    // Durable mint outbox: guarantees a settled surplus survives a mint that
+    // can't land on-chain yet (bridge/validator down, sim rejection, lost
+    // reply). The settlement loop enqueues here instead of fire-and-forget
+    // minting; a drain loop retries every sweep until the mint is confirmed, and
+    // the entry survives a restart. Enabled only when minting is on AND Redis is
+    // reachable; otherwise None ⇒ the loop falls back to the prior best-effort
+    // immediate mint (no durability, no regression). Retries are safe: the
+    // bridge dedups on mint:{serial}:{window_start_ms} + the on-chain PDA.
+    let mint_outbox = match (mint_gateway.is_enabled(), early_redis_conn.clone()) {
+        (true, Some(conn)) => {
+            info!("📤 Durable mint outbox ENABLED (unsettled surplus retried until on-chain)");
+            Some(Arc::new(aggregator_api::mint_outbox::MintOutbox::new(conn)))
+        }
+        (true, None) => {
+            warn!("⚠️ Mint enabled but Redis unavailable — mint outbox OFF; a mint that can't land on-chain is best-effort only (surplus may be lost on failure).");
+            None
+        }
+        (false, _) => None,
+    };
+
     // Settlement sink: periodically drains completed 15-minute billing bins. For
     // each bin it (1) writes the TOU/demand `billing` point to InfluxDB (if
     // enabled) and (2) mints the net surplus to the meter owner via Chain Bridge
@@ -385,6 +468,7 @@ async fn main() -> Result<()> {
         let settle_registry = meter_registry.clone();
         let billing_influx = billing_influx;
         let settle_bin_store = bin_store.clone();
+        let settle_outbox = mint_outbox.clone();
         let interval_secs = std::env::var("BILLING_FLUSH_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -446,52 +530,49 @@ async fn main() -> Result<()> {
                                 }
                             }
 
-                            // (2) Surplus mint — fire-and-forget so a slow bridge
-                            // never stalls the sweep. The bridge idempotency key
-                            // mint:{serial}:{window_start_ms} + on-chain PDA dedup
-                            // any replay (e.g. a crash before eviction). The
-                            // mint-vs-skip decision is the pure `plan_mint`.
+                            // (2) Surplus mint. When the durable outbox is on, the
+                            // surplus is ENQUEUED (persisted) and the drain loop
+                            // mints it — so a mint that can't land on-chain yet
+                            // (bridge/validator down, sim rejection, lost reply) is
+                            // retried until confirmed, never lost. Without the
+                            // outbox (no Redis) it falls back to a best-effort
+                            // fire-and-forget mint (prior behavior). The bridge
+                            // dedups replays on mint:{serial}:{window_start_ms} +
+                            // the on-chain PDA, so retries never double-mint.
                             match aggregator_api::billing_sink::plan_mint(bin, settle_mint.is_enabled()) {
                                 aggregator_api::billing_sink::MintDecision::Surplus(kwh) => {
-                                    let gw = settle_mint.clone();
-                                    let reg = settle_registry.clone();
-                                    let serial = bin.meter_serial.clone();
-                                    let meter_id = *bin.meter_id.as_bytes();
-                                    let window_start_ms = bin.window_start_ms();
-                                    tokio::spawn(async move {
-                                        let wallet = match reg.resolve_wallet(&serial).await {
-                                            Ok(Some(w)) => w,
-                                            Ok(None) => {
-                                                // Unregistered meter: aggregates but mints
-                                                // nothing. Counted so this silent skip is
-                                                // visible on dashboards, not just in logs.
-                                                warn!("surplus mint skipped: no wallet registered for meter {serial}");
-                                                metrics::record_mint_outcome("skipped", "no_wallet");
-                                                return;
+                                    let pending = aggregator_api::mint_outbox::PendingMint::new(
+                                        bin.meter_serial.clone(),
+                                        bin.meter_id,
+                                        bin.window_start_ms(),
+                                        kwh,
+                                    );
+                                    match &settle_outbox {
+                                        Some(outbox) => match outbox.enqueue(&pending).await {
+                                            Ok(()) => {
+                                                // Durably queued; the drain loop mints + removes it.
+                                                metrics::record_mint_outcome("queued", "ok");
                                             }
                                             Err(e) => {
-                                                warn!("surplus mint skipped: wallet lookup failed for {serial}: {e}");
-                                                metrics::record_mint_outcome("skipped", "resolve_err");
-                                                return;
+                                                // Outbox write failed — don't drop the surplus;
+                                                // attempt an immediate best-effort mint instead.
+                                                warn!("mint outbox enqueue failed for {}: {e}; attempting immediate mint", pending.meter_serial);
+                                                let gw = settle_mint.clone();
+                                                let reg = settle_registry.clone();
+                                                tokio::spawn(async move {
+                                                    let _ = attempt_mint(&gw, &reg, &pending).await;
+                                                });
                                             }
-                                        };
-                                        match gw
-                                            .mint(&wallet, kwh, meter_id, &serial, window_start_ms)
-                                            .await
-                                        {
-                                            Ok(out) => {
-                                                info!(
-                                                    "⚡ minted {kwh} kWh surplus for meter {serial} (sig={}, slot={})",
-                                                    out.signature, out.slot
-                                                );
-                                                metrics::record_mint_outcome("settled", "ok");
-                                            }
-                                            Err(e) => {
-                                                warn!("surplus mint failed for meter {serial}: {e}");
-                                                metrics::record_mint_outcome("failed", "mint_err");
-                                            }
+                                        },
+                                        None => {
+                                            // No durable outbox (Redis off): best-effort mint.
+                                            let gw = settle_mint.clone();
+                                            let reg = settle_registry.clone();
+                                            tokio::spawn(async move {
+                                                let _ = attempt_mint(&gw, &reg, &pending).await;
+                                            });
                                         }
-                                    });
+                                    }
                                 }
                                 aggregator_api::billing_sink::MintDecision::NoSurplus => {
                                     // Net consumption — nothing to mint. Counted as the
@@ -512,6 +593,57 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    // Mint outbox drain loop: retries every persisted unsettled surplus until it
+    // is confirmed on-chain, then removes it. This is what makes "the mint can't
+    // land yet" non-lossy — a bridge/validator outage or a sim rejection just
+    // leaves the entry queued for the next tick (and it survives a restart, since
+    // load_all reads Redis). Retries are idempotent (bridge dedup + on-chain PDA).
+    if let Some(outbox) = mint_outbox.clone() {
+        let drain_gw = mint_gateway.clone();
+        let drain_reg = meter_registry.clone();
+        let drain_shutdown = shutdown_token.clone();
+        let retry_secs = std::env::var("MINT_RETRY_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        info!("📤 Mint outbox drain loop ENABLED (retry every {retry_secs}s until on-chain)");
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(retry_secs));
+            loop {
+                tokio::select! {
+                    _ = drain_shutdown.cancelled() => {
+                        info!("🛑 Mint outbox drain loop stopped");
+                        break;
+                    }
+                    _ = ticker.tick() => {
+                        let pending = match outbox.load_all().await {
+                            Ok(p) => p,
+                            Err(e) => {
+                                warn!("mint outbox load failed ({e}); will retry next tick");
+                                continue;
+                            }
+                        };
+                        if pending.is_empty() {
+                            continue;
+                        }
+                        info!("📤 Mint outbox: draining {} pending surplus mint(s)", pending.len());
+                        for p in pending {
+                            // Confirmed on-chain ⇒ remove; otherwise keep for the
+                            // next tick (no_wallet / bridge down / sim rejection).
+                            if attempt_mint(&drain_gw, &drain_reg, &p).await {
+                                let field = p.field();
+                                if let Err(e) = outbox.remove(&field).await {
+                                    warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let api_keys_raw = std::env::var("GRIDTOKENX_API_KEYS").unwrap_or_default();
     let api_keys = parse_api_keys(&api_keys_raw);
 
