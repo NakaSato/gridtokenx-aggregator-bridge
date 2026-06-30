@@ -27,6 +27,31 @@ use crate::utils::numeric::to_positive_decimal;
 /// Maximum concurrent processing per zone
 const ZONE_SEMAPHORE_SIZE: usize = 50;
 
+/// Spawns a single background task that drains an unbounded channel and calls
+/// `write_fn` on each item **strictly in receive order** — the next item is
+/// only dequeued after the previous `write_fn` call's future resolves, so
+/// submission order always equals effect order even if an earlier item's
+/// write happens to be slower than a later one's. Returns the paired sender;
+/// dropping it lets the writer task exit once the channel drains.
+///
+/// Generic over `T`/`write_fn` so the ordering guarantee itself is
+/// unit-testable without a live Redis (see the `ordered_writer` tests below) —
+/// `bin_write_tx` wires this up against [`aggregator_logic::bin_store::BinStore::write`].
+fn spawn_ordered_writer<T, F, Fut>(write_fn: F) -> mpsc::UnboundedSender<T>
+where
+    T: Send + 'static,
+    F: Fn(T) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let (tx, mut rx) = mpsc::unbounded_channel::<T>();
+    tokio::spawn(async move {
+        while let Some(item) = rx.recv().await {
+            write_fn(item).await;
+        }
+    });
+    tx
+}
+
 /// Zone-based event ingester with parallel processing and batch forwarding
 pub struct ZoneEventIngester {
     connection_manager: ConnectionManager,
@@ -129,15 +154,14 @@ impl ZoneEventIngester {
         // fire-and-forget from the caller's perspective — Redis latency never
         // blocks ingest, it just serializes the writes themselves.
         let bin_write_tx = bin_store.map(|store| {
-            let (tx, mut rx) = mpsc::unbounded_channel::<crate::aggregator::BillingBin>();
-            tokio::spawn(async move {
-                while let Some(bin) = rx.recv().await {
+            spawn_ordered_writer(move |bin: crate::aggregator::BillingBin| {
+                let store = store.clone();
+                async move {
                     if let Err(e) = store.write(&bin).await {
                         debug!("durable bin write-through failed (memory-only): {e}");
                     }
                 }
-            });
-            tx
+            })
         });
 
         Ok(Self {
@@ -880,5 +904,82 @@ mod tests {
         let (tariff, demand) = extract_tariff_demand(&HashMap::new());
         assert_eq!(tariff, None);
         assert_eq!(demand, None);
+    }
+
+    // --- spawn_ordered_writer: the durable bin-store write-ordering fix ---
+    //
+    // Regression coverage for the bug where concurrent fire-and-forget
+    // `tokio::spawn` writes for the same (meter, window) key could complete
+    // out of order and leave Redis holding a stale, undercounted bin. The
+    // fix routes every write through one channel drained by a single task, so
+    // it never starts writing item N+1 until item N's write has resolved.
+
+    #[tokio::test]
+    async fn writes_land_in_submission_order_even_when_an_earlier_one_is_slower() {
+        use std::sync::Mutex as StdMutex;
+
+        let order = std::sync::Arc::new(StdMutex::new(Vec::new()));
+        let order_writer = order.clone();
+        let tx = super::spawn_ordered_writer(move |item: u32| {
+            let order = order_writer.clone();
+            async move {
+                // Item 1 is the slowest call — if the writer ran items
+                // concurrently (the bug), item 2 or 3 would finish first and
+                // this assertion-by-construction (sequential drain) would be
+                // the only thing preventing item 1 from landing last.
+                if item == 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                order.lock().unwrap().push(item);
+            }
+        });
+
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+        drop(tx); // let the writer task observe channel closure and exit
+
+        // Give the single writer task time to fully drain (item 1's 20ms
+        // sleep dominates).
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![1, 2, 3],
+            "writer must process strictly in submission order, not completion order"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_write_for_a_key_always_wins_no_matter_submission_timing() {
+        // Mirrors the real failure mode: two writes for the *same* bin key,
+        // the later (larger, more-accumulated) snapshot must be the one that
+        // sticks in the durable store, never overwritten by a late-arriving
+        // earlier snapshot.
+        use std::sync::Mutex as StdMutex;
+
+        let last_seen = std::sync::Arc::new(StdMutex::new(0u32));
+        let last_seen_writer = last_seen.clone();
+        let tx = super::spawn_ordered_writer(move |snapshot: u32| {
+            let last_seen = last_seen_writer.clone();
+            async move {
+                if snapshot == 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                *last_seen.lock().unwrap() = snapshot; // last write wins, like a Redis HSET
+            }
+        });
+
+        tx.send(1).unwrap(); // smaller, earlier-accumulated snapshot
+        tx.send(2).unwrap(); // larger, later-accumulated snapshot
+        drop(tx);
+
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        assert_eq!(
+            *last_seen.lock().unwrap(),
+            2,
+            "the later snapshot must win even though the earlier one was slower"
+        );
     }
 }
