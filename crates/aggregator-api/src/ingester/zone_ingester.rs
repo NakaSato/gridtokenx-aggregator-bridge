@@ -55,6 +55,18 @@ pub struct ZoneEventIngester {
     /// drains the channel strictly in submission order, which matches mutation
     /// order because the lock serializes both. `None` ⇒ memory-only (durable
     /// bins disabled or Redis unavailable).
+    ///
+    /// KNOWN RESIDUAL RACE (accepted, low severity): this channel only orders
+    /// writes against each other, not against the settlement loop's
+    /// `BinStore::remove` (`bin/.../main.rs`), which is a separate call path. A
+    /// write already queued here for a bin can still land in Redis *after*
+    /// settlement's `remove` for that same key, leaving a zombie entry that
+    /// gets restored and reprocessed once on the next restart. Harmless: the
+    /// reprocessing is deduped by the mint's `mint:{serial}:{window_start_ms}`
+    /// idempotency key (no double-mint), the only cost is a duplicate InfluxDB
+    /// billing row. Closing this fully would require moving the ordering into
+    /// `BinStore` itself so both call sites share one queue — not done; the
+    /// failure mode doesn't warrant that architecture change.
     bin_write_tx: Option<mpsc::UnboundedSender<crate::aggregator::BillingBin>>,
 }
 
