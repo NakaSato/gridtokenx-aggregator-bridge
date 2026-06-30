@@ -310,9 +310,14 @@ pub fn record_ven_event(outcome: &str) {
 /// Records a surplus-mint settlement outcome per completed billing bin:
 /// "settled" (minted on-chain via Chain Bridge), "skipped" (the bin aggregated
 /// but no token was issued — most often an unregistered meter with no recipient
-/// wallet, which otherwise fails silently), "failed" (the bridge/NATS mint call
-/// errored), or "no_surplus" (net consumption — nothing to mint). `reason`
-/// qualifies the outcome ("no_wallet", "resolve_err", "mint_err", "ok").
+/// wallet, which otherwise fails silently), "failed" (a single mint call
+/// errored — may still retry via the durable outbox), "no_surplus" (net
+/// consumption — nothing to mint), or "lost" (the durable outbox enqueue
+/// failed twice AND the last-resort immediate mint also failed — the surplus
+/// has no durable home anywhere; the bin's durable entry is retained for
+/// manual recovery instead of being evicted, see
+/// `aggregator_logic::billing_sink::MintHandoff::Lost`). `reason` qualifies
+/// the outcome ("no_wallet", "resolve_err", "mint_err", "outbox_and_mint_failed", "ok").
 pub fn record_mint_outcome(outcome: &str, reason: &str) {
     counter!("aggregator_mint_total",
         "outcome" => outcome.to_string(),

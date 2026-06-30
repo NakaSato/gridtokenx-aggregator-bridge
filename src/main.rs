@@ -529,6 +529,13 @@ async fn main() -> Result<()> {
                                                                 "surplus mint LOST for meter {} window {}: outbox enqueue failed twice and immediate mint failed; durable bin entry retained for manual recovery",
                                                                 pending.meter_serial, pending.window_start_ms
                                                             );
+                                                            // Distinct from attempt_mint's own
+                                                            // "failed"/"mint_err" (one failed
+                                                            // call) — this counts the end-to-end
+                                                            // outcome (no durable home anywhere),
+                                                            // so an alert can page on it directly
+                                                            // instead of relying on a log grep.
+                                                            metrics::record_mint_outcome("lost", "outbox_and_mint_failed");
                                                             handoff = MintHandoff::Lost;
                                                         }
                                                     }

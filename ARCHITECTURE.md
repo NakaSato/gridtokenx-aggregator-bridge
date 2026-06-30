@@ -130,10 +130,10 @@ scraper presents a CA-issued client cert; the superproject's prometheus job uses
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `aggregator_settlement_path` | gauge | `path` = `nats` \| `grpc` \| `disabled` | The active surplus-mint path, set once at startup **after** the recorder is installed. Active path = `1`, others = `0`. `disabled` = `MINT_VIA_CHAIN_BRIDGE` unset or NATS unreachable. |
-| `aggregator_mint_total` | counter | `outcome` = `settled` \| `skipped` \| `failed` \| `no_surplus`; `reason` = `ok` \| `no_wallet` \| `resolve_err` \| `mint_err` | One increment per completed billing bin in the settlement sweep. `skipped/no_wallet` surfaces the otherwise-silent unregistered-meter case; `no_surplus` is the net-consumption denominator. |
+| `aggregator_mint_total` | counter | `outcome` = `settled` \| `skipped` \| `failed` \| `no_surplus` \| `lost`; `reason` = `ok` \| `no_wallet` \| `resolve_err` \| `mint_err` \| `outbox_and_mint_failed` | One increment per completed billing bin in the settlement sweep. `skipped/no_wallet` surfaces the otherwise-silent unregistered-meter case; `no_surplus` is the net-consumption denominator. `lost/outbox_and_mint_failed` is the durable-outbox enqueue failing twice **and** the last-resort immediate mint also failing — the bin's durable Redis entry is retained for manual recovery instead of evicted (`src/main.rs`, `MintHandoff::Lost`). |
 
 Alert rules live in the superproject `monitoring/prometheus_rules.yml`
-(`AggregatorSurplusMintDisabled`, `AggregatorMintSkipSpike`).
+(`AggregatorSurplusMintDisabled`, `AggregatorMintSkipSpike`, `AggregatorMintLost`).
 
 **API-key auth cache.** `crates/aggregator-api/src/auth.rs` caches the IAM
 `VerifyApiKey` verdict to keep sustained ingest from flooding IAM (each call is a
