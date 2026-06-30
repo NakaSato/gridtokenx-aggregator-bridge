@@ -475,14 +475,13 @@ async fn main() -> Result<()> {
                             // Without the outbox (no Redis) it falls back to a
                             // best-effort fire-and-forget mint (prior behavior).
                             //
-                            // `bin_settled` gates the durable bin-store removal below:
-                            // it only stays `true` once the surplus has somewhere
-                            // durable to live (the outbox) or there genuinely is none
-                            // to track (no surplus / mint disabled). If both the
-                            // outbox enqueue and a last-resort immediate mint fail, the
-                            // bin's durable entry is deliberately retained instead of
-                            // silently dropped.
-                            let mut bin_settled = true;
+                            // `handoff` records how (or whether) the surplus was
+                            // durably handed off, and gates the durable bin-store
+                            // removal below via the pure `bin_durably_settled` — see
+                            // its doc for why `Lost` is the only outcome that must
+                            // retain the bin's durable entry instead of evicting it.
+                            use aggregator_api::billing_sink::MintHandoff;
+                            let mut handoff = MintHandoff::NotApplicable;
                             match aggregator_api::billing_sink::plan_mint(bin, settle_mint.is_enabled()) {
                                 aggregator_api::billing_sink::MintDecision::Surplus(kwh) => {
                                     let pending = aggregator_api::mint_outbox::PendingMint::new(
@@ -495,6 +494,7 @@ async fn main() -> Result<()> {
                                         Some(outbox) => match outbox.enqueue(&pending).await {
                                             Ok(()) => {
                                                 metrics::record_mint_outcome("queued", "ok");
+                                                handoff = MintHandoff::Enqueued;
                                                 let gw = settle_mint.clone();
                                                 let reg = settle_registry.clone();
                                                 let outbox = outbox.clone();
@@ -515,18 +515,21 @@ async fn main() -> Result<()> {
                                                 match outbox.enqueue(&pending).await {
                                                     Ok(()) => {
                                                         metrics::record_mint_outcome("queued", "ok");
+                                                        handoff = MintHandoff::Enqueued;
                                                     }
                                                     Err(e2) => {
                                                         error!(
                                                             "mint outbox enqueue failed twice for meter {} window {}: {e2}; attempting immediate mint as last resort",
                                                             pending.meter_serial, pending.window_start_ms
                                                         );
-                                                        if !mint_settlement::attempt_mint(&settle_mint, &settle_registry, &pending).await {
+                                                        if mint_settlement::attempt_mint(&settle_mint, &settle_registry, &pending).await {
+                                                            handoff = MintHandoff::MintedDirectly;
+                                                        } else {
                                                             error!(
                                                                 "surplus mint LOST for meter {} window {}: outbox enqueue failed twice and immediate mint failed; durable bin entry retained for manual recovery",
                                                                 pending.meter_serial, pending.window_start_ms
                                                             );
-                                                            bin_settled = false;
+                                                            handoff = MintHandoff::Lost;
                                                         }
                                                     }
                                                 }
@@ -534,6 +537,10 @@ async fn main() -> Result<()> {
                                         },
                                         None => {
                                             // No durable outbox (Redis off): best-effort mint.
+                                            // No outbox here ⇒ no durable bin store either
+                                            // (both gate on the same Redis connection), so
+                                            // there is nothing for `handoff` to protect.
+                                            handoff = MintHandoff::BestEffortOnly;
                                             let gw = settle_mint.clone();
                                             let reg = settle_registry.clone();
                                             tokio::spawn(async move {
@@ -550,7 +557,7 @@ async fn main() -> Result<()> {
                                 aggregator_api::billing_sink::MintDecision::Disabled => {}
                             }
 
-                            if bin_settled {
+                            if aggregator_api::billing_sink::bin_durably_settled(handoff) {
                                 if let Some(store) = &settle_bin_store {
                                     if let Err(e) = store.remove(&[bin.key()]).await {
                                         warn!("durable bin eviction failed for {} (stale entry remains, deduped by idempotency key): {e}", bin.meter_serial);

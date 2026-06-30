@@ -80,6 +80,44 @@ pub fn plan_mint(bin: &BillingBin, mint_enabled: bool) -> MintDecision {
     }
 }
 
+/// How a completed bin's [`MintDecision::Surplus`] was (or wasn't) durably
+/// handed off — the input to [`bin_durably_settled`], which gates whether the
+/// flush loop may drop the bin's durable Redis backup (`bin/.../main.rs`).
+///
+/// A crash before the surplus has *anywhere* durable to live (the outbox, or a
+/// confirmed on-chain mint) must not be allowed to also lose the bin's durable
+/// entry — that combination is the data-loss bug this type exists to prevent
+/// by construction: only [`MintHandoff::Lost`] yields `false`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum MintHandoff {
+    /// `MintDecision::NoSurplus` or `MintDecision::Disabled` — nothing to mint,
+    /// so nothing durable to protect.
+    NotApplicable,
+    /// Outbox enqueue succeeded — the outbox is now the durable home; the
+    /// bin's own durable entry is no longer needed.
+    Enqueued,
+    /// Outbox enqueue failed (after a retry), but a same-tick last-resort
+    /// immediate mint confirmed on-chain.
+    MintedDirectly,
+    /// No durable outbox configured (Redis unavailable) — best-effort
+    /// fire-and-forget mint, same as before the durable outbox existed. Only
+    /// reachable when there is also no durable bin store to protect.
+    BestEffortOnly,
+    /// Outbox enqueue failed (after a retry) AND the last-resort immediate
+    /// mint also failed: the surplus has nowhere durable to live. The bin's
+    /// durable entry must be **retained**, not evicted, so it survives for
+    /// manual recovery instead of being silently dropped.
+    Lost,
+}
+
+/// Whether it is safe to drop a completed bin's durable Redis backup, given
+/// how its mint was (or wasn't) durably handed off. Pure — the flush loop
+/// calls this so the eviction-safety rule is a single, unit-testable decision
+/// rather than a `bool` threaded by hand through a `tokio::spawn` chain.
+pub fn bin_durably_settled(handoff: MintHandoff) -> bool {
+    !matches!(handoff, MintHandoff::Lost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +209,45 @@ mod tests {
             MintDecision::NoSurplus,
             "net-zero must not mint a 0 kWh surplus"
         );
+    }
+
+    // --- bin_durably_settled: the durable-bin-store eviction-safety gate ---
+    //
+    // Regression coverage for the bug where the settlement loop deleted a
+    // bin's durable Redis backup for the whole batch up front, before that
+    // bin's surplus had anywhere durable to live. The fix routes every
+    // post-mint outcome through this pure decision instead.
+
+    #[test]
+    fn not_applicable_is_always_safe_to_evict() {
+        assert!(bin_durably_settled(MintHandoff::NotApplicable));
+    }
+
+    #[test]
+    fn enqueued_is_safe_to_evict() {
+        // The outbox itself is durable, so once enqueued the bin-store copy
+        // is redundant and may be dropped.
+        assert!(bin_durably_settled(MintHandoff::Enqueued));
+    }
+
+    #[test]
+    fn minted_directly_is_safe_to_evict() {
+        // Confirmed on-chain — nothing left to retry.
+        assert!(bin_durably_settled(MintHandoff::MintedDirectly));
+    }
+
+    #[test]
+    fn best_effort_only_is_safe_to_evict() {
+        // No durable outbox configured means no durable bin store either
+        // (both gate on the same Redis connection) — nothing to protect.
+        assert!(bin_durably_settled(MintHandoff::BestEffortOnly));
+    }
+
+    #[test]
+    fn lost_must_not_be_evicted() {
+        // The one outcome where the surplus has no durable home anywhere:
+        // the bin-store entry is the last copy and must be retained for
+        // manual recovery, never silently dropped.
+        assert!(!bin_durably_settled(MintHandoff::Lost));
     }
 }
