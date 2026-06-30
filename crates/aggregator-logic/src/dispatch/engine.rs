@@ -114,9 +114,13 @@ impl DispatchEngine {
         adapters: &std::collections::HashMap<String, Arc<dyn DispatchAdapter>>,
     ) -> Vec<String> {
         let raw = match std::env::var("DISPATCH_ADAPTERS") {
-            Ok(csv) => csv,
+            // A present-but-empty/whitespace value (e.g. orchestrator
+            // templating that leaves the var set to "") must fall back too —
+            // otherwise the legacy DISPATCH_ADAPTER is silently never
+            // consulted and selection falls straight through to the default.
+            Ok(csv) if !csv.trim().is_empty() => csv,
             // Fall back to the legacy single-adapter var.
-            Err(_) => std::env::var("DISPATCH_ADAPTER").unwrap_or_default(),
+            _ => std::env::var("DISPATCH_ADAPTER").unwrap_or_default(),
         };
         Self::select_adapters_from(&raw, adapters)
     }
@@ -211,19 +215,17 @@ impl DispatchEngine {
             DispatchType::FLEX_DOWN => info!("Frequency high! Dispatching FLEX_DOWN command."),
         }
 
-        // Capacity is a property of the fleet, not the adapter — check it once
-        // for the whole fan-out. Zero capacity skips ALL adapters (no target
-        // can be served), not one.
-        if !self.has_dispatch_capacity().await {
-            return Err(anyhow!("No available capacity for dispatch"));
-        }
-
         // Snapshot the target list so the dispatch loop can borrow `&mut self`
         // (record_dispatch) without aliasing `self.active_adapters`.
         let targets = self.active_adapters.clone();
-        let mut fired = 0usize;
-        let mut errors: Vec<String> = Vec::new();
 
+        // Cooldown is resolved BEFORE the capacity check: a target already
+        // inside its cooldown window is a no-op regardless of capacity, so
+        // checking capacity first turned every cooldown-suppressed
+        // grid-status message into a logged error (and, when it fanned out
+        // to zero adapters, an error with no adapter to blame). Only targets
+        // that would actually attempt a dispatch need capacity to exist.
+        let mut eligible: Vec<(String, Arc<dyn DispatchAdapter>)> = Vec::new();
         for name in &targets {
             let Some(adapter) = self.adapters.get(name).cloned() else {
                 // Shouldn't happen — names are validated at construction.
@@ -239,19 +241,59 @@ impl DispatchEngine {
                 crate::metrics::record_dispatch_outcome(&action_label, name, "suppressed");
                 continue;
             }
+            eligible.push((name.clone(), adapter));
+        }
 
-            match adapter.execute_dispatch(action, self.capacity_kw).await {
-                Ok(()) => {
-                    crate::metrics::record_dispatch_outcome(&action_label, name, "fired");
+        if eligible.is_empty() {
+            // Every target was cooldown-suppressed (or vanished) — nothing to
+            // dispatch this tick, so no capacity check and no error.
+            return Ok(());
+        }
+
+        // Capacity is a property of the fleet, not the adapter — check it once
+        // for the whole fan-out. Zero capacity skips every eligible target;
+        // each still gets a "failed" outcome recorded so capacity-exhaustion
+        // incidents stay visible on aggregator_dispatch_total, not just in logs.
+        if !self.has_dispatch_capacity().await {
+            for (name, _) in &eligible {
+                crate::metrics::record_dispatch_outcome(&action_label, name, "failed");
+            }
+            return Err(anyhow!("No available capacity for dispatch"));
+        }
+
+        // Fan out concurrently: these are independent network targets (e.g. a
+        // downstream in-mesh VTN AND a separate utility VTN). Awaiting them
+        // sequentially would sum their round-trip latencies instead of
+        // bounding the total to the slowest one — exactly wrong during a
+        // frequency excursion, when fast response matters most.
+        let capacity_kw = self.capacity_kw;
+        let mut tasks = tokio::task::JoinSet::new();
+        for (name, adapter) in eligible {
+            tasks.spawn(async move {
+                let result = adapter.execute_dispatch(action, capacity_kw).await;
+                (name, result)
+            });
+        }
+
+        let mut fired = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((name, Ok(()))) => {
+                    crate::metrics::record_dispatch_outcome(&action_label, &name, "fired");
                     // Record only on success: a failed dispatch must retry on
                     // the next grid-status message, not sit out the cooldown.
-                    self.record_dispatch(action, name);
+                    self.record_dispatch(action, &name);
                     fired += 1;
                 }
-                Err(e) => {
-                    crate::metrics::record_dispatch_outcome(&action_label, name, "failed");
+                Ok((name, Err(e))) => {
+                    crate::metrics::record_dispatch_outcome(&action_label, &name, "failed");
                     warn!("Dispatch of {:?} to {} failed: {}", action, name, e);
                     errors.push(format!("{name}: {e}"));
+                }
+                Err(join_err) => {
+                    warn!("dispatch task panicked: {join_err}");
+                    errors.push(format!("task panicked: {join_err}"));
                 }
             }
         }
@@ -348,31 +390,30 @@ mod tests {
 
     // Per-action tracking: a flipped action fires immediately (independent
     // timer), but oscillation cannot reset a direction's own cooldown.
+    // Exercises the real DispatchEngine (record_dispatch/last_dispatch_of)
+    // rather than a hand-rolled reimplementation, so it can't drift from the
+    // adapter-keyed behavior covered by cooldown_is_keyed_per_action_and_adapter.
     #[test]
     fn per_action_timers_survive_oscillation() {
-        let mut last: Vec<(DispatchType, std::time::Instant)> = Vec::new();
-        let lookup = |last: &Vec<(DispatchType, std::time::Instant)>, action: DispatchType| {
-            last.iter().find(|(a, _)| *a == action).map(|(_, at)| *at)
-        };
-        let cooldown = std::time::Duration::from_secs(900);
+        let mut eng = engine(vec![], &[], false);
 
         // FLEX_UP fires, then frequency flips: FLEX_DOWN still allowed.
-        last.push((DispatchType::FLEX_UP, std::time::Instant::now()));
+        eng.record_dispatch(DispatchType::FLEX_UP, "a");
         assert!(cooldown_allows(
-            lookup(&last, DispatchType::FLEX_DOWN),
-            cooldown
+            eng.last_dispatch_of(DispatchType::FLEX_DOWN, "a"),
+            eng.cooldown
         ));
 
         // FLEX_DOWN fires too; now flipping BACK to FLEX_UP is suppressed —
         // its own timer is still hot.
-        last.push((DispatchType::FLEX_DOWN, std::time::Instant::now()));
+        eng.record_dispatch(DispatchType::FLEX_DOWN, "a");
         assert!(!cooldown_allows(
-            lookup(&last, DispatchType::FLEX_UP),
-            cooldown
+            eng.last_dispatch_of(DispatchType::FLEX_UP, "a"),
+            eng.cooldown
         ));
         assert!(!cooldown_allows(
-            lookup(&last, DispatchType::FLEX_DOWN),
-            cooldown
+            eng.last_dispatch_of(DispatchType::FLEX_DOWN, "a"),
+            eng.cooldown
         ));
     }
 
