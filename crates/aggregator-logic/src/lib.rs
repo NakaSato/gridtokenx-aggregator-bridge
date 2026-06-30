@@ -17,5 +17,7 @@ pub mod dispatch;
 pub mod grid_status;
 pub mod metrics;
 pub mod mint_outbox;
+pub mod mint_settlement;
+pub mod redis_hash;
 pub mod router;
 pub mod standards;

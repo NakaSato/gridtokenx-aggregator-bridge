@@ -19,9 +19,9 @@ use anyhow::{Context, Result};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use std::collections::HashMap;
-use tracing::warn;
 
 use crate::aggregator::{BillingBin, BinKey};
+use crate::redis_hash::parse_redis_hash;
 
 /// Redis hash holding every in-flight bin: field = [`bin_field`], value = JSON.
 const BINS_KEY: &str = "gridtokenx:billing:bins";
@@ -34,19 +34,10 @@ fn bin_field(key: &BinKey) -> String {
 }
 
 /// Decodes an `HGETALL` map into bins, skipping (with a `warn!`) any value that
-/// fails to deserialize rather than aborting the whole restore. Pure so it can
-/// be unit-tested without a live Redis. `BillingBin`'s `#[serde(default)]`
-/// fields keep bins written by an older binary loadable here.
+/// fails to deserialize rather than aborting the whole restore. `BillingBin`'s
+/// `#[serde(default)]` fields keep bins written by an older binary loadable here.
 fn parse_bins(map: HashMap<String, String>) -> Vec<BillingBin> {
-    map.into_iter()
-        .filter_map(|(field, json)| match serde_json::from_str::<BillingBin>(&json) {
-            Ok(bin) => Some(bin),
-            Err(e) => {
-                warn!("durable bin store: dropping unparsable bin field {field}: {e}");
-                None
-            }
-        })
-        .collect()
+    parse_redis_hash(map, "durable bin store")
 }
 
 /// Redis-backed durable store for billing bins. Cheap to clone (the

@@ -12,7 +12,7 @@ use redis::{AsyncCommands, Client};
 use rust_decimal::Decimal;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -47,10 +47,15 @@ pub struct ZoneEventIngester {
     /// At-rest stream encryption. When set, stream entries arrive as an `enc`
     /// envelope that is AES-256-GCM decrypted back to the reading before decode.
     stream_cipher: Option<Arc<crate::infra::stream_cipher::StreamCipher>>,
-    /// Durable billing-bin store. When set, each updated bin is write-through'd
-    /// to Redis (fire-and-forget) so a restart recovers in-flight windows. `None`
-    /// ⇒ memory-only (durable bins disabled or Redis unavailable).
-    bin_store: Option<Arc<aggregator_logic::bin_store::BinStore>>,
+    /// Ordered write-through channel to a single background writer task (see
+    /// [`Self::new`]) backed by the durable billing-bin store. Sending the
+    /// snapshot here *while still holding the aggregator lock* (not via a
+    /// per-reading `tokio::spawn`) keeps concurrent readings for the same
+    /// (meter, window) from racing each other's `HSET` — a single consumer
+    /// drains the channel strictly in submission order, which matches mutation
+    /// order because the lock serializes both. `None` ⇒ memory-only (durable
+    /// bins disabled or Redis unavailable).
+    bin_write_tx: Option<mpsc::UnboundedSender<crate::aggregator::BillingBin>>,
 }
 
 impl ZoneEventIngester {
@@ -106,6 +111,23 @@ impl ZoneEventIngester {
             FORWARD_BATCH_SIZE, BATCH_TIMEOUT_MS
         );
 
+        // Single background writer task drains the channel strictly in
+        // submission order, so concurrent readings for the same (meter, window)
+        // never race each other's `HSET` (see `bin_write_tx` doc). Still
+        // fire-and-forget from the caller's perspective — Redis latency never
+        // blocks ingest, it just serializes the writes themselves.
+        let bin_write_tx = bin_store.map(|store| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<crate::aggregator::BillingBin>();
+            tokio::spawn(async move {
+                while let Some(bin) = rx.recv().await {
+                    if let Err(e) = store.write(&bin).await {
+                        debug!("durable bin write-through failed (memory-only): {e}");
+                    }
+                }
+            });
+            tx
+        });
+
         Ok(Self {
             connection_manager,
             aggregator,
@@ -118,7 +140,7 @@ impl ZoneEventIngester {
             meter_registry,
             frequency_monitor,
             stream_cipher,
-            bin_store,
+            bin_write_tx,
         })
     }
 
@@ -602,12 +624,16 @@ impl ZoneEventIngester {
         // demand. Absent for non-DLMS sources -> None (split/demand untouched).
         let (tariff_period, demand_kw) = extract_tariff_demand(&reading.metadata);
 
-        // 1. Update Aggregator (local stats). Feeds the dispatch engine's
-        // completed-window capacity query (VPP flex dispatch). The returned bin
-        // snapshot is write-through'd to the durable store below.
-        let updated_bin = {
+        // 1. Update Aggregator (local stats) and, in the same locked section,
+        // hand the updated snapshot to the durable write-through channel (1b).
+        // Sending *before* releasing the lock — rather than after, via a
+        // per-reading `tokio::spawn` — keeps the channel's submission order
+        // identical to the lock's mutation order: two readings racing for the
+        // same (meter, window) can no longer have their `HSET`s land out of
+        // order and leave Redis holding a stale, undercounted bin.
+        {
             let mut agg = self.aggregator.lock().await;
-            agg.handle_reading(
+            let updated_bin = agg.handle_reading(
                 meter_id,
                 user_id,
                 reading.serial_number.clone(),
@@ -616,21 +642,16 @@ impl ZoneEventIngester {
                 reading.timestamp,
                 tariff_period,
                 demand_kw,
-            )
-        };
+            );
 
-        // 1b. Durable write-through (crash recovery of the in-flight window).
-        // Fire-and-forget so Redis latency never blocks ingest — mirrors the
-        // InfluxDB sink. A write fault degrades to memory-only (logged), never
-        // fatal. The store is keyed by (meter, window) so this overwrites the
-        // bin's prior persisted state as it accumulates.
-        if let Some(store) = &self.bin_store {
-            let store = store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = store.write(&updated_bin).await {
-                    debug!("durable bin write-through failed (memory-only): {e}");
-                }
-            });
+            // 1b. Durable write-through (crash recovery of the in-flight
+            // window). The channel send is non-blocking — Redis latency never
+            // blocks ingest, the single writer task (spawned in `new`) absorbs
+            // it. A closed channel (writer task gone) or a write fault both
+            // degrade to memory-only, never fatal.
+            if let Some(tx) = &self.bin_write_tx {
+                let _ = tx.send(updated_bin);
+            }
         }
 
         // 2. ACK in Redis to prevent redelivery. (The legacy HTTP/gRPC

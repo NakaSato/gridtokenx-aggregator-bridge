@@ -21,8 +21,9 @@ use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
 use uuid::Uuid;
+
+use crate::redis_hash::parse_redis_hash;
 
 /// Redis hash holding every unsettled mint: field = [`PendingMint::field`],
 /// value = JSON. Distinct from the billing-bin hash — a bin is evicted once
@@ -69,15 +70,7 @@ impl PendingMint {
 /// Decodes an `HGETALL` map into pending mints, skipping (with a `warn!`) any
 /// unparsable value. Pure — unit-testable without a live Redis.
 fn parse_pending(map: HashMap<String, String>) -> Vec<PendingMint> {
-    map.into_iter()
-        .filter_map(|(field, json)| match serde_json::from_str::<PendingMint>(&json) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                warn!("mint outbox: dropping unparsable entry {field}: {e}");
-                None
-            }
-        })
-        .collect()
+    parse_redis_hash(map, "mint outbox")
 }
 
 /// Redis-backed durable outbox of unsettled surplus mints.

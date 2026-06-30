@@ -12,8 +12,8 @@ use tracing::{error, info, warn};
 // aggregator-logic / aggregator-persistence / aggregator-protocol / aggregator-stacks / aggregator-core).
 // This binary is a thin entrypoint that wires the components and runs the servers.
 use aggregator_api::{
-    aggregator, auth, dispatch, grid_status, grpc, handlers, infra, ingester, metrics, protocol,
-    router, standards, state, telemetry,
+    aggregator, auth, dispatch, grid_status, grpc, handlers, infra, ingester, metrics,
+    mint_settlement, protocol, router, standards, state, telemetry,
 };
 
 use tokio::signal;
@@ -98,69 +98,6 @@ fn build_mtls_server_config(
         .with_client_cert_verifier(verifier)
         .with_single_cert(cert_chain, key)
         .context("build mTLS server config")
-}
-
-/// Attempts one on-chain mint for a pending surplus. Resolves the recipient
-/// wallet fresh (so a meter that registers after its window still mints on a
-/// retry), then asks Chain Bridge to mint. Returns `true` only when the mint is
-/// **confirmed** — the caller then drops the outbox entry. Returns `false`
-/// (keep + retry) for an unregistered wallet, a lookup error, or a mint failure
-/// (bridge/validator down, sim rejection). Idempotent: the bridge dedups on
-/// `mint:{serial}:{window_start_ms}` + the on-chain PDA, so a retry of a mint
-/// that already landed does not double-mint.
-async fn attempt_mint(
-    gw: &infra::mint::MintGateway,
-    reg: &infra::meter_registry::MeterRegistry,
-    p: &aggregator_api::mint_outbox::PendingMint,
-) -> bool {
-    let wallet = match reg.resolve_wallet(&p.meter_serial).await {
-        Ok(Some(w)) => w,
-        Ok(None) => {
-            // Unregistered meter: kept in the outbox so it mints once the owner
-            // registers a wallet. Counted so the skip is visible on dashboards.
-            warn!(
-                "surplus mint deferred: no wallet registered for meter {} (kept for retry)",
-                p.meter_serial
-            );
-            metrics::record_mint_outcome("skipped", "no_wallet");
-            return false;
-        }
-        Err(e) => {
-            warn!(
-                "surplus mint deferred: wallet lookup failed for {} ({e}); kept for retry",
-                p.meter_serial
-            );
-            metrics::record_mint_outcome("skipped", "resolve_err");
-            return false;
-        }
-    };
-    match gw
-        .mint(
-            &wallet,
-            p.energy_kwh,
-            *p.meter_id.as_bytes(),
-            &p.meter_serial,
-            p.window_start_ms,
-        )
-        .await
-    {
-        Ok(out) => {
-            info!(
-                "⚡ minted {} kWh surplus for meter {} (sig={}, slot={})",
-                p.energy_kwh, p.meter_serial, out.signature, out.slot
-            );
-            metrics::record_mint_outcome("settled", "ok");
-            true
-        }
-        Err(e) => {
-            warn!(
-                "surplus mint failed for meter {} ({e}); kept in outbox for retry",
-                p.meter_serial
-            );
-            metrics::record_mint_outcome("failed", "mint_err");
-            false
-        }
-    }
 }
 
 #[tokio::main]
@@ -494,9 +431,17 @@ async fn main() -> Result<()> {
                         break;
                     }
                     _ = ticker.tick() => {
-                        // Drain and evict under the lock, then process the owned
-                        // snapshot without holding the mutex (mint may be slow).
-                        let (bins, settled_keys) = {
+                        // Drain and evict from the in-memory aggregator under the
+                        // lock, then process the owned snapshot without holding the
+                        // mutex (mint may be slow). The DURABLE (Redis) bin-store
+                        // entry for each bin is intentionally NOT removed here — only
+                        // after that bin's surplus has been durably handed off below,
+                        // per-bin. Deleting it earlier (e.g. once for the whole batch,
+                        // up front) would reopen the crash-loss window this store
+                        // exists to close: a crash between an up-front bulk delete and
+                        // a later enqueue would drop the surplus from every durable
+                        // copy at once.
+                        let bins = {
                             let mut agg = billing_agg.lock().await;
                             let bins = agg.peek_completed_bins(grace);
                             if bins.is_empty() {
@@ -504,19 +449,8 @@ async fn main() -> Result<()> {
                             }
                             let keys: Vec<_> = bins.iter().map(|b| b.key()).collect();
                             agg.remove_bins(&keys);
-                            (bins, keys)
+                            bins
                         };
-
-                        // Drop the durable entries for the bins we just settled +
-                        // evicted from memory. After this point the bin is fully
-                        // processed (Influx written, mint spawned), so deleting is
-                        // safe; a delete fault only leaves a stale entry that the
-                        // mint idempotency key dedups on the next restart.
-                        if let Some(store) = &settle_bin_store {
-                            if let Err(e) = store.remove(&settled_keys).await {
-                                warn!("durable bin eviction failed (stale entries remain, deduped by idempotency key): {e}");
-                            }
-                        }
 
                         let mut written = 0usize;
                         for bin in &bins {
@@ -531,14 +465,24 @@ async fn main() -> Result<()> {
                             }
 
                             // (2) Surplus mint. When the durable outbox is on, the
-                            // surplus is ENQUEUED (persisted) and the drain loop
-                            // mints it — so a mint that can't land on-chain yet
-                            // (bridge/validator down, sim rejection, lost reply) is
-                            // retried until confirmed, never lost. Without the
-                            // outbox (no Redis) it falls back to a best-effort
-                            // fire-and-forget mint (prior behavior). The bridge
-                            // dedups replays on mint:{serial}:{window_start_ms} +
-                            // the on-chain PDA, so retries never double-mint.
+                            // surplus is ENQUEUED (persisted) first, then an immediate
+                            // best-effort mint is attempted so a healthy bridge still
+                            // settles within ~1s — the outbox + drain loop remain the
+                            // durable backstop if that immediate attempt fails (retried
+                            // until confirmed, never lost; idempotent on
+                            // mint:{serial}:{window_start_ms} + the on-chain PDA, so a
+                            // retry of a mint that already landed never double-mints).
+                            // Without the outbox (no Redis) it falls back to a
+                            // best-effort fire-and-forget mint (prior behavior).
+                            //
+                            // `bin_settled` gates the durable bin-store removal below:
+                            // it only stays `true` once the surplus has somewhere
+                            // durable to live (the outbox) or there genuinely is none
+                            // to track (no surplus / mint disabled). If both the
+                            // outbox enqueue and a last-resort immediate mint fail, the
+                            // bin's durable entry is deliberately retained instead of
+                            // silently dropped.
+                            let mut bin_settled = true;
                             match aggregator_api::billing_sink::plan_mint(bin, settle_mint.is_enabled()) {
                                 aggregator_api::billing_sink::MintDecision::Surplus(kwh) => {
                                     let pending = aggregator_api::mint_outbox::PendingMint::new(
@@ -550,18 +494,42 @@ async fn main() -> Result<()> {
                                     match &settle_outbox {
                                         Some(outbox) => match outbox.enqueue(&pending).await {
                                             Ok(()) => {
-                                                // Durably queued; the drain loop mints + removes it.
                                                 metrics::record_mint_outcome("queued", "ok");
-                                            }
-                                            Err(e) => {
-                                                // Outbox write failed — don't drop the surplus;
-                                                // attempt an immediate best-effort mint instead.
-                                                warn!("mint outbox enqueue failed for {}: {e}; attempting immediate mint", pending.meter_serial);
                                                 let gw = settle_mint.clone();
                                                 let reg = settle_registry.clone();
+                                                let outbox = outbox.clone();
+                                                let field = pending.field();
                                                 tokio::spawn(async move {
-                                                    let _ = attempt_mint(&gw, &reg, &pending).await;
+                                                    if mint_settlement::attempt_mint(&gw, &reg, &pending).await {
+                                                        if let Err(e) = outbox.remove(&field).await {
+                                                            warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
+                                                        }
+                                                    }
                                                 });
+                                            }
+                                            Err(e) => {
+                                                // Outbox write failed — retry it once before
+                                                // falling back, instead of silently relying on
+                                                // a single best-effort mint attempt.
+                                                warn!("mint outbox enqueue failed for {}: {e}; retrying enqueue once", pending.meter_serial);
+                                                match outbox.enqueue(&pending).await {
+                                                    Ok(()) => {
+                                                        metrics::record_mint_outcome("queued", "ok");
+                                                    }
+                                                    Err(e2) => {
+                                                        error!(
+                                                            "mint outbox enqueue failed twice for meter {} window {}: {e2}; attempting immediate mint as last resort",
+                                                            pending.meter_serial, pending.window_start_ms
+                                                        );
+                                                        if !mint_settlement::attempt_mint(&settle_mint, &settle_registry, &pending).await {
+                                                            error!(
+                                                                "surplus mint LOST for meter {} window {}: outbox enqueue failed twice and immediate mint failed; durable bin entry retained for manual recovery",
+                                                                pending.meter_serial, pending.window_start_ms
+                                                            );
+                                                            bin_settled = false;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         },
                                         None => {
@@ -569,7 +537,7 @@ async fn main() -> Result<()> {
                                             let gw = settle_mint.clone();
                                             let reg = settle_registry.clone();
                                             tokio::spawn(async move {
-                                                let _ = attempt_mint(&gw, &reg, &pending).await;
+                                                let _ = mint_settlement::attempt_mint(&gw, &reg, &pending).await;
                                             });
                                         }
                                     }
@@ -580,6 +548,14 @@ async fn main() -> Result<()> {
                                     metrics::record_mint_outcome("no_surplus", "ok");
                                 }
                                 aggregator_api::billing_sink::MintDecision::Disabled => {}
+                            }
+
+                            if bin_settled {
+                                if let Some(store) = &settle_bin_store {
+                                    if let Err(e) = store.remove(&[bin.key()]).await {
+                                        warn!("durable bin eviction failed for {} (stale entry remains, deduped by idempotency key): {e}", bin.meter_serial);
+                                    }
+                                }
                             }
                         }
                         if written > 0 {
@@ -628,14 +604,29 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         info!("📤 Mint outbox: draining {} pending surplus mint(s)", pending.len());
+                        // Attempt every pending entry concurrently — sequential
+                        // awaits would let one slow/unreachable Chain Bridge call
+                        // serialize and starve the rest of the backlog for the
+                        // whole tick.
+                        let mut attempts = tokio::task::JoinSet::new();
                         for p in pending {
-                            // Confirmed on-chain ⇒ remove; otherwise keep for the
-                            // next tick (no_wallet / bridge down / sim rejection).
-                            if attempt_mint(&drain_gw, &drain_reg, &p).await {
-                                let field = p.field();
-                                if let Err(e) = outbox.remove(&field).await {
-                                    warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
+                            let gw = drain_gw.clone();
+                            let reg = drain_reg.clone();
+                            let outbox = outbox.clone();
+                            attempts.spawn(async move {
+                                // Confirmed on-chain ⇒ remove; otherwise keep for the
+                                // next tick (no_wallet / bridge down / sim rejection).
+                                if mint_settlement::attempt_mint(&gw, &reg, &p).await {
+                                    let field = p.field();
+                                    if let Err(e) = outbox.remove(&field).await {
+                                        warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
+                                    }
                                 }
+                            });
+                        }
+                        while let Some(res) = attempts.join_next().await {
+                            if let Err(e) = res {
+                                warn!("mint outbox drain task panicked: {e}");
                             }
                         }
                     }
