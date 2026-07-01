@@ -10,6 +10,43 @@ use tracing::{debug, warn};
 
 use crate::metrics::record_cache_lookup;
 
+/// How often a TTL-cache's full `retain()` prune runs, at most. Decoupled from
+/// the (possibly much shorter) per-entry TTLs — a stale entry lingering a bit
+/// past its TTL between prunes is harmless, since every lookup double-checks
+/// per-entry expiry anyway (see `pubkey_cache_get`/`key_cache_get`).
+const CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A TTL-cache `HashMap` paired with a prune gate: a full expired-entry scan
+/// runs at most once per [`CACHE_PRUNE_INTERVAL`], not on every single insert.
+/// Without this, a burst of cache misses in one batch call (e.g. after a mass
+/// TTL expiry across a large device fleet) turns each insert into an
+/// O(cache_size) scan under the shared lock — serializing what should be an
+/// O(1) write.
+struct PrunedCache<K, V> {
+    map: HashMap<K, V>,
+    last_pruned: Instant,
+}
+
+impl<K: std::hash::Hash + Eq, V> PrunedCache<K, V> {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            last_pruned: Instant::now(),
+        }
+    }
+
+    /// Insert `key`→`value`. Prunes entries for which `expired` returns `true`
+    /// first, but only if `CACHE_PRUNE_INTERVAL` has elapsed since the last prune.
+    fn insert_pruned(&mut self, key: K, value: V, expired: impl Fn(&V) -> bool) {
+        let now = Instant::now();
+        if now.duration_since(self.last_pruned) >= CACHE_PRUNE_INTERVAL {
+            self.map.retain(|_, v| !expired(v));
+            self.last_pruned = now;
+        }
+        self.map.insert(key, value);
+    }
+}
+
 /// Verifies Ed25519 telemetry signatures against device public keys stored in
 /// Redis (`gridtokenx:devices:{meter_id}:pubkey`).
 ///
@@ -26,6 +63,11 @@ use crate::metrics::record_cache_lookup;
 /// 60s) for that reason. The signature itself is still verified on every call; only
 /// the Redis *fetch* of the (static) pubkey is cached, and a cache miss with Redis
 /// unreachable still `Err`s — fail-closed is preserved.
+///
+/// Mirror case: the same TTL also delays picking up a *legitimate* key
+/// rotation — telemetry freshly signed with a device's new key is rejected
+/// against the stale cached old key for up to this TTL post-rotation. Same
+/// trade-off, opposite direction; the short default bounds both.
 const PUBKEY_POSITIVE_TTL_SECS: u64 = 60;
 
 /// Default seconds an *absent* pubkey is remembered before re-reading Redis.
@@ -60,7 +102,7 @@ pub struct SignatureVerifier {
     /// Hot cache of parsed device pubkeys (present/absent) with TTLs, so a device's
     /// (static) key isn't re-read from Redis on every reading. The signature is still
     /// verified per call — only the lookup is cached. See [`pubkey_positive_ttl`].
-    pubkey_cache: Arc<Mutex<HashMap<String, CachedPubkey>>>,
+    pubkey_cache: Arc<Mutex<PrunedCache<String, CachedPubkey>>>,
 }
 
 impl SignatureVerifier {
@@ -70,7 +112,7 @@ impl SignatureVerifier {
         Self {
             redis_url,
             conn: Arc::new(Mutex::new(None)),
-            pubkey_cache: Arc::new(Mutex::new(HashMap::new())),
+            pubkey_cache: Arc::new(Mutex::new(PrunedCache::new())),
         }
     }
 
@@ -81,7 +123,7 @@ impl SignatureVerifier {
         Self {
             redis_url: None,
             conn: Arc::new(Mutex::new(conn)),
-            pubkey_cache: Arc::new(Mutex::new(HashMap::new())),
+            pubkey_cache: Arc::new(Mutex::new(PrunedCache::new())),
         }
     }
 
@@ -161,10 +203,10 @@ impl SignatureVerifier {
     /// Look up a cached pubkey verdict for `meter_id`, dropping it when expired.
     async fn pubkey_cache_get(&self, meter_id: &str) -> Option<Option<VerifyingKey>> {
         let mut cache = self.pubkey_cache.lock().await;
-        let out = match cache.get(meter_id) {
+        let out = match cache.map.get(meter_id) {
             Some(e) if e.expires > Instant::now() => Some(e.key),
             Some(_) => {
-                cache.remove(meter_id);
+                cache.map.remove(meter_id);
                 None
             }
             None => None,
@@ -174,7 +216,8 @@ impl SignatureVerifier {
     }
 
     /// Store a verdict for `meter_id`. Present keys last the positive TTL (= the
-    /// revocation latency), absences the shorter negative TTL. Prunes expired entries.
+    /// revocation latency), absences the shorter negative TTL. Opportunistically
+    /// prunes expired entries (see [`PrunedCache`] / [`CACHE_PRUNE_INTERVAL`]).
     async fn pubkey_cache_put(&self, meter_id: &str, key: Option<VerifyingKey>) {
         let now = Instant::now();
         let ttl = if key.is_some() {
@@ -183,13 +226,13 @@ impl SignatureVerifier {
             pubkey_negative_ttl()
         };
         let mut cache = self.pubkey_cache.lock().await;
-        cache.retain(|_, v| v.expires > now);
-        cache.insert(
+        cache.insert_pruned(
             meter_id.to_string(),
             CachedPubkey {
                 key,
                 expires: now + ttl,
             },
+            |v| v.expires <= now,
         );
     }
 
@@ -432,7 +475,7 @@ pub struct DeviceKeyRegistry {
     /// Hot cache of *unversioned* enckey verdicts (present/absent) with TTLs, so a
     /// keyed device isn't re-read from Redis on every frame. Positive verdicts last
     /// [`enckey_positive_ttl`], absences the shorter [`enckey_negative_ttl`].
-    key_cache: Arc<Mutex<HashMap<String, CachedEncKey>>>,
+    key_cache: Arc<Mutex<PrunedCache<String, CachedEncKey>>>,
 }
 
 impl DeviceKeyRegistry {
@@ -444,7 +487,7 @@ impl DeviceKeyRegistry {
             conn: Arc::new(Mutex::new(None)),
             vault: None,
             versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            key_cache: Arc::new(Mutex::new(HashMap::new())),
+            key_cache: Arc::new(Mutex::new(PrunedCache::new())),
         }
     }
 
@@ -456,7 +499,7 @@ impl DeviceKeyRegistry {
             conn: Arc::new(Mutex::new(conn)),
             vault: None,
             versioned_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            key_cache: Arc::new(Mutex::new(HashMap::new())),
+            key_cache: Arc::new(Mutex::new(PrunedCache::new())),
         }
     }
 
@@ -539,10 +582,10 @@ impl DeviceKeyRegistry {
     /// Look up a cached enckey verdict for `meter_id`, dropping it when expired.
     async fn key_cache_get(&self, meter_id: &str) -> Option<Option<[u8; 32]>> {
         let mut cache = self.key_cache.lock().await;
-        let out = match cache.get(meter_id) {
+        let out = match cache.map.get(meter_id) {
             Some(e) if e.expires > Instant::now() => Some(e.key),
             Some(_) => {
-                cache.remove(meter_id); // expired — drop so the map stays bounded
+                cache.map.remove(meter_id); // expired — drop so the map stays bounded
                 None
             }
             None => None,
@@ -552,7 +595,8 @@ impl DeviceKeyRegistry {
     }
 
     /// Store a verdict for `meter_id`. Present keys last the positive TTL, absences
-    /// the shorter negative TTL. Opportunistically prunes expired entries.
+    /// the shorter negative TTL. Opportunistically prunes expired entries (see
+    /// [`PrunedCache`] / [`CACHE_PRUNE_INTERVAL`]).
     async fn key_cache_put(&self, meter_id: &str, key: Option<[u8; 32]>) {
         let now = Instant::now();
         let ttl = if key.is_some() {
@@ -561,13 +605,13 @@ impl DeviceKeyRegistry {
             enckey_negative_ttl()
         };
         let mut cache = self.key_cache.lock().await;
-        cache.retain(|_, v| v.expires > now);
-        cache.insert(
+        cache.insert_pruned(
             meter_id.to_string(),
             CachedEncKey {
                 key,
                 expires: now + ttl,
             },
+            |v| v.expires <= now,
         );
     }
 
@@ -937,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn expired_enckey_entry_evicted() {
         let r = DeviceKeyRegistry::from_manager(None);
-        r.key_cache.lock().await.insert(
+        r.key_cache.lock().await.map.insert(
             "m-old".to_string(),
             CachedEncKey {
                 key: Some([0x22u8; 32]),
@@ -946,7 +990,7 @@ mod tests {
         );
         assert!(r.key_cache_get("m-old").await.is_none(), "expired must miss");
         assert!(
-            !r.key_cache.lock().await.contains_key("m-old"),
+            !r.key_cache.lock().await.map.contains_key("m-old"),
             "expired entry evicted on lookup"
         );
     }
@@ -1020,7 +1064,7 @@ mod tests {
     async fn expired_pubkey_entry_evicted() {
         let sk = SigningKey::from_bytes(&[23u8; 32]);
         let v = SignatureVerifier::from_manager(None);
-        v.pubkey_cache.lock().await.insert(
+        v.pubkey_cache.lock().await.map.insert(
             "m-old".to_string(),
             CachedPubkey {
                 key: Some(sk.verifying_key()),
@@ -1029,7 +1073,7 @@ mod tests {
         );
         assert!(v.pubkey_cache_get("m-old").await.is_none(), "expired must miss");
         assert!(
-            !v.pubkey_cache.lock().await.contains_key("m-old"),
+            !v.pubkey_cache.lock().await.map.contains_key("m-old"),
             "expired entry evicted on lookup"
         );
     }
