@@ -21,12 +21,7 @@ const METER_NEG_CACHE_TTL_SECS: u64 = 30;
 /// cache (no backend round-trip), `miss` = fell through to Redis/Postgres. Feeds
 /// `aggregator_cache_lookups_total{cache="meter_owner"}`.
 fn record_owner_lookup(hit: bool) {
-    metrics::counter!(
-        "aggregator_cache_lookups_total",
-        "cache" => "meter_owner",
-        "result" => if hit { "hit" } else { "miss" },
-    )
-    .increment(1);
+    crate::metrics::record_cache_lookup("meter_owner", hit);
 }
 
 fn neg_cache_ttl() -> Duration {

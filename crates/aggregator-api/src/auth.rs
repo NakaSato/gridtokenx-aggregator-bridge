@@ -128,15 +128,10 @@ fn cache_lookup(key: &str) -> Option<bool> {
         }
         None => None,
     };
-    // Track cache effectiveness — mirrors aggregator_cache_lookups_total in
-    // aggregator-persistence (pubkey/enckey/meter_owner). A falling hit-rate flags
-    // key churn or a flood of distinct/bad keys hammering IAM.
-    metrics::counter!(
-        "aggregator_cache_lookups_total",
-        "cache" => "apikey",
-        "result" => if out.is_some() { "hit" } else { "miss" },
-    )
-    .increment(1);
+    // Track cache effectiveness — shares aggregator_cache_lookups_total with
+    // aggregator-persistence's pubkey/enckey/meter_owner caches. A falling
+    // hit-rate flags key churn or a flood of distinct/bad keys hammering IAM.
+    aggregator_persistence::metrics::record_cache_lookup("apikey", out.is_some());
     out
 }
 

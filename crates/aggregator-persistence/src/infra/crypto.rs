@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use crate::metrics::record_cache_lookup;
+
 /// Verifies Ed25519 telemetry signatures against device public keys stored in
 /// Redis (`gridtokenx:devices:{meter_id}:pubkey`).
 ///
@@ -409,18 +411,6 @@ fn ttl_env(var: &'static str, default_secs: u64) -> Duration {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(default_secs);
     Duration::from_secs(secs)
-}
-
-/// Emit a hot-cache lookup outcome. `cache` ∈ {pubkey, enckey, ...}; `result` =
-/// hit|miss. Lets `aggregator_cache_lookups_total` track cache effectiveness (a
-/// falling hit-rate flags key churn / revocation activity / an attack on unknown ids).
-fn record_cache_lookup(cache: &'static str, hit: bool) {
-    metrics::counter!(
-        "aggregator_cache_lookups_total",
-        "cache" => cache,
-        "result" => if hit { "hit" } else { "miss" },
-    )
-    .increment(1);
 }
 
 /// A cached enckey verdict: `Some(key)` present, `None` genuinely absent.

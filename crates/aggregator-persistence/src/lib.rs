@@ -5,4 +5,5 @@
 //! - `storage`: local time-series buffering & sync (circular buffer, sqlite sync manager).
 
 pub mod infra;
+pub mod metrics;
 pub mod storage;
