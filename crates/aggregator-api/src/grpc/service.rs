@@ -341,49 +341,65 @@ impl OracleService for AggregatorServiceImpl {
             let sign_target =
                 grpc_sign_target(&request.meter_id, &request.kwh, request.timestamp);
 
-            let is_verified = match self
-                .state
-                .signature_verifier
-                .verify_telemetry_signature(&request.meter_id, sign_target.as_bytes(), signature)
-                .await
-            {
-                Ok(true) => true,
-                _ => {
-                    // Fallback to binary payload verification (which now includes CRC-32 and Versioning)
-                    if !request.raw_payload.is_empty() {
-                        match self
-                            .state
-                            .signature_verifier
-                            .verify_telemetry_signature(
-                                &request.meter_id,
-                                &request.raw_payload,
-                                signature,
-                            )
-                            .await
-                        {
-                            Ok(true) => {
-                                info!(
-                                    "✅ UTT-H signature verified against binary payload for {}",
-                                    request.meter_id
-                                );
-                                true
-                            }
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    }
-                }
-            };
+            // Try the canonical target, then fall back to the raw binary payload
+            // (CRC-32 + versioned). Mirrors verify_rest_signature's ladder: a
+            // verifier error is fatal and short-circuits (fail-closed), a
+            // non-match falls through to the next candidate. This distinguishes
+            // "we checked and it's forged" (PermissionDenied) from "we couldn't
+            // check" (Unauthenticated, e.g. Redis unreachable fetching the
+            // device pubkey) — collapsing the two previously hid infra errors
+            // behind an unlogged "forged signature" rejection.
+            let mut candidates: Vec<(&str, &[u8])> = vec![("", sign_target.as_bytes())];
+            if !request.raw_payload.is_empty() {
+                candidates.push(("binary payload", &request.raw_payload));
+            }
 
-            if !is_verified {
-                error!(
-                    "🚫 UTT-H Integrity check failed for meter {}",
-                    request.meter_id
-                );
-                return Err(ConnectError::permission_denied(
-                    "UTT-H Signature Verification Failed",
-                ));
+            let mut verify_result: anyhow::Result<bool> = Ok(false);
+            for (label, target) in candidates {
+                match self
+                    .state
+                    .signature_verifier
+                    .verify_telemetry_signature(&request.meter_id, target, signature)
+                    .await
+                {
+                    Ok(true) => {
+                        if !label.is_empty() {
+                            info!(
+                                "✅ UTT-H signature verified against {} for {}",
+                                label, request.meter_id
+                            );
+                        }
+                        verify_result = Ok(true);
+                        break;
+                    }
+                    Err(e) => {
+                        verify_result = Err(e);
+                        break;
+                    }
+                    Ok(false) => {}
+                }
+            }
+
+            match verify_result {
+                Ok(true) => {}
+                Ok(false) => {
+                    error!(
+                        "🚫 UTT-H Integrity check failed for meter {}",
+                        request.meter_id
+                    );
+                    return Err(ConnectError::permission_denied(
+                        "UTT-H Signature Verification Failed",
+                    ));
+                }
+                Err(e) => {
+                    error!(
+                        "⚠️ UTT-H signature verifier error for meter {}: {}",
+                        request.meter_id, e
+                    );
+                    return Err(ConnectError::unauthenticated(
+                        "UTT-H signature verification unavailable",
+                    ));
+                }
             }
             true
         } else {
