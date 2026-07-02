@@ -609,10 +609,19 @@ pub async fn ingest_legacy_batch(
         let reading_id = reading.reading_id.clone();
         let device_type = reading.device_type;
 
-        state.router.disseminate(&reading).await.ok();
+        let status = match state.router.disseminate(&reading).await {
+            Ok(_) => "accepted",
+            Err(e) => {
+                error!(
+                    "❌ Failed to disseminate reading {} for device {}: {}",
+                    reading_id, device_id, e
+                );
+                "failed"
+            }
+        };
 
         responses.push(IngestResponse {
-            status: "accepted",
+            status,
             reading_id,
             device_type,
             stream: device_type.target_stream().to_string(),
@@ -758,9 +767,18 @@ pub async fn ingest_private_network_batch(
 
             let reading_id = reading.reading_id.clone();
             let device_type = reading.device_type;
-            state.router.disseminate(&reading).await.ok();
+            let status = match state.router.disseminate(&reading).await {
+                Ok(_) => "accepted",
+                Err(e) => {
+                    error!(
+                        "❌ Failed to disseminate reading {} for device {}: {}",
+                        reading_id, device_id, e
+                    );
+                    "failed"
+                }
+            };
             responses.push(IngestResponse {
-                status: "accepted",
+                status,
                 reading_id,
                 device_type,
                 stream: device_type.target_stream().to_string(),
@@ -780,10 +798,19 @@ pub async fn ingest_private_network_batch(
                 let device_type = reading.device_type;
 
                 // In batch mode, we handle dissemination sequentially for simplicity
-                state.router.disseminate(&reading).await.ok();
+                let status = match state.router.disseminate(&reading).await {
+                    Ok(_) => "accepted",
+                    Err(e) => {
+                        error!(
+                            "❌ Failed to disseminate reading {} for device {}: {}",
+                            reading_id, device_id, e
+                        );
+                        "failed"
+                    }
+                };
 
                 responses.push(IngestResponse {
-                    status: "accepted",
+                    status,
                     reading_id,
                     device_type,
                     stream: device_type.target_stream().to_string(),
