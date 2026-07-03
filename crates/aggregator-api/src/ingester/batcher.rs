@@ -173,7 +173,9 @@ impl BatchWorker {
                         }
                         Some(BatchMessage::Shutdown(done_tx)) => {
                             info!("🔄 Batch worker shutting down, flushing {} items", self.batch.len());
-                            let _ = self.flush().await;
+                            if let Err(e) = self.flush().await {
+                                error!("❌ Shutdown flush failed: {}", e);
+                            }
                             let _ = done_tx.send(());
                             break;
                         }
