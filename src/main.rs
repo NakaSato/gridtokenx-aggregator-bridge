@@ -393,12 +393,31 @@ async fn main() -> Result<()> {
         (false, _) => None,
     };
 
+    // Bound on concurrent in-flight mint request-replies toward Chain Bridge,
+    // shared by the settlement sink's immediate attempts and the outbox drain
+    // loop. An unbounded fan-out (e.g. 10k bins completing in the same window)
+    // floods the bridge's NATS consumer: every envelope is timestamped at
+    // publish, the queue drains at the bridge's rate, and anything waiting past
+    // the bridge's staleness cutoff (55s) is rejected — then times out client-
+    // side and re-fires on the next drain tick, a livelock that throttled the
+    // measured mint rate to ~40/s while the bridge could absorb ~160/s. The cap
+    // keeps bridge queue wait well under the cutoff; size it near the bridge's
+    // CHAIN_BRIDGE_MINT_CONCURRENCY.
+    let mint_inflight = Arc::new(tokio::sync::Semaphore::new(
+        std::env::var("MINT_INFLIGHT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(128),
+    ));
+
     // Settlement sink: periodically drains completed 15-minute billing bins. For
     // each bin it (1) writes the TOU/demand `billing` point to InfluxDB (if
     // enabled) and (2) mints the net surplus to the meter owner via Chain Bridge
     // (if enabled), then evicts the bin — the eviction bounds the otherwise-
     // unbounded `active_bins` map. Runs whenever InfluxDB OR minting is enabled.
     if billing_influx.is_some() || mint_gateway.is_enabled() {
+        let sink_inflight = mint_inflight.clone();
         let billing_agg = aggregator.clone();
         let billing_shutdown = shutdown_token.clone();
         let settle_mint = mint_gateway.clone();
@@ -499,7 +518,15 @@ async fn main() -> Result<()> {
                                                 let reg = settle_registry.clone();
                                                 let outbox = outbox.clone();
                                                 let field = pending.field();
+                                                let inflight = sink_inflight.clone();
                                                 tokio::spawn(async move {
+                                                    // Gate on the shared in-flight cap so a huge
+                                                    // window doesn't flood the bridge into
+                                                    // staleness rejections. Closed semaphore ⇒
+                                                    // skip; the outbox drain retries durably.
+                                                    let Ok(_permit) = inflight.acquire_owned().await else {
+                                                        return;
+                                                    };
                                                     if mint_settlement::attempt_mint(&gw, &reg, &pending).await {
                                                         if let Err(e) = outbox.remove(&field).await {
                                                             warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
@@ -550,7 +577,11 @@ async fn main() -> Result<()> {
                                             handoff = MintHandoff::BestEffortOnly;
                                             let gw = settle_mint.clone();
                                             let reg = settle_registry.clone();
+                                            let inflight = sink_inflight.clone();
                                             tokio::spawn(async move {
+                                                let Ok(_permit) = inflight.acquire_owned().await else {
+                                                    return;
+                                                };
                                                 let _ = mint_settlement::attempt_mint(&gw, &reg, &pending).await;
                                             });
                                         }
@@ -593,6 +624,7 @@ async fn main() -> Result<()> {
         let drain_gw = mint_gateway.clone();
         let drain_reg = meter_registry.clone();
         let drain_shutdown = shutdown_token.clone();
+        let drain_inflight = mint_inflight.clone();
         let retry_secs = std::env::var("MINT_RETRY_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -618,16 +650,25 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         info!("📤 Mint outbox: draining {} pending surplus mint(s)", pending.len());
-                        // Attempt every pending entry concurrently — sequential
-                        // awaits would let one slow/unreachable Chain Bridge call
-                        // serialize and starve the rest of the backlog for the
-                        // whole tick.
+                        // Attempt pending entries concurrently — sequential awaits
+                        // would let one slow/unreachable Chain Bridge call serialize
+                        // and starve the rest of the backlog for the whole tick —
+                        // but bounded by the shared in-flight cap: each mint
+                        // envelope is timestamped when it is published, so firing a
+                        // 10k backlog at once parks most of it in the bridge's NATS
+                        // queue past the 55s staleness cutoff (mass rejection +
+                        // client reply-timeouts + re-fire next tick). The permit
+                        // makes publish time ≈ processing time.
                         let mut attempts = tokio::task::JoinSet::new();
                         for p in pending {
                             let gw = drain_gw.clone();
                             let reg = drain_reg.clone();
                             let outbox = outbox.clone();
+                            let inflight = drain_inflight.clone();
                             attempts.spawn(async move {
+                                let Ok(_permit) = inflight.acquire_owned().await else {
+                                    return;
+                                };
                                 // Confirmed on-chain ⇒ remove; otherwise keep for the
                                 // next tick (no_wallet / bridge down / sim rejection).
                                 if mint_settlement::attempt_mint(&gw, &reg, &p).await {
