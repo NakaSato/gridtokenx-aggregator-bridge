@@ -463,6 +463,9 @@ struct CachedEncKey {
     expires: Instant,
 }
 
+/// Unwrapped versioned GUEK cache, keyed by `(meter_id, kid)`.
+type VersionedKeyCache = Arc<Mutex<std::collections::HashMap<(String, i64), [u8; 32]>>>;
+
 pub struct DeviceKeyRegistry {
     redis_url: Option<String>,
     conn: Arc<Mutex<Option<ConnectionManager>>>,
@@ -471,7 +474,7 @@ pub struct DeviceKeyRegistry {
     vault: Option<super::vault::VaultTransitClient>,
     /// Cache of unwrapped versioned keys, keyed by `(meter_id, kid)`. A wrapped
     /// GUEK version is immutable, so caching avoids re-hitting Vault per frame.
-    versioned_cache: Arc<Mutex<std::collections::HashMap<(String, i64), [u8; 32]>>>,
+    versioned_cache: VersionedKeyCache,
     /// Hot cache of *unversioned* enckey verdicts (present/absent) with TTLs, so a
     /// keyed device isn't re-read from Redis on every frame. Positive verdicts last
     /// [`enckey_positive_ttl`], absences the shorter [`enckey_negative_ttl`].
