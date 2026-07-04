@@ -317,7 +317,11 @@ pub fn record_ven_event(outcome: &str) {
 /// has no durable home anywhere; the bin's durable entry is retained for
 /// manual recovery instead of being evicted, see
 /// `aggregator_logic::billing_sink::MintHandoff::Lost`). `reason` qualifies
-/// the outcome ("no_wallet", "resolve_err", "mint_err", "outbox_and_mint_failed", "ok").
+/// the outcome ("no_wallet", "in_flight", "resolve_err", "mint_err",
+/// "reply_timeout", "outbox_and_mint_failed", "ok"). "reply_timeout" separates
+/// a lost reply (intent durably queued, mint may have landed — retry is
+/// dedup-safe) from a hard mint rejection. "in_flight" is a declined retry:
+/// an attempt for the same key is still awaiting its reply in this process.
 pub fn record_mint_outcome(outcome: &str, reason: &str) {
     counter!("aggregator_mint_total",
         "outcome" => outcome.to_string(),
@@ -427,6 +431,7 @@ mod tests {
         record_mint_outcome("skipped", "no_wallet"); // unregistered meter
         record_mint_outcome("skipped", "resolve_err");
         record_mint_outcome("failed", "mint_err");
+        record_mint_outcome("failed", "reply_timeout"); // lost reply, retry dedup-safe
         record_mint_outcome("no_surplus", "ok");
         record_settlement_path("nats");
         record_settlement_path("disabled");

@@ -162,6 +162,22 @@ fn parse_mint_result(result: MintEnergyResultMessage) -> Result<MintOutcome> {
     }
 }
 
+/// Marker error: the mint intent was durably acked by JetStream but no reply
+/// arrived within the request timeout. Unlike a hard bridge rejection, the mint
+/// may still have landed on-chain — the retry is safe (idempotency key + PDA
+/// dedup) but callers must count it distinctly so a lossy reply path is visible
+/// on dashboards instead of masquerading as mint failures.
+#[derive(Debug)]
+pub struct MintReplyTimeout;
+
+impl std::fmt::Display for MintReplyTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mint request timed out awaiting reply")
+    }
+}
+
+impl std::error::Error for MintReplyTimeout {}
+
 /// Result of a successful on-chain mint submission.
 #[derive(Debug, Clone)]
 pub struct MintOutcome {
@@ -226,7 +242,17 @@ impl MintGateway {
                 Ok(client) => Self::Nats(NatsMintGateway::new(
                     client,
                     service_identity,
-                    std::time::Duration::from_secs(30),
+                    // Reply-wait budget per mint request. Under a large settlement
+                    // burst the chain-bridge queue wait can exceed a short budget,
+                    // and every timeout re-enters the outbox → wholesale republish
+                    // amplification (observed 2.3× at a 10k burst, congestion
+                    // collapse at 25k). Raise via env for fleet-scale windows.
+                    std::time::Duration::from_secs(
+                        std::env::var("AGGREGATOR_MINT_REPLY_TIMEOUT_SECS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(30),
+                    ),
                     EnvelopeSigner::from_env_paths(),
                 )),
                 Err(e) => {
@@ -370,7 +396,7 @@ impl NatsMintGateway {
 
         let reply = tokio::time::timeout(self.request_timeout, sub.next())
             .await
-            .map_err(|_| anyhow!("mint request timed out"))?
+            .map_err(|_| anyhow::Error::new(MintReplyTimeout))?
             .ok_or_else(|| anyhow!("mint reply stream closed"))?;
 
         let result: MintEnergyResultMessage =

@@ -420,6 +420,10 @@ async fn main() -> Result<()> {
             .filter(|&n| n > 0)
             .unwrap_or(128),
     ));
+    // Companion to the semaphore: the semaphore bounds *how many* attempts run
+    // at once; this keyset stops the sweep and the drain tick from publishing
+    // the *same* entry twice while its reply is pending (see MintInFlight).
+    let mint_inflight_keys = Arc::new(mint_settlement::MintInFlight::default());
 
     // Settlement sink: periodically drains completed 15-minute billing bins. For
     // each bin it (1) writes the TOU/demand `billing` point to InfluxDB (if
@@ -428,6 +432,7 @@ async fn main() -> Result<()> {
     // unbounded `active_bins` map. Runs whenever InfluxDB OR minting is enabled.
     if billing_influx.is_some() || mint_gateway.is_enabled() {
         let sink_inflight = mint_inflight.clone();
+        let sink_inflight_keys = mint_inflight_keys.clone();
         let billing_agg = aggregator.clone();
         let billing_shutdown = shutdown_token.clone();
         let settle_mint = mint_gateway.clone();
@@ -529,6 +534,7 @@ async fn main() -> Result<()> {
                                                 let outbox = outbox.clone();
                                                 let field = pending.field();
                                                 let inflight = sink_inflight.clone();
+                                                let inflight_keys = sink_inflight_keys.clone();
                                                 tokio::spawn(async move {
                                                     // Gate on the shared in-flight cap so a huge
                                                     // window doesn't flood the bridge into
@@ -537,7 +543,7 @@ async fn main() -> Result<()> {
                                                     let Ok(_permit) = inflight.acquire_owned().await else {
                                                         return;
                                                     };
-                                                    if mint_settlement::attempt_mint(&gw, &reg, &pending).await {
+                                                    if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await {
                                                         if let Err(e) = outbox.remove(&field).await {
                                                             warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
                                                         }
@@ -559,7 +565,7 @@ async fn main() -> Result<()> {
                                                             "mint outbox enqueue failed twice for meter {} window {}: {e2}; attempting immediate mint as last resort",
                                                             pending.meter_serial, pending.window_start_ms
                                                         );
-                                                        if mint_settlement::attempt_mint(&settle_mint, &settle_registry, &pending).await {
+                                                        if mint_settlement::attempt_mint(&settle_mint, &settle_registry, &sink_inflight_keys, &pending).await {
                                                             handoff = MintHandoff::MintedDirectly;
                                                         } else {
                                                             error!(
@@ -588,11 +594,12 @@ async fn main() -> Result<()> {
                                             let gw = settle_mint.clone();
                                             let reg = settle_registry.clone();
                                             let inflight = sink_inflight.clone();
+                                            let inflight_keys = sink_inflight_keys.clone();
                                             tokio::spawn(async move {
                                                 let Ok(_permit) = inflight.acquire_owned().await else {
                                                     return;
                                                 };
-                                                let _ = mint_settlement::attempt_mint(&gw, &reg, &pending).await;
+                                                let _ = mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await;
                                             });
                                         }
                                     }
@@ -635,6 +642,7 @@ async fn main() -> Result<()> {
         let drain_reg = meter_registry.clone();
         let drain_shutdown = shutdown_token.clone();
         let drain_inflight = mint_inflight.clone();
+        let drain_inflight_keys = mint_inflight_keys.clone();
         let retry_secs = std::env::var("MINT_RETRY_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -675,13 +683,14 @@ async fn main() -> Result<()> {
                             let reg = drain_reg.clone();
                             let outbox = outbox.clone();
                             let inflight = drain_inflight.clone();
+                            let inflight_keys = drain_inflight_keys.clone();
                             attempts.spawn(async move {
                                 let Ok(_permit) = inflight.acquire_owned().await else {
                                     return;
                                 };
                                 // Confirmed on-chain ⇒ remove; otherwise keep for the
                                 // next tick (no_wallet / bridge down / sim rejection).
-                                if mint_settlement::attempt_mint(&gw, &reg, &p).await {
+                                if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &p).await {
                                     let field = p.field();
                                     if let Err(e) = outbox.remove(&field).await {
                                         warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
