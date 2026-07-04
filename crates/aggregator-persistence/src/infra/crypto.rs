@@ -282,8 +282,15 @@ impl SignatureVerifier {
 
         let signature = Signature::from_slice(&signature_bytes)?;
 
-        // 3. Verify signature (always — only the key lookup above is cached)
-        let is_valid = verifying_key.verify(payload, &signature).is_ok();
+        // 3. Verify signature (always — only the key lookup above is cached).
+        // Off the executor thread: Ed25519 verify is CPU-bound and must not block
+        // other in-flight requests on this Tokio worker.
+        let payload_owned = payload.to_vec();
+        let is_valid = tokio::task::spawn_blocking(move || {
+            verifying_key.verify(&payload_owned, &signature).is_ok()
+        })
+        .await
+        .map_err(|e| anyhow!("Thread panic during signature verification: {}", e))?;
 
         if !is_valid {
             warn!(
@@ -360,17 +367,27 @@ impl SignatureVerifier {
             }
         }
 
-        let mut results = Vec::with_capacity(meter_ids.len());
-        for (i, vk) in vks.into_iter().enumerate() {
-            let res = match vk {
-                Some(verifying_key) => {
-                    let signature = Signature::from_bytes(&signatures[i]);
-                    verifying_key.verify(&payloads[i], &signature).is_ok()
-                }
-                None => false,
-            };
-            results.push(res);
-        }
+        // Verify the whole batch in one spawn_blocking call — not one per item —
+        // so thread-pool dispatch overhead isn't paid per reading, while still
+        // keeping the CPU-bound verify loop off the executor thread.
+        let jobs: Vec<(Option<VerifyingKey>, Vec<u8>, [u8; 64])> = vks
+            .into_iter()
+            .enumerate()
+            .map(|(i, vk)| (vk, payloads[i].clone(), signatures[i]))
+            .collect();
+        let results = tokio::task::spawn_blocking(move || {
+            jobs.into_iter()
+                .map(|(vk, payload, sig)| match vk {
+                    Some(verifying_key) => {
+                        let signature = Signature::from_bytes(&sig);
+                        verifying_key.verify(&payload, &signature).is_ok()
+                    }
+                    None => false,
+                })
+                .collect::<Vec<bool>>()
+        })
+        .await
+        .map_err(|e| anyhow!("Thread panic during batch signature verification: {}", e))?;
 
         Ok(results)
     }

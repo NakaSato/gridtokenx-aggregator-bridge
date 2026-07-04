@@ -293,6 +293,9 @@ async fn decrypt_dlms_envelope(
     };
 
     // Authenticate + decrypt first (AAD binds device_id:counter into the tag).
+    // Left inline (not spawn_blocking): AES-GCM on a single small OBIS payload
+    // runs in low single-digit microseconds — cheaper than a thread-pool
+    // dispatch, so offloading it would only add latency for no non-blocking gain.
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
     let aad = format!("{}:{}", device_id, counter);
     let plaintext = match cipher.decrypt(
