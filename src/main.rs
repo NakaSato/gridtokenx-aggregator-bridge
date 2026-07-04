@@ -269,6 +269,16 @@ async fn main() -> Result<()> {
                 early_redis_conn.clone(),
             ) {
                 (Some(vault), Some(mut conn)) => {
+                    // The SEK unwrap below hits Vault Transit immediately, so the
+                    // KEK must exist first. The dev Vault is in-memory: after a
+                    // restart the transit engine itself is gone and the unwrap
+                    // fails with a route-not-found 404 — self-provision here
+                    // (idempotent) instead of relying on the meter-key path's
+                    // later ensure_kek, which boots after this point.
+                    vault
+                        .ensure_kek()
+                        .await
+                        .context("Failed to ensure Vault Transit KEK before SEK bootstrap")?;
                     let cipher =
                         infra::stream_cipher::load_or_create_stream_cipher(&vault, &mut conn)
                             .await

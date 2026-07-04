@@ -70,30 +70,52 @@ impl StreamCipher {
 /// the wrapped blob at `gridtokenx:stream:sek` (NX so concurrent bridge
 /// instances converge on one SEK). On every run after: read the wrapped blob
 /// and Vault-unwrap it — so the SEK is stable across restarts and old stream
-/// entries remain decryptable. Fail-closed: Vault/Redis errors propagate.
+/// entries remain decryptable. Fail-closed: Vault/Redis errors propagate,
+/// EXCEPT an unwrappable stored blob (KEK destroyed, e.g. dev Vault restart),
+/// which rotates to a fresh SEK instead of crash-looping the bridge.
 pub async fn load_or_create_stream_cipher(
     vault: &VaultTransitClient,
     conn: &mut ConnectionManager,
 ) -> Result<StreamCipher> {
+    // A stored blob wrapped by a KEK that no longer exists (dev Vault is
+    // in-memory — a Vault restart destroys the transit key) can NEVER be
+    // recovered; treat it as dead and rotate rather than crash-looping the
+    // whole bridge on boot.
+    let mut rotate_dead_blob = false;
     if let Some(wrapped) = conn
         .get::<_, Option<String>>(SEK_REDIS_KEY)
         .await
         .context("read stream SEK from Redis")?
     {
-        let sek = vault
-            .unwrap(wrapped.trim())
-            .await
-            .context("unwrap stream SEK")?;
-        return Ok(StreamCipher::new(sek));
+        match vault.unwrap(wrapped.trim()).await {
+            Ok(sek) => return Ok(StreamCipher::new(sek)),
+            Err(e) => {
+                tracing::warn!(
+                    "stored stream SEK is unwrappable ({e:#}); rotating to a fresh SEK — \
+                     stream entries sealed under the old key stay undecryptable"
+                );
+                rotate_dead_blob = true;
+            }
+        }
     }
 
     let mut sek = [0u8; 32];
     getrandom::getrandom(&mut sek).map_err(|e| anyhow!("SEK RNG failed: {}", e))?;
     let wrapped = vault.wrap(&sek).await.context("wrap new stream SEK")?;
-    let stored: bool = conn
-        .set_nx(SEK_REDIS_KEY, &wrapped)
-        .await
-        .context("SET NX stream SEK")?;
+    let stored: bool = if rotate_dead_blob {
+        // Overwrite the dead blob — SET NX would keep it forever. Concurrent
+        // rotating instances are last-writer-wins: both hold valid ciphers for
+        // what they seal, and mixed-key entries only cost per-entry decode
+        // failures on the reader (decode_entry already tolerates them).
+        conn.set::<_, _, ()>(SEK_REDIS_KEY, &wrapped)
+            .await
+            .context("SET rotated stream SEK")?;
+        true
+    } else {
+        conn.set_nx(SEK_REDIS_KEY, &wrapped)
+            .await
+            .context("SET NX stream SEK")?
+    };
     if stored {
         return Ok(StreamCipher::new(sek));
     }
