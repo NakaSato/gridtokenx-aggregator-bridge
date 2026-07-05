@@ -30,6 +30,12 @@ use crate::redis_hash::parse_redis_hash;
 /// settled, but its mint lives here until confirmed on-chain.
 const OUTBOX_KEY: &str = "gridtokenx:billing:mint_outbox";
 
+/// Redis hash holding mints that exceeded [`is_expired`]'s age bound — parked
+/// out of the retry path instead of deleted, so an owed surplus is never
+/// silently dropped. An operator re-enqueues by moving the field back into
+/// [`OUTBOX_KEY`] (`HSET` there + `HDEL` here).
+const PARKED_KEY: &str = "gridtokenx:billing:mint_outbox:parked";
+
 /// A surplus mint that has been settled out of a billing bin but not yet
 /// confirmed on-chain. Carries everything needed to (re)attempt the mint; the
 /// recipient wallet is intentionally **not** stored — it is resolved fresh at
@@ -73,6 +79,17 @@ fn parse_pending(map: HashMap<String, String>) -> Vec<PendingMint> {
     parse_redis_hash(map, "mint outbox")
 }
 
+/// Whether a pending mint has aged past the retention bound and should be
+/// parked out of the retry path. `max_age_secs == 0` disables the bound
+/// (legacy retry-forever). Pure — the drain loop supplies `now_ms`.
+#[must_use]
+pub fn is_expired(p: &PendingMint, now_ms: i64, max_age_secs: u64) -> bool {
+    if max_age_secs == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(p.enqueued_at_ms) > (max_age_secs as i64).saturating_mul(1000)
+}
+
 /// Redis-backed durable outbox of unsettled surplus mints.
 #[derive(Clone)]
 pub struct MintOutbox {
@@ -112,6 +129,28 @@ impl MintOutbox {
             .hdel(OUTBOX_KEY, field)
             .await
             .context("HDEL pending mint")?;
+        Ok(())
+    }
+
+    /// Move an expired pending mint out of the retry path into the parked
+    /// hash. Sequential `HSET` + `HDEL`: a crash between the two leaves a
+    /// duplicate parked copy, which is harmless (the live entry just gets
+    /// parked again next tick).
+    ///
+    /// # Errors
+    /// Returns an error if either Redis command fails (caller keeps the entry
+    /// in the retry path and tries again next tick).
+    pub async fn park(&self, pending: &PendingMint) -> Result<()> {
+        let json = serde_json::to_string(pending).context("serialize pending mint")?;
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .hset(PARKED_KEY, pending.field(), json)
+            .await
+            .context("HSET parked mint")?;
+        let _: () = conn
+            .hdel(OUTBOX_KEY, pending.field())
+            .await
+            .context("HDEL pending mint after park")?;
         Ok(())
     }
 
@@ -181,6 +220,38 @@ mod tests {
         let got = parse_pending(map);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].meter_serial, "MTR-001");
+    }
+
+    #[test]
+    fn fresh_entry_not_expired() {
+        let p = pending();
+        // 1 hour after enqueue, 7-day bound.
+        let now = p.enqueued_at_ms + 3_600_000;
+        assert!(!is_expired(&p, now, 604_800));
+    }
+
+    #[test]
+    fn old_entry_expired() {
+        let p = pending();
+        // 8 days after enqueue, 7-day bound.
+        let now = p.enqueued_at_ms + 8 * 24 * 3_600_000;
+        assert!(is_expired(&p, now, 604_800));
+    }
+
+    #[test]
+    fn zero_max_age_never_expires() {
+        let p = pending();
+        let now = p.enqueued_at_ms + 365 * 24 * 3_600_000;
+        assert!(!is_expired(&p, now, 0));
+    }
+
+    #[test]
+    fn expiry_boundary_is_exclusive() {
+        // Exactly at the bound ⇒ not yet expired (strict `>`).
+        let p = pending();
+        let now = p.enqueued_at_ms + 604_800_000;
+        assert!(!is_expired(&p, now, 604_800));
+        assert!(is_expired(&p, now + 1, 604_800));
     }
 
     #[test]

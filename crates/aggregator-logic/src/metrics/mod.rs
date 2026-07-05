@@ -316,12 +316,19 @@ pub fn record_ven_event(outcome: &str) {
 /// failed twice AND the last-resort immediate mint also failed — the surplus
 /// has no durable home anywhere; the bin's durable entry is retained for
 /// manual recovery instead of being evicted, see
-/// `aggregator_logic::billing_sink::MintHandoff::Lost`). `reason` qualifies
-/// the outcome ("no_wallet", "in_flight", "resolve_err", "mint_err",
-/// "reply_timeout", "outbox_and_mint_failed", "ok"). "reply_timeout" separates
+/// `aggregator_logic::billing_sink::MintHandoff::Lost`), or "parked" (the
+/// entry aged past `MINT_OUTBOX_MAX_AGE_SECS` without landing on-chain and
+/// was moved out of the retry path to `gridtokenx:billing:mint_outbox:parked`
+/// for manual recovery). `reason` qualifies the outcome ("no_wallet",
+/// "invalid_wallet", "in_flight", "resolve_err", "mint_err", "reply_timeout",
+/// "outbox_and_mint_failed", "expired", "ok"). "reply_timeout" separates
 /// a lost reply (intent durably queued, mint may have landed — retry is
 /// dedup-safe) from a hard mint rejection. "in_flight" is a declined retry:
 /// an attempt for the same key is still awaiting its reply in this process.
+/// "invalid_wallet" is a declined publish: the resolved wallet isn't a
+/// parseable Solana address, so the bridge would reject it — no NATS
+/// round-trip is spent; the entry retries (registry may be corrected) until
+/// the age bound parks it.
 pub fn record_mint_outcome(outcome: &str, reason: &str) {
     counter!("aggregator_mint_total",
         "outcome" => outcome.to_string(),

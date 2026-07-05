@@ -144,6 +144,19 @@ fn mint_idempotency_key(meter_serial: &str, window_start_ms: i64) -> String {
     format!("mint:{meter_serial}:{window_start_ms}")
 }
 
+/// Whether `wallet` is a syntactically valid Solana address (Base58, 32 bytes
+/// decoded). The bridge rejects anything else (`Pubkey::from_str`), so checking
+/// here lets the mint retry path skip the NATS round-trip for a wallet that can
+/// never mint — without pulling in a Solana dependency (this crate stays
+/// chain-light; `bs58` alone matches `Pubkey`'s own encoding).
+#[must_use]
+pub fn wallet_is_valid(wallet: &str) -> bool {
+    bs58::decode(wallet)
+        .into_vec()
+        .map(|b| b.len() == 32)
+        .unwrap_or(false)
+}
+
 /// Interprets the bridge's reply: `success` requires a signature; otherwise the
 /// reported error (or a default) surfaces as an `Err`.
 fn parse_mint_result(result: MintEnergyResultMessage) -> Result<MintOutcome> {
@@ -419,6 +432,28 @@ mod tests {
             mint_idempotency_key("MTR-001", 1_700_000_000_000),
             "mint:MTR-001:1700000000000"
         );
+    }
+
+    // --- wallet pre-validation: must accept exactly what the bridge's Pubkey parse accepts ---
+
+    #[test]
+    fn real_solana_pubkey_is_valid() {
+        // The SPL token program id — a canonical 32-byte Base58 address.
+        assert!(wallet_is_valid("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"));
+    }
+
+    #[test]
+    fn e2e_fake_wallet_with_non_base58_chars_is_invalid() {
+        // The 30_settlement fixture shape: `Wa11et{meter}` padded with '1's.
+        // Meter ids like I8438032 inject 'I'/'0' — not in the Base58 alphabet.
+        assert!(!wallet_is_valid("Wa11etI843803211111111111111111111111111111"));
+        assert!(!wallet_is_valid("Wa11etS478130111111111111111111111111111111"));
+    }
+
+    #[test]
+    fn valid_base58_but_wrong_length_is_invalid() {
+        assert!(!wallet_is_valid("abc")); // decodes fine, 2 bytes
+        assert!(!wallet_is_valid("")); // empty
     }
 
     // --- mint intent wire shape: field names + types form the Chain Bridge contract ---

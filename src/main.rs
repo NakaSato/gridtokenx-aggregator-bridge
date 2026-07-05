@@ -647,7 +647,15 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
-        info!("📤 Mint outbox drain loop ENABLED (retry every {retry_secs}s until on-chain)");
+        // Retention bound: entries older than this are parked (moved to the
+        // `:parked` hash, out of the retry path) instead of retried forever —
+        // an unmintable entry (never-registered or invalid wallet) otherwise
+        // churns every tick indefinitely. 0 disables (legacy retry-forever).
+        let max_age_secs = std::env::var("MINT_OUTBOX_MAX_AGE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(604_800); // 7 days
+        info!("📤 Mint outbox drain loop ENABLED (retry every {retry_secs}s until on-chain; park after {max_age_secs}s)");
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(retry_secs));
             loop {
@@ -677,8 +685,22 @@ async fn main() -> Result<()> {
                         // queue past the 55s staleness cutoff (mass rejection +
                         // client reply-timeouts + re-fire next tick). The permit
                         // makes publish time ≈ processing time.
+                        let now_ms = telemetry::time::now().timestamp_millis();
                         let mut attempts = tokio::task::JoinSet::new();
                         for p in pending {
+                            if aggregator_api::mint_outbox::is_expired(&p, now_ms, max_age_secs) {
+                                let age_secs = now_ms.saturating_sub(p.enqueued_at_ms) / 1000;
+                                warn!(
+                                    "surplus mint PARKED after {age_secs}s without landing on-chain: meter {} window {} ({} kWh) — moved to gridtokenx:billing:mint_outbox:parked; re-enqueue manually to retry",
+                                    p.meter_serial, p.window_start_ms, p.energy_kwh
+                                );
+                                if let Err(e) = outbox.park(&p).await {
+                                    warn!("mint outbox park failed for {} ({e}); entry stays in retry path", p.field());
+                                } else {
+                                    metrics::record_mint_outcome("parked", "expired");
+                                }
+                                continue;
+                            }
                             let gw = drain_gw.clone();
                             let reg = drain_reg.clone();
                             let outbox = outbox.clone();

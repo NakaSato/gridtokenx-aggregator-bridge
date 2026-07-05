@@ -153,7 +153,14 @@ Durability (two crash-safety closures, both degrade-safe):
   `mint:{serial}:{window_start_ms}` + the on-chain `(meter_id, window_start_ms)` PDA, so a retry of a mint
   that actually landed (but whose reply was lost) does not double-mint (`MintOutbox` +
   `aggregator_logic::mint_outbox`, drain loop + `attempt_mint` in `src/main.rs`). No Redis ⇒ falls back to
-  the prior best-effort fire-and-forget mint (no durability, no regression).
+  the prior best-effort fire-and-forget mint (no durability, no regression). **Retention is bounded**:
+  an entry that hasn't landed after `MINT_OUTBOX_MAX_AGE_SECS` (default 7 days, `0` = retry forever) is
+  **parked** — moved to `gridtokenx:billing:mint_outbox:parked`, out of the retry path, loud `warn!` +
+  `aggregator_mint_total{outcome="parked",reason="expired"}` — never silently deleted; re-enqueue manually
+  to resume. A resolved wallet that isn't a parseable Solana address (e.g. e2e-fixture junk) is skipped
+  aggregator-side *before* the NATS publish (`wallet_is_valid`,
+  `crates/aggregator-persistence/src/infra/mint.rs`; `skipped/invalid_wallet`) — it still retries (the
+  registry may be corrected) until the age bound parks it.
 
 > SECURITY: `NatsMintGateway` **signs** the mint envelope with this service's mTLS client key
 > (P-256/ECDSA over the canonical bytes) and attaches an `EnvelopeAuth` (cert PEM + signature), so the

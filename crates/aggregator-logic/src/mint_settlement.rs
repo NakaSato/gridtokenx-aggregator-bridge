@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use aggregator_persistence::infra::meter_registry::MeterRegistry;
-use aggregator_persistence::infra::mint::{MintGateway, MintReplyTimeout};
+use aggregator_persistence::infra::mint::{wallet_is_valid, MintGateway, MintReplyTimeout};
 use tracing::{info, warn};
 
 use crate::metrics;
@@ -77,6 +77,19 @@ pub async fn attempt_mint(
         return false;
     };
     let wallet = match reg.resolve_wallet(&p.meter_serial).await {
+        Ok(Some(w)) if !wallet_is_valid(&w) => {
+            // A wallet the bridge can never parse (`Pubkey::from_str` rejects
+            // it) — publishing would just burn a NATS round-trip per retry.
+            // Kept: the wallet is re-resolved each attempt, so a corrected
+            // registry entry still mints; the outbox age bound eventually
+            // parks entries that never heal.
+            warn!(
+                "surplus mint deferred: invalid recipient wallet '{w}' for meter {} (kept for retry)",
+                p.meter_serial
+            );
+            metrics::record_mint_outcome("skipped", "invalid_wallet");
+            return false;
+        }
         Ok(Some(w)) => w,
         Ok(None) => {
             // Unregistered meter: kept in the outbox so it mints once the owner
