@@ -535,7 +535,7 @@ async fn main() -> Result<()> {
                                                 let field = pending.field();
                                                 let inflight = sink_inflight.clone();
                                                 let inflight_keys = sink_inflight_keys.clone();
-                                                tokio::spawn(async move {
+                                                let handle = tokio::spawn(async move {
                                                     // Gate on the shared in-flight cap so a huge
                                                     // window doesn't flood the bridge into
                                                     // staleness rejections. Closed semaphore ⇒
@@ -546,6 +546,17 @@ async fn main() -> Result<()> {
                                                     if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await {
                                                         if let Err(e) = outbox.remove(&field).await {
                                                             warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
+                                                        }
+                                                    }
+                                                });
+                                                // The outbox entry is the durable backstop either
+                                                // way, but a silent panic here would otherwise
+                                                // never surface — log it loud so it's not mistaken
+                                                // for a clean skip.
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = handle.await {
+                                                        if e.is_panic() {
+                                                            error!("immediate mint attempt task panicked: {e}");
                                                         }
                                                     }
                                                 });
@@ -595,11 +606,21 @@ async fn main() -> Result<()> {
                                             let reg = settle_registry.clone();
                                             let inflight = sink_inflight.clone();
                                             let inflight_keys = sink_inflight_keys.clone();
-                                            tokio::spawn(async move {
+                                            let handle = tokio::spawn(async move {
                                                 let Ok(_permit) = inflight.acquire_owned().await else {
                                                     return;
                                                 };
                                                 let _ = mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await;
+                                            });
+                                            // No durable outbox in this branch (Redis is off), so
+                                            // a panic here is the only failure signal there is —
+                                            // surface it instead of letting it vanish silently.
+                                            tokio::spawn(async move {
+                                                if let Err(e) = handle.await {
+                                                    if e.is_panic() {
+                                                        error!("best-effort mint attempt task panicked: {e}");
+                                                    }
+                                                }
                                             });
                                         }
                                     }
