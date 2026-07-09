@@ -352,6 +352,7 @@ impl NatsMintGateway {
         }
     }
 
+    #[tracing::instrument(name = "nats_mint_publish", skip_all, fields(energy_kwh = energy_kwh))]
     async fn mint(
         &self,
         recipient_wallet: &str,
@@ -399,9 +400,15 @@ impl NatsMintGateway {
         // stream before we wait for a reply. A missing stream / broker fault
         // surfaces as `Err` here (caller logs; the bin still evicts and the
         // idempotency key dedups any later retry) rather than a silent drop.
+        // Carry the current trace context on NATS headers so chain-bridge stitches
+        // its mint-consume span onto this trace. Headers ride OUTSIDE the signed
+        // envelope (`canonical_mint_bytes` excludes them), so signing is unaffected.
+        let mut headers = async_nats::HeaderMap::new();
+        gridtokenx_telemetry::inject_trace_context(|k, v| headers.insert(k, v.as_str()));
+
         let ack = self
             .jetstream
-            .publish(MINT_SUBJECT, payload.into())
+            .publish_with_headers(MINT_SUBJECT, headers, payload.into())
             .await
             .map_err(|e| anyhow!("publish mint intent (jetstream): {e}"))?;
         ack.await
