@@ -17,8 +17,8 @@ async-nats = "0.37"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 
 # OpenADR demand response client
-openleadr-client = "0.2.3"
-openleadr-wire = "0.2.3"
+openleadr-client = "0.2.4"
+openleadr-wire = "0.2.4"
 url = "2.5"
 
 # Async

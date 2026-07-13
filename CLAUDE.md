@@ -69,7 +69,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 - Two servers run concurrently: **HTTP IoT gateway** on `IOT_GATEWAY_PORT` (default `4010`) and **gRPC ingestion** on `GRPC_PORT` (default **5030**, the canonical mesh port — `50051` in `.env.example` is the simulator override).
 - HTTP routes: `/health` + `/metrics` (both auth-exempt), and the `api_key_auth`-gated ingest routes `/v1/private-network/ingest[/batch]` + `/v1/ingest/telemetry[/batch]` (`src/main.rs` route block).
 - **Degraded-mode by design**: Redis (3s timeout), Kafka, RabbitMQ, InfluxDB, and IAM gRPC all fall back to disabled/None on connect failure with a `warn!` — the process still starts. Don't "fix" these by making them fatal.
-- Background tasks: zone ingester, Kafka dispatch listener, gRPC server, billing-sink flush loop (only when InfluxDB enabled) — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
+- Background tasks: zone ingester, Kafka dispatch listener, gRPC server, billing-sink flush loop (only when InfluxDB enabled), pg_readings writer (only when `AGGREGATOR_PG_READINGS` enabled) — all gated on a shared `CancellationToken` driven by SIGINT/SIGTERM.
 - Env interpolation: values support `${VAR}` expansion via `expand_env`.
 
 ## Security-critical invariants (don't regress)
@@ -91,7 +91,12 @@ Copy `.env.example` → `.env`. Key vars: `REDIS_URL`, `DATABASE_URL`, `IOT_GATE
 (default 10), `IAM_SERVICE_URL`, `KAFKA_BOOTSTRAP_SERVERS`, `RABBITMQ_URL`, `IOT_NUM_ZONES`
 (default 10), `ENVIRONMENT` (`production` ⇒ strict sig + DLMS decryption), `ALLOW_PLAINTEXT_DLMS`
 (dev-only; allow plaintext v4 frames when a device has no `enckey`), `AGGREGATOR_REQUIRE_SECURE`
-(`true` ⇒ locked-down: neutralizes every ingest bypass — see Security-critical invariants).
+(`true` ⇒ locked-down: neutralizes every ingest bypass — see Security-critical invariants),
+`AGGREGATOR_PG_READINGS` (`true`/`1` ⇒ enables the optional Postgres `meter_readings` sink,
+requires `DATABASE_URL`; mirrors the `INFLUXDB_URL`-gated sink — disabled by default, degrades
+safely when unset or the pool is absent. Batches `DeviceReading`s into the shared `meters`/`users`
+join and writes to the IAM-owned `meter_readings` table so the trading UI / meter-service can list a
+meter's Recent Readings — see `crates/aggregator-persistence/src/infra/pg_readings.rs`).
 
 Meter-owner registry (`DATABASE_URL`): the **durable source of truth** for `meter_serial →
 (user_id, owner wallet)` is the shared gridtokenx Postgres `meters` JOIN `users`, written by the
@@ -182,7 +187,7 @@ one-element list when `DISPATCH_ADAPTERS` is unset (`select_adapters`, `crates/a
 Optional: `OPENLEADR_CLIENT_ID`/`OPENLEADR_CLIENT_SECRET` (OAuth pair), `OPENLEADR_PROGRAM_ID`,
 `OPENLEADR_PROGRAM_NAME` (default `gridtokenx-flex-dispatch`), `OPENLEADR_TARGET`,
 `OPENLEADR_EVENT_DURATION_HOURS` (default 1.0). A local VTN for testing runs as the superproject's
-`openleadr-vtn` compose service (port 4031, upstream openleadr-rs v0.2.3 — same version as the
+`openleadr-vtn` compose service (port 4031, upstream openleadr-rs v0.2.4 — same version as the
 `openleadr-client`/`openleadr-wire` crates.io deps; dev credentials `bl-client`/`bl-client` are
 seeded by the one-shot `openleadr-vtn-seed` service). The dispatch trigger is a Kafka
 `GridStatusEvent` JSON message on `KAFKA_TOPIC_GRID_STATUS` (default

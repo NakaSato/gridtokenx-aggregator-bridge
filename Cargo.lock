@@ -3109,9 +3109,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openleadr-client"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3ea1981c7165b694ab835f52d3669053a9d1010f8dfd145e2a9c5f6fb2df139"
+checksum = "8c89c01404e1aebbcf875b19c627d9a5ebae2ab9eb29e9dc6785f9e62c4d69c8"
 dependencies = [
  "async-trait",
  "axum",
@@ -3132,9 +3132,9 @@ dependencies = [
 
 [[package]]
 name = "openleadr-wire"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6d6e3f7af065587831339745902e359f853dd4f52d968bc1a3f0811ff23ebb0"
+checksum = "808922720c0882a8aae619daef7616e7fdd50d5dcd3c15714e5810920041f4f5"
 dependencies = [
  "chrono",
  "derive_more",

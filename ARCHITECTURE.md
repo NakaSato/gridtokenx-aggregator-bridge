@@ -133,7 +133,8 @@ scraper presents a CA-issued client cert; the superproject's prometheus job uses
 | `aggregator_mint_total` | counter | `outcome` = `settled` \| `skipped` \| `failed` \| `no_surplus` \| `lost` \| `parked`; `reason` = `ok` \| `no_wallet` \| `invalid_wallet` \| `in_flight` \| `resolve_err` \| `mint_err` \| `reply_timeout` \| `outbox_and_mint_failed` \| `expired` | One increment per completed billing bin in the settlement sweep. `skipped/no_wallet` surfaces the otherwise-silent unregistered-meter case; `skipped/invalid_wallet` is a declined publish — the resolved wallet isn't a parseable Solana address (`wallet_is_valid`, `crates/aggregator-persistence/src/infra/mint.rs`), so no NATS round-trip is spent; `skipped/in_flight` is a retry declined because an attempt for the same `{serial}:{window}` key is still awaiting its reply in this process (`MintInFlight`); `no_surplus` is the net-consumption denominator. `failed/reply_timeout` is a lost mint reply (intent durably queued in JetStream, the mint may have landed — the outbox retry is dedup-safe), distinct from a hard `failed/mint_err` rejection. `lost/outbox_and_mint_failed` is the durable-outbox enqueue failing twice **and** the last-resort immediate mint also failing — the bin's durable Redis entry is retained for manual recovery instead of evicted (`src/main.rs`, `MintHandoff::Lost`). `parked/expired` is an outbox entry that aged past `MINT_OUTBOX_MAX_AGE_SECS` (default 7 days, `0` disables) without landing on-chain and was moved to `gridtokenx:billing:mint_outbox:parked`, out of the retry path — re-enqueue manually (`HSET` back into `gridtokenx:billing:mint_outbox` + `HDEL` from `:parked`) to resume retries. |
 
 Alert rules live in the superproject `monitoring/prometheus_rules.yml`
-(`AggregatorSurplusMintDisabled`, `AggregatorMintSkipSpike`, `AggregatorMintLost`).
+(`AggregatorSurplusMintDisabled`, `AggregatorMintSkipSpike`, `AggregatorMintLost`,
+`AggregatorMintParked`).
 
 **API-key auth cache.** `crates/aggregator-api/src/auth.rs` caches the IAM
 `VerifyApiKey` verdict to keep sustained ingest from flooding IAM (each call is a
@@ -216,17 +217,18 @@ no external SCADA feed:
   retries the dispatch; `post_execution_report`, verified
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:392`).
 - **Why the VEN polls (not webhook).** OpenADR 3.1 defines push subscriptions,
-  but the backing library (`openleadr-rs` v0.2.3 — the spec floor for 3.1;
+  but the backing library (`openleadr-rs` v0.2.4 — the spec floor for 3.1;
   3.0 ended at v0.1) does **not** implement real-time webhook subscriptions
-  (≈166/168 OpenADR Alliance tests pass; the 38 failures are all the unsupported
-  subscriptions feature). So the listener falls back to a poll loop every
+  (166/168 OpenADR Alliance tests pass; the 2 failures are intentional, from a
+  differing permission model, not the unsupported subscriptions feature). So the
+  listener falls back to a poll loop every
   `OPENLEADR_VEN_POLL_SECS` (default 30, verified
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:51`). The polling
   cadence is a dependency constraint, not a design preference — `poll_interval`
   bounds dispatch latency to one poll; lower it for tighter response, raise it
   to spare the VTN. Revisit if openleadr-rs ships subscriptions.
 - **Local test loop.** The superproject compose runs an `openleadr-vtn` service
-  (upstream openleadr-rs v0.2.3, host port 4031) + seeded dev OAuth clients;
+  (upstream openleadr-rs v0.2.4, host port 4031) + seeded dev OAuth clients;
   `just openadr-e2e` proves the full loop telemetry → frequency window → Kafka
   → dispatch → VTN event → VEN execution.
 
