@@ -16,126 +16,33 @@
 //! identical to `canonical_mint_bytes` there or every signature fails verification.
 
 use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine as _;
 use futures::StreamExt;
-use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+// Send/sign wire types + canonical-bytes scheme now come from the shared light
+// `gridtokenx-blockchain-types` crate (single source of truth with the Chain
+// Bridge verifier) — replaces the byte-for-byte local mirror this file carried.
+use gridtokenx_blockchain_types::envelope_auth::{
+    canonical_mint_batch_bytes, canonical_mint_bytes, EnvelopeSigner,
+};
+use gridtokenx_blockchain_types::nats_schema::{
+    BatchMintItem, EnvelopeAuth, MintEnergyBatchMessage, MintEnergyMessage,
+};
+
+// Test-only: signing/verify primitives used by the golden-vector + roundtrip tests.
+#[cfg(test)]
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(test)]
+use p256::ecdsa::{Signature, SigningKey};
 
 /// Subject Chain Bridge consumes mint intents on.
 const MINT_SUBJECT: &str = "chain.tx.mint";
 
-/// Envelope-auth scheme tag — must equal `blockchain_core::rpc::envelope_auth::ENVELOPE_AUTH_SCHEME_V1`.
-const ENVELOPE_AUTH_SCHEME_V1: &str = "ecdsa-p256-sha256-v1";
-
-/// Domain separation tag — must equal `envelope_auth::DOMAIN_TAG` (trailing NUL included).
-const DOMAIN_TAG: &[u8] = b"gridtokenx-nats-envelope-v1\0";
-
-/// Length-prefixed canonical field encoder — mirror of `envelope_auth::push_field`:
-/// `name` bytes, `0x00`, the value length as `u64` LE, then the value bytes.
-fn push_field(buf: &mut Vec<u8>, name: &str, bytes: &[u8]) {
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
-
-/// Canonical bytes signed for a mint envelope — byte-for-byte mirror of
-/// `blockchain_core::rpc::envelope_auth::canonical_mint_bytes`. The field order,
-/// little-endian numeric encoding, and exclusion of `auth` are part of the wire
-/// contract: any drift here makes the bridge reject every signature.
-fn canonical_mint_bytes(m: &MintEnergyMessage) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(256);
-    buf.extend_from_slice(DOMAIN_TAG);
-    buf.extend_from_slice(b"mint");
-    buf.push(0);
-    push_field(&mut buf, "correlation_id", m.correlation_id.as_bytes());
-    push_field(&mut buf, "idempotency_key", m.idempotency_key.as_bytes());
-    push_field(&mut buf, "reply_subject", m.reply_subject.as_bytes());
-    push_field(&mut buf, "recipient_wallet", m.recipient_wallet.as_bytes());
-    push_field(&mut buf, "service_identity", m.service_identity.as_bytes());
-    push_field(&mut buf, "created_at_ms", &m.created_at_ms.to_le_bytes());
-    push_field(&mut buf, "energy_kwh", &m.energy_kwh.to_le_bytes());
-    push_field(&mut buf, "meter_id", &m.meter_id);
-    push_field(
-        &mut buf,
-        "window_start_ms",
-        &m.window_start_ms.to_le_bytes(),
-    );
-    buf
-}
-
-/// Mirror of `blockchain_core::rpc::nats_schema::EnvelopeAuth` — the auth block the
-/// bridge's `check_envelope_auth` deserializes (scheme → cert → SAN → signature).
-#[derive(Serialize, Deserialize, Clone)]
-struct EnvelopeAuth {
-    scheme: String,
-    cert_pem: String,
-    /// base64(ASN.1-DER ECDSA P-256/SHA-256 signature) over the canonical bytes.
-    signature: String,
-}
-
-/// Signs canonical mint bytes with the service's mTLS client key and carries the
-/// matching cert PEM. Built once at startup; cheap per message (one ECDSA sign).
-/// Local mirror of `envelope_auth::EnvelopeSigner` (no blockchain-core dep).
-struct EnvelopeSigner {
-    key: SigningKey,
-    cert_pem: String,
-}
-
-impl EnvelopeSigner {
-    /// Pure constructor from in-memory PEM. The key must be ECDSA P-256 in SEC1
-    /// ("EC PRIVATE KEY", what `gen-certs.sh` emits) or PKCS#8 form.
-    fn from_pem(cert_pem: String, key_pem: &str) -> Result<Self> {
-        let secret = p256::SecretKey::from_sec1_pem(key_pem)
-            .or_else(|_| p256::SecretKey::from_pkcs8_pem(key_pem))
-            .map_err(|e| anyhow!("client key is not a P-256 SEC1/PKCS#8 PEM: {e}"))?;
-        Ok(Self {
-            key: SigningKey::from(secret),
-            cert_pem,
-        })
-    }
-
-    /// Loads `CHAIN_BRIDGE_CLIENT_CERT` / `CHAIN_BRIDGE_CLIENT_KEY` (same paths the
-    /// mTLS gRPC client uses). Returns `None` with a warning when the material is
-    /// missing or unparseable, so insecure/dev setups keep publishing unsigned.
-    fn from_env_paths() -> Option<Self> {
-        let cert_path = std::env::var("CHAIN_BRIDGE_CLIENT_CERT")
-            .unwrap_or_else(|_| "infra/certs/client.crt".to_string());
-        let key_path = std::env::var("CHAIN_BRIDGE_CLIENT_KEY")
-            .unwrap_or_else(|_| "infra/certs/client.key".to_string());
-        let load = || -> Result<Self> {
-            let cert_pem = std::fs::read_to_string(&cert_path)
-                .with_context(|| format!("reading client cert at {cert_path}"))?;
-            let key_pem = std::fs::read_to_string(&key_path)
-                .with_context(|| format!("reading client key at {key_path}"))?;
-            Self::from_pem(cert_pem, &key_pem)
-        };
-        match load() {
-            Ok(signer) => Some(signer),
-            Err(e) => {
-                tracing::warn!(
-                    "⚠️ NATS mint envelope signer unavailable ({e:#}) — mints will be UNSIGNED (dev only)"
-                );
-                None
-            }
-        }
-    }
-
-    /// Signs the canonical bytes; the `p256` `Signer` impl prehashes with SHA-256,
-    /// matching the bridge's `verify_p256_signature`.
-    fn sign(&self, canonical: &[u8]) -> EnvelopeAuth {
-        let sig: Signature = self.key.sign(canonical);
-        EnvelopeAuth {
-            scheme: ENVELOPE_AUTH_SCHEME_V1.to_string(),
-            cert_pem: self.cert_pem.clone(),
-            signature: BASE64.encode(sig.to_der()),
-        }
-    }
-}
+/// Subject Chain Bridge consumes BATCHED mint intents on — must equal
+/// `blockchain_core::rpc::nats_schema::MINT_BATCH_SUBJECT`. A single token under
+/// `chain.tx.` so the bridge's `chain.tx.*` stream captures it without reconfig.
+const MINT_BATCH_SUBJECT: &str = "chain.tx.mintbatch";
 
 /// Stable per-(meter, window) idempotency key: `mint:{serial}:{window_start_ms}`.
 /// The bridge dedups replays on this; the on-chain `(meter_id, window_start_ms)`
@@ -200,25 +107,9 @@ pub struct MintOutcome {
     pub slot: u64,
 }
 
-/// Mirror of `gridtokenx_blockchain_core::rpc::nats_schema::MintEnergyMessage`.
-/// Duplicated here so the aggregator stays chain-light. Keep field names in sync.
-#[derive(Serialize, Deserialize)]
-struct MintEnergyMessage {
-    correlation_id: String,
-    idempotency_key: String,
-    reply_subject: String,
-    recipient_wallet: String,
-    energy_kwh: f64,
-    meter_id: [u8; 16],
-    window_start_ms: i64,
-    service_identity: String,
-    created_at_ms: u64,
-    /// Signed envelope auth; omitted from the wire when unsigned (no client cert).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    auth: Option<EnvelopeAuth>,
-}
-
-/// Mirror of `MintEnergyResultMessage`.
+/// Local Deserialize subset of `gridtokenx_blockchain_types::nats_schema::MintEnergyResultMessage`
+/// (the bridge reply). Extra fields the bridge may send (`correlation_id`,
+/// `deduplicated`) are intentionally ignored by serde.
 #[derive(Deserialize)]
 struct MintEnergyResultMessage {
     success: bool,
@@ -226,6 +117,42 @@ struct MintEnergyResultMessage {
     error: Option<String>,
     #[serde(default)]
     slot: u64,
+}
+
+/// One recipient's outcome from the bridge's batch reply. Minimal Deserialize
+/// mirror (unknown fields, e.g. `deduplicated`, are ignored). `idempotency_key`
+/// lets the caller match a result back to its outbox entry without ordering.
+#[derive(Deserialize, Debug, Clone)]
+pub struct MintBatchItemResult {
+    /// Index into the request's items — informational; matching is by key.
+    #[serde(default)]
+    pub index: usize,
+    pub idempotency_key: String,
+    pub success: bool,
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub slot: u64,
+    pub error: Option<String>,
+}
+
+/// Mirror of `blockchain_core::rpc::nats_schema::MintEnergyBatchResultMessage`
+/// (reply side, Deserialize-only).
+#[derive(Deserialize)]
+struct MintEnergyBatchResultMessage {
+    results: Vec<MintBatchItemResult>,
+}
+
+/// Input to [`NatsMintGateway::mint_batch`] — one recipient's mint intent. The
+/// per-item idempotency key is derived as `mint:{meter_serial}:{window_start_ms}`,
+/// identical to the single-recipient path, so the two paths dedup against the
+/// same on-chain `(meter, window)` PDA.
+#[derive(Debug, Clone)]
+pub struct BatchMintInput {
+    pub recipient_wallet: String,
+    pub energy_kwh: f64,
+    pub meter_id: [u8; 16],
+    pub meter_serial: String,
+    pub window_start_ms: i64,
 }
 
 /// Mint gateway. `Nats` talks to Chain Bridge; `Disabled` is wired when no
@@ -311,6 +238,20 @@ impl MintGateway {
                 )
                 .await
             }
+            Self::Disabled => Err(anyhow!("mint backend not configured")),
+        }
+    }
+
+    /// Batched sibling of [`Self::mint`] — mints many recipients in one NATS
+    /// round-trip and returns the bridge's per-recipient result vector.
+    ///
+    /// # Errors
+    /// Returns an error only for envelope-level failures (backend disabled,
+    /// encode, publish/ack, reply timeout, decode). Per-recipient failures ride
+    /// in the returned results (`success = false`), not as an `Err`.
+    pub async fn mint_batch(&self, inputs: &[BatchMintInput]) -> Result<Vec<MintBatchItemResult>> {
+        match self {
+            Self::Nats(gw) => gw.mint_batch(inputs).await,
             Self::Disabled => Err(anyhow!("mint backend not configured")),
         }
     }
@@ -423,6 +364,85 @@ impl NatsMintGateway {
             serde_json::from_slice(&reply.payload).context("decode mint result")?;
 
         parse_mint_result(result)
+    }
+
+    /// Batched sibling of [`Self::mint`]: publishes ONE `chain.tx.mintbatch`
+    /// envelope carrying every recipient, and returns the bridge's per-recipient
+    /// result vector so the caller evicts exactly the confirmed ones and retries
+    /// the rest. Amortises the NATS round-trip and the bridge's per-tx cost over
+    /// up to `GENERATION_MINT_CHUNK` recipients per on-chain transaction.
+    ///
+    /// Each item's dedup/PDA key is `mint:{meter_serial}:{window_start_ms}` —
+    /// identical to the single path, so the two paths are mutually idempotent (a
+    /// recipient minted by either never double-mints via the other).
+    ///
+    /// # Errors
+    /// Returns `Err` only for envelope-level failures (encode, JetStream
+    /// publish/ack, reply timeout, decode). Per-recipient failures are carried in
+    /// the returned `MintBatchItemResult`s (`success = false`), not as an `Err`.
+    #[tracing::instrument(name = "nats_mint_batch_publish", skip_all, fields(items = inputs.len()))]
+    pub async fn mint_batch(&self, inputs: &[BatchMintInput]) -> Result<Vec<MintBatchItemResult>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let correlation_id = Uuid::new_v4().to_string();
+        let reply_subject = format!("chain.mint.batch.result.{correlation_id}");
+        let created_at_ms = gridtokenx_telemetry::time::now()
+            .timestamp_millis()
+            .try_into()
+            .unwrap_or(0u64);
+
+        let items: Vec<BatchMintItem> = inputs
+            .iter()
+            .map(|i| BatchMintItem {
+                idempotency_key: mint_idempotency_key(&i.meter_serial, i.window_start_ms),
+                recipient_wallet: i.recipient_wallet.clone(),
+                energy_kwh: i.energy_kwh,
+                meter_id: i.meter_id,
+                window_start_ms: i.window_start_ms,
+            })
+            .collect();
+
+        let mut msg = MintEnergyBatchMessage {
+            correlation_id,
+            reply_subject: reply_subject.clone(),
+            items,
+            service_identity: self.service_identity.clone(),
+            created_at_ms,
+            auth: None,
+        };
+        if let Some(signer) = &self.signer {
+            msg.auth = Some(signer.sign(&canonical_mint_batch_bytes(&msg)));
+        }
+        let payload = serde_json::to_vec(&msg).context("encode batch mint intent")?;
+
+        // Subscribe to the reply BEFORE publishing so it can't be missed.
+        let mut sub = self
+            .client
+            .subscribe(reply_subject.clone())
+            .await
+            .map_err(|e| anyhow!("subscribe batch mint reply: {e}"))?;
+
+        let mut headers = async_nats::HeaderMap::new();
+        gridtokenx_telemetry::inject_trace_context(|k, v| headers.insert(k, v.as_str()));
+
+        let ack = self
+            .jetstream
+            .publish_with_headers(MINT_BATCH_SUBJECT, headers, payload.into())
+            .await
+            .map_err(|e| anyhow!("publish batch mint intent (jetstream): {e}"))?;
+        ack.await
+            .map_err(|e| anyhow!("batch mint intent not acked by jetstream: {e}"))?;
+
+        let reply = tokio::time::timeout(self.request_timeout, sub.next())
+            .await
+            .map_err(|_| anyhow::Error::new(MintReplyTimeout))?
+            .ok_or_else(|| anyhow!("batch mint reply stream closed"))?;
+
+        let result: MintEnergyBatchResultMessage =
+            serde_json::from_slice(&reply.payload).context("decode batch mint result")?;
+
+        Ok(result.results)
     }
 }
 
@@ -598,6 +618,86 @@ mod tests {
             "aggregator mint canonical bytes drifted from the blockchain-core wire \
              scheme (envelope_auth::canonical_mint_bytes) — every mint signature \
              would fail verification at the Chain Bridge"
+        );
+    }
+
+    /// Golden vector for the BATCH canonical bytes — identical reconstruction to
+    /// `blockchain_core::rpc::envelope_auth::canonical_mint_batch_golden_vector`.
+    /// Pins the aggregator's private mirror to the bridge's wire scheme byte-for-
+    /// byte (per-item framing + `item_count`); drift fails here instead of
+    /// silently breaking every batch signature at the verifier.
+    #[test]
+    fn canonical_mint_batch_bytes_matches_blockchain_core_golden() {
+        let m = MintEnergyBatchMessage {
+            correlation_id: "c1".to_string(),
+            reply_subject: "chain.mint.batch.result.c1".to_string(),
+            items: vec![
+                BatchMintItem {
+                    idempotency_key: "mint:m1:1000".to_string(),
+                    recipient_wallet: "Wa11etA".to_string(),
+                    energy_kwh: 7.5,
+                    meter_id: [7u8; 16],
+                    window_start_ms: 1_700_000_000_000,
+                },
+                BatchMintItem {
+                    idempotency_key: "mint:m2:1000".to_string(),
+                    recipient_wallet: "Wa11etB".to_string(),
+                    energy_kwh: 3.25,
+                    meter_id: [9u8; 16],
+                    window_start_ms: 1_700_000_000_000,
+                },
+            ],
+            service_identity: "spiffe://gridtokenx.th/prod/aggregator-bridge".to_string(),
+            created_at_ms: 1_700_000_000_000,
+            auth: None,
+        };
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(b"gridtokenx-nats-envelope-v1\0mint_batch\0");
+        let mut field = |name: &str, bytes: &[u8]| {
+            expected.extend_from_slice(name.as_bytes());
+            expected.push(0);
+            expected.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            expected.extend_from_slice(bytes);
+        };
+        let item_bytes = |ik: &str, wallet: &str, kwh: f64, meter: &[u8; 16], win: i64| {
+            let mut b: Vec<u8> = Vec::new();
+            let mut f = |name: &str, bytes: &[u8]| {
+                b.extend_from_slice(name.as_bytes());
+                b.push(0);
+                b.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                b.extend_from_slice(bytes);
+            };
+            f("idempotency_key", ik.as_bytes());
+            f("recipient_wallet", wallet.as_bytes());
+            f("energy_kwh", &kwh.to_le_bytes());
+            f("meter_id", meter);
+            f("window_start_ms", &win.to_le_bytes());
+            b
+        };
+        field("correlation_id", b"c1");
+        field("reply_subject", b"chain.mint.batch.result.c1");
+        field(
+            "service_identity",
+            b"spiffe://gridtokenx.th/prod/aggregator-bridge",
+        );
+        field("created_at_ms", &1_700_000_000_000u64.to_le_bytes());
+        field("item_count", &2u64.to_le_bytes());
+        field(
+            "item",
+            &item_bytes("mint:m1:1000", "Wa11etA", 7.5, &[7u8; 16], 1_700_000_000_000),
+        );
+        field(
+            "item",
+            &item_bytes("mint:m2:1000", "Wa11etB", 3.25, &[9u8; 16], 1_700_000_000_000),
+        );
+
+        assert_eq!(
+            canonical_mint_batch_bytes(&m),
+            expected,
+            "aggregator BATCH canonical bytes drifted from the blockchain-core wire \
+             scheme (envelope_auth::canonical_mint_batch_bytes) — every batch mint \
+             signature would fail verification at the Chain Bridge"
         );
     }
 

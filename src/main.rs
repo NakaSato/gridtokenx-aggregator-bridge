@@ -714,7 +714,9 @@ async fn main() -> Result<()> {
                         // client reply-timeouts + re-fire next tick). The permit
                         // makes publish time ≈ processing time.
                         let now_ms = telemetry::time::now().timestamp_millis();
-                        let mut attempts = tokio::task::JoinSet::new();
+                        // Partition: park expired entries, collect the rest to mint.
+                        let mut to_mint: Vec<aggregator_api::mint_outbox::PendingMint> =
+                            Vec::with_capacity(pending.len());
                         for p in pending {
                             if aggregator_api::mint_outbox::is_expired(&p, now_ms, max_age_secs) {
                                 let age_secs = now_ms.saturating_sub(p.enqueued_at_ms) / 1000;
@@ -729,6 +731,23 @@ async fn main() -> Result<()> {
                                 }
                                 continue;
                             }
+                            to_mint.push(p);
+                        }
+
+                        // Coalesce into batches: one NATS round-trip + one bridge
+                        // envelope amortises many recipients (the bridge splits each
+                        // envelope into GENERATION_MINT_CHUNK-recipient transactions).
+                        // AGGREGATOR_MINT_BATCH_SIZE bounds the bridge's per-envelope
+                        // handler time (≈ ⌈size/3⌉ chunk confirmations) against the
+                        // reply timeout — keep it comfortably below
+                        // AGGREGATOR_MINT_REPLY_TIMEOUT_SECS ÷ per-chunk-confirm.
+                        let batch_size = std::env::var("AGGREGATOR_MINT_BATCH_SIZE")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .filter(|&n| n > 0)
+                            .unwrap_or(15);
+                        let mut attempts = tokio::task::JoinSet::new();
+                        for batch in to_mint.chunks(batch_size).map(|c| c.to_vec()) {
                             let gw = drain_gw.clone();
                             let reg = drain_reg.clone();
                             let outbox = outbox.clone();
@@ -738,10 +757,14 @@ async fn main() -> Result<()> {
                                 let Ok(_permit) = inflight.acquire_owned().await else {
                                     return;
                                 };
-                                // Confirmed on-chain ⇒ remove; otherwise keep for the
-                                // next tick (no_wallet / bridge down / sim rejection).
-                                if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &p).await {
-                                    let field = p.field();
+                                // Batched mint: returns the outbox fields confirmed
+                                // on-chain; the rest stay for the next tick (no_wallet
+                                // / bridge down / sim rejection / reply timeout).
+                                let confirmed = mint_settlement::attempt_mint_batch(
+                                    &gw, &reg, &inflight_keys, &batch,
+                                )
+                                .await;
+                                for field in confirmed {
                                     if let Err(e) = outbox.remove(&field).await {
                                         warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
                                     }
