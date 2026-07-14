@@ -1990,8 +1990,11 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-serde",
  "tracing-subscriber",
 ]
 

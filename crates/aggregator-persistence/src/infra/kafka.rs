@@ -40,7 +40,22 @@ impl AggregatorKafkaProducer {
     pub fn new(bootstrap_servers: &str, topic: &str) -> Result<Self> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("message.timeout.ms", "5000")
+            // Detect dead/black-holed peers. Without TCP keepalive (librdkafka
+            // default OFF), a connection silently dropped by the broker's idle
+            // reap (`connections.max.idle.ms`) or the container overlay during an
+            // ingest lull is never noticed — the producer keeps writing to a dead
+            // socket and every message expires at `message.timeout.ms`, forever,
+            // with no auto-recovery. Keepalive lets librdkafka tear down the stale
+            // socket and reconnect.
+            .set("socket.keepalive.enable", "true")
+            // Tolerate transient broker slowness (e.g. CPU contention) instead of
+            // dropping the reading after only 5s. This is a fire-and-forget stream
+            // already made durable via Redis + InfluxDB, so a longer delivery
+            // window is cheap insurance against spurious MessageTimedOut floods.
+            .set("message.timeout.ms", "30000")
+            // Bound reconnect latency once a dead socket is detected.
+            .set("reconnect.backoff.ms", "500")
+            .set("reconnect.backoff.max.ms", "10000")
             .set("acks", "all")
             .create()?;
 

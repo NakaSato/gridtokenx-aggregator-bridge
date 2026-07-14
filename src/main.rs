@@ -203,6 +203,12 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Optional Postgres meter_readings sink (dashboard Recent Readings). Cloned
+    // from the same pool the registry uses (PgPool is an Arc); gated on
+    // AGGREGATOR_PG_READINGS. Built before the pool moves into MeterRegistry.
+    let pg_readings_writer =
+        infra::pg_readings::PgReadingsWriter::start(pg_pool.clone()).map(Arc::new);
+
     let meter_registry = Arc::new(infra::meter_registry::MeterRegistry::new(
         early_redis_conn.clone(),
         pg_pool,
@@ -354,7 +360,8 @@ async fn main() -> Result<()> {
         router::Router::new(&redis_url, num_zones, influx_writer)
             .await
             .context("Failed to initialize IoT router")?
-            .with_stream_cipher(stream_cipher.clone()),
+            .with_stream_cipher(stream_cipher.clone())
+            .with_pg_readings(pg_readings_writer),
     );
 
     // Chain Bridge mint gateway for surplus settlement. Degrades to Disabled when

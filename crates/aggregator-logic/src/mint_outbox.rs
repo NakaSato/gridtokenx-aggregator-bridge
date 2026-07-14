@@ -118,24 +118,41 @@ impl MintOutbox {
         Ok(())
     }
 
-    /// Remove a pending mint once its on-chain mint is confirmed.
+    /// Remove a pending mint once its on-chain mint is confirmed. Clears the
+    /// field from **both** [`OUTBOX_KEY`] and [`PARKED_KEY`] — a confirming
+    /// attempt can race the drain loop's [`Self::park`] (the attempt was
+    /// still in flight when the entry aged past the retention bound), so
+    /// clearing both self-heals that race: whichever of park/confirm runs
+    /// last, a confirmed mint never leaves a stray "unresolved" copy behind
+    /// in the parked hash.
     ///
     /// # Errors
-    /// Returns an error if the Redis `HDEL` fails (a stale entry only causes one
-    /// idempotent retry, which the bridge dedups — never a double-mint).
+    /// Returns an error if the `OUTBOX_KEY` `HDEL` fails (a stale entry only
+    /// causes one idempotent retry, which the bridge dedups — never a
+    /// double-mint). The `PARKED_KEY` cleanup is best-effort: its failure is
+    /// logged by the caller, not propagated, since the mint is already
+    /// confirmed and a leftover parked copy is a display nuisance, not a
+    /// lossy state.
     pub async fn remove(&self, field: &str) -> Result<()> {
         let mut conn = self.conn.clone();
         let _: () = conn
             .hdel(OUTBOX_KEY, field)
             .await
             .context("HDEL pending mint")?;
+        // Best-effort: a confirmed mint must never leave a misleading
+        // "unresolved" entry in the parked hash, even if it got parked by a
+        // racing drain-loop tick while this attempt was still in flight.
+        let _: redis::RedisResult<()> = conn.hdel(PARKED_KEY, field).await;
         Ok(())
     }
 
     /// Move an expired pending mint out of the retry path into the parked
     /// hash. Sequential `HSET` + `HDEL`: a crash between the two leaves a
     /// duplicate parked copy, which is harmless (the live entry just gets
-    /// parked again next tick).
+    /// parked again next tick). Racing a concurrent confirming [`Self::remove`]
+    /// is also harmless: whichever runs last wins, and `remove` always clears
+    /// both hashes — so a mint that lands on-chain right as it's being parked
+    /// still ends up fully cleared, never stuck showing "unresolved" forever.
     ///
     /// # Errors
     /// Returns an error if either Redis command fails (caller keeps the entry

@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use aggregator_core::models::{DeviceMetrics, DeviceReading, DeviceType};
 use aggregator_persistence::infra::influxdb::{InfluxWriter, TelemetryPoint};
+use aggregator_persistence::infra::pg_readings::{PgReadingsWriter, ReadingRow};
 
 /// Default maximum number of entries per Redis stream.
 const DEFAULT_MAX_STREAM_LEN: usize = 100_000;
@@ -76,6 +77,10 @@ pub struct Router {
     /// DeviceReading is AES-256-GCM sealed before XADD (the in-process zone
     /// ingester decrypts); when None, payloads are written in the clear.
     stream_cipher: Option<Arc<aggregator_persistence::infra::stream_cipher::StreamCipher>>,
+    /// Optional Postgres `meter_readings` sink so the dashboard (meter-service,
+    /// read-only) can list Recent Readings. Fire-and-forget; owner+wallet
+    /// resolved inside the INSERT. None ⇒ disabled (default).
+    pg_readings: Option<Arc<PgReadingsWriter>>,
 }
 
 impl Router {
@@ -102,6 +107,7 @@ impl Router {
             num_zones,
             influx,
             stream_cipher: None,
+            pg_readings: None,
         })
     }
 
@@ -111,6 +117,12 @@ impl Router {
         cipher: Option<Arc<aggregator_persistence::infra::stream_cipher::StreamCipher>>,
     ) -> Self {
         self.stream_cipher = cipher;
+        self
+    }
+
+    /// Attach the optional Postgres `meter_readings` sink (dashboard history).
+    pub fn with_pg_readings(mut self, writer: Option<Arc<PgReadingsWriter>>) -> Self {
+        self.pg_readings = writer;
         self
     }
 
@@ -232,6 +244,15 @@ impl Router {
             }
         }
 
+        // Mirror energy readings into the shared Postgres `meter_readings` table
+        // so the dashboard's Recent Readings list is populated (owner+wallet
+        // resolved inside the INSERT). Same fire-and-forget contract as InfluxDB.
+        if let Some(pg) = &self.pg_readings {
+            if let Some(row) = reading_to_row(reading) {
+                pg.record(row);
+            }
+        }
+
         // Surplus minting is NOT done here. Readings are persisted (Redis zone +
         // unified streams, InfluxDB); the on-chain mint happens in the settlement
         // sink when a 15-min billing window closes with net surplus, via the
@@ -348,6 +369,35 @@ fn reading_to_point(reading: &DeviceReading) -> Option<TelemetryPoint> {
         extra_tags,
         fields,
         timestamp_ns,
+    })
+}
+
+/// Map a `DeviceReading` into a Postgres `meter_readings` row.
+///
+/// Only smart-meter **energy** readings are mirrored (EV/battery have no place in
+/// the meter dashboard's energy history). `voltage`/`power_factor`/`frequency` are
+/// pulled from the decoded OBIS metadata when present. Returns `None` for
+/// non-energy metrics so nothing is written for them.
+fn reading_to_row(reading: &DeviceReading) -> Option<ReadingRow> {
+    let DeviceMetrics::Energy {
+        generated_kwh,
+        consumed_kwh,
+        net_kwh,
+    } = &reading.metrics
+    else {
+        return None;
+    };
+    let meta = |name: &str| reading.metadata.get(name).and_then(serde_json::Value::as_f64);
+    Some(ReadingRow {
+        serial_number: reading.serial_number.clone(),
+        timestamp_ms: reading.timestamp.timestamp_millis(),
+        generated_kwh: *generated_kwh,
+        consumed_kwh: *consumed_kwh,
+        surplus_kwh: net_kwh.max(0.0),
+        deficit_kwh: (-net_kwh).max(0.0),
+        voltage: meta("voltage_l1_v"),
+        power_factor: meta("power_factor"),
+        frequency: meta("frequency_hz"),
     })
 }
 
