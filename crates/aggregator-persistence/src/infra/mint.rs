@@ -30,9 +30,12 @@ use gridtokenx_blockchain_types::nats_schema::{
     BatchMintItem, EnvelopeAuth, MintEnergyBatchMessage, MintEnergyMessage,
 };
 
-// Test-only: signing/verify primitives used by the golden-vector + roundtrip tests.
+// Test-only: signing/verify primitives + the scheme tag, used by the
+// golden-vector + roundtrip tests that guard the shared wire scheme.
 #[cfg(test)]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+#[cfg(test)]
+use gridtokenx_blockchain_types::envelope_auth::ENVELOPE_AUTH_SCHEME_V1;
 #[cfg(test)]
 use p256::ecdsa::{Signature, SigningKey};
 
@@ -780,7 +783,8 @@ mod tests {
             auth: None,
         };
         let bytes = canonical_mint_bytes(&msg);
-        let mut expected_prefix = DOMAIN_TAG.to_vec();
+        // Domain tag is private to -types; assert the literal wire prefix here.
+        let mut expected_prefix = b"gridtokenx-nats-envelope-v1\0".to_vec();
         expected_prefix.extend_from_slice(b"mint");
         expected_prefix.push(0);
         assert!(

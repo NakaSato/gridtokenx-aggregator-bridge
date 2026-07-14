@@ -7,6 +7,10 @@ description = "GridTokenX Aggregator Bridge - persistence & external adapters (s
 [dependencies]
 aggregator-protocol = { path = "../aggregator-protocol" }
 gridtokenx-telemetry = { path = "../../../gridtokenx-telemetry" }
+# Light shared wire-types + envelope-auth signing scheme — single source of truth
+# with the Chain Bridge verifier (replaces the former byte-for-byte local mirror in
+# infra/mint.rs). Stays chain-light: this crate carries no tonic/NATS/SPL/Solana.
+gridtokenx-blockchain-types = { path = "../../../gridtokenx-blockchain-core/crates/blockchain-types" }
 
 # Async runtime
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "time", "sync"] }
@@ -46,9 +50,9 @@ http = "1.0.0"
 ed25519-dalek = "2.1"
 bs58 = "0.5"
 hex = "0.4.3"
-# NATS envelope auth — sign mint intents with the mTLS client key (P-256/ECDSA,
-# SEC1 PEM from gen-certs.sh). Mirrors gridtokenx-blockchain-core's envelope_auth
-# scheme locally so the aggregator stays chain-light (no blockchain-core dep).
+# P-256/ECDSA + base64 — now only exercised by mint.rs's golden-vector + signed
+# roundtrip tests (the runtime signing moved into gridtokenx-blockchain-types's
+# EnvelopeSigner). Kept as regular deps since the test cfg lives in this crate.
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 base64 = "0.22"
 # AES-256-GCM for at-rest encryption of Redis stream payloads (StreamCipher).
