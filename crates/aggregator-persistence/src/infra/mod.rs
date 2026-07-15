@@ -3,6 +3,7 @@ pub mod influxdb;
 pub mod kafka;
 pub mod meter_registry;
 pub mod mint;
+pub mod owner_read_model;
 pub mod pg_readings;
 pub mod platform;
 pub mod rabbitmq;

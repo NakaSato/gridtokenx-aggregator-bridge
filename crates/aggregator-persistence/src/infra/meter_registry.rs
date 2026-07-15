@@ -114,6 +114,14 @@ impl MeterRegistry {
             Some(p) => p,
             None => return Ok(None),
         };
+        // TODO(db-split): this JOINs IAM-owned `users` (u.wallet_address) — a
+        // cross-domain read DB-per-service forbids (Phase 2, docs/db-split-phase2.md).
+        // After cutover to gridtokenx_meter, read (user_id, wallet_address) from the
+        // local `meter_owner_read_model` table instead:
+        //   SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1
+        // The read-model is fed by IAM user.wallet.* NATS events + first-boot backfill,
+        // and is the durable form of the Redis owner cache backfilled below.
+        // Do NOT remove this JOIN until the read-model is populated + verified.
         let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
             "SELECT m.user_id, u.wallet_address \
              FROM meters m JOIN users u ON u.id = m.user_id \

@@ -209,6 +209,11 @@ async fn main() -> Result<()> {
     let pg_readings_writer =
         infra::pg_readings::PgReadingsWriter::start(pg_pool.clone()).map(Arc::new);
 
+    // DB-per-service Phase 2: clone the pool for the (default-OFF) owner/wallet
+    // read-model feed before the pool moves into MeterRegistry below. The feed is
+    // spawned after the shutdown token exists (gated on AGGREGATOR_OWNER_READMODEL_FEED).
+    let owner_readmodel_pool = pg_pool.clone();
+
     let meter_registry = Arc::new(infra::meter_registry::MeterRegistry::new(
         early_redis_conn.clone(),
         pg_pool,
@@ -322,6 +327,18 @@ async fn main() -> Result<()> {
 
     // Lifecycle coordination
     let shutdown_token = CancellationToken::new();
+
+    // DB-per-service Phase 2 — owner/wallet read-model feed (default OFF).
+    // When AGGREGATOR_OWNER_READMODEL_FEED is enabled: run the one-time backfill,
+    // then spawn a Kafka consumer (mirrors the dispatch listener) that keeps the
+    // local `meter_owner_read_model` table current from meter + IAM wallet events.
+    // Gated on the SAME CancellationToken as the other background tasks. Does NOT
+    // touch the existing `meters ⋈ users` reads — that swap is the cutover step.
+    infra::owner_read_model::spawn_owner_readmodel_feed(
+        owner_readmodel_pool,
+        shutdown_token.clone().cancelled_owned(),
+    )
+    .await;
 
     // Run zone ingester in background if initialized
     if let Some(zi) = zone_ingester {

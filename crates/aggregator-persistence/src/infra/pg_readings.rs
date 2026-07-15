@@ -178,6 +178,12 @@ async fn insert_batch(pool: &PgPool, rows: &[ReadingRow]) -> Result<(), sqlx::Er
     let power_factor: Vec<Option<f64>> = rows.iter().map(|r| r.power_factor).collect();
     let frequency: Vec<Option<f64>> = rows.iter().map(|r| r.frequency).collect();
 
+    // TODO(db-split): this INSERT…SELECT JOINs IAM-owned `users` (u.wallet_address)
+    // to fill wallet_address — a cross-domain read that DB-per-service forbids
+    // (Phase 2, docs/db-split-phase2.md). Once cutover to gridtokenx_meter lands,
+    // resolve wallet from the local `meter_owner_read_model` table (or pass the
+    // already-resolved wallet down from MeterRegistry) and drop the `JOIN users u`.
+    // Do NOT remove the JOIN until the read-model is populated + verified.
     sqlx::query(
         r#"
         INSERT INTO meter_readings
