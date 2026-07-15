@@ -31,7 +31,7 @@ metrics = "0.24"
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 # Durable meter-owner lookup (shared gridtokenx Postgres `meters` JOIN `users`).
 # Runtime-checked queries only (no macros) — no DATABASE_URL/.sqlx needed to build.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "macros", "migrate"] }
 rdkafka = { version = "0.37", features = ["zstd"] }
 lapin = "2.5"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }

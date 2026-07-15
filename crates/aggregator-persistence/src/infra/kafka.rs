@@ -6,8 +6,19 @@ use rdkafka::{
     ClientConfig,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tracing::info;
+use tokio::sync::RwLock;
+use tracing::{error, info, warn};
+
+/// After this many *consecutive* delivery failures the long-lived producer is
+/// assumed to be sitting on a black-holed socket (the classic stale-socket
+/// wedge: broker healthy, a fresh producer publishes fine, but this one 100%
+/// `MessageTimedOut` forever). `socket.keepalive.enable` only reconnects on the
+/// OS keepalive interval (~2h idle on Linux), far too slow — so we proactively
+/// rebuild the client. At the sim's ~20k reads/30min this threshold trips a few
+/// seconds into a wedge, not on a transient blip.
+const REBUILD_AFTER_FAILURES: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeterReadingEvent {
@@ -32,13 +43,19 @@ pub struct GridStatusEvent {
 }
 
 pub struct AggregatorKafkaProducer {
-    producer: FutureProducer,
+    // Behind a lock so a wedged client can be swapped for a fresh one at
+    // runtime (`maybe_rebuild`). Reads clone the `FutureProducer` (a cheap
+    // Arc) and release the lock *before* the send await, so a 30s
+    // `message.timeout.ms` stall never blocks the rebuild's write lock.
+    producer: RwLock<FutureProducer>,
+    bootstrap_servers: String,
     topic: String,
+    consecutive_failures: AtomicU32,
 }
 
 impl AggregatorKafkaProducer {
-    pub fn new(bootstrap_servers: &str, topic: &str) -> Result<Self> {
-        let producer: FutureProducer = ClientConfig::new()
+    fn build(bootstrap_servers: &str) -> Result<FutureProducer> {
+        ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
             // Detect dead/black-holed peers. Without TCP keepalive (librdkafka
             // default OFF), a connection silently dropped by the broker's idle
@@ -57,14 +74,58 @@ impl AggregatorKafkaProducer {
             .set("reconnect.backoff.ms", "500")
             .set("reconnect.backoff.max.ms", "10000")
             .set("acks", "all")
-            .create()?;
+            .create()
+            .map_err(|e| anyhow!("Kafka producer create failed: {:?}", e))
+    }
+
+    pub fn new(bootstrap_servers: &str, topic: &str) -> Result<Self> {
+        let producer = Self::build(bootstrap_servers)?;
 
         info!("✅ Kafka Producer initialized for topic: {}", topic);
 
         Ok(Self {
-            producer,
+            producer: RwLock::new(producer),
+            bootstrap_servers: bootstrap_servers.to_string(),
             topic: topic.to_string(),
+            consecutive_failures: AtomicU32::new(0),
         })
+    }
+
+    /// A successful delivery clears the wedge counter.
+    fn mark_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Count a delivery failure and, once the run of failures crosses the
+    /// threshold, swap in a fresh producer to recover from a stale/black-holed
+    /// socket that librdkafka's own keepalive/reconnect hasn't torn down.
+    async fn mark_failure_and_maybe_rebuild(&self) {
+        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if n < REBUILD_AFTER_FAILURES {
+            return;
+        }
+        // Only one task rebuilds at a time. `try_write` almost always succeeds
+        // here because senders hold the read lock only long enough to clone the
+        // Arc, never across the send await; if another task is already
+        // rebuilding, skip and let it finish.
+        let Ok(mut guard) = self.producer.try_write() else {
+            return;
+        };
+        // Re-check under the lock: a concurrent rebuild may have just reset it.
+        if self.consecutive_failures.load(Ordering::Relaxed) < REBUILD_AFTER_FAILURES {
+            return;
+        }
+        match Self::build(&self.bootstrap_servers) {
+            Ok(fresh) => {
+                *guard = fresh;
+                self.consecutive_failures.store(0, Ordering::Relaxed);
+                warn!(
+                    "♻️ Kafka producer rebuilt after {} consecutive delivery failures (stale-socket recovery)",
+                    n
+                );
+            }
+            Err(e) => error!("Kafka producer rebuild failed, will retry: {:?}", e),
+        }
     }
 
     pub async fn publish_meter_reading(&self, reading: &MeterReadingEvent) -> Result<()> {
@@ -86,12 +147,19 @@ impl AggregatorKafkaProducer {
                     }),
             );
 
-        self.producer
-            .send(record, Duration::from_secs(5))
-            .await
-            .map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
-
-        Ok(())
+        // Clone the client out of the lock, then send — the lock is not held
+        // across the await.
+        let producer = self.producer.read().await.clone();
+        match producer.send(record, Duration::from_secs(5)).await {
+            Ok(_) => {
+                self.mark_success();
+                Ok(())
+            }
+            Err((e, _)) => {
+                self.mark_failure_and_maybe_rebuild().await;
+                Err(anyhow!("Kafka send error: {:?}", e))
+            }
+        }
     }
 
     /// Publish a grid status event to the given topic (the producer's default
@@ -100,12 +168,17 @@ impl AggregatorKafkaProducer {
         let payload = serde_json::to_string(event)?;
         let record = FutureRecord::to(topic).key("grid_status").payload(&payload);
 
-        self.producer
-            .send(record, Duration::from_secs(5))
-            .await
-            .map_err(|(e, _)| anyhow::anyhow!("Kafka send error: {:?}", e))?;
-
-        Ok(())
+        let producer = self.producer.read().await.clone();
+        match producer.send(record, Duration::from_secs(5)).await {
+            Ok(_) => {
+                self.mark_success();
+                Ok(())
+            }
+            Err((e, _)) => {
+                self.mark_failure_and_maybe_rebuild().await;
+                Err(anyhow!("Kafka send error: {:?}", e))
+            }
+        }
     }
 }
 
@@ -206,6 +279,44 @@ mod tests {
         let e: GridStatusEvent = serde_json::from_slice(bytes).unwrap();
         assert_eq!(e.frequency, 49.9);
         assert_eq!(e.timestamp, 42);
+    }
+
+    #[tokio::test]
+    async fn producer_starts_with_zero_failures() {
+        let p = AggregatorKafkaProducer::new("localhost:29001", "t").expect("producer");
+        assert_eq!(p.consecutive_failures.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn failure_run_rebuilds_and_resets_counter() {
+        // No broker needed: `build`/`create` connect lazily, so the rebuild at
+        // the threshold succeeds offline and resets the counter to 0.
+        let p = AggregatorKafkaProducer::new("localhost:29001", "t").expect("producer");
+        for _ in 0..(REBUILD_AFTER_FAILURES - 1) {
+            p.mark_failure_and_maybe_rebuild().await;
+        }
+        assert_eq!(
+            p.consecutive_failures.load(Ordering::Relaxed),
+            REBUILD_AFTER_FAILURES - 1,
+            "below threshold: no rebuild yet"
+        );
+        // The Nth failure crosses the threshold → rebuild → counter reset.
+        p.mark_failure_and_maybe_rebuild().await;
+        assert_eq!(
+            p.consecutive_failures.load(Ordering::Relaxed),
+            0,
+            "threshold failure triggers rebuild and resets counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn success_clears_failure_run() {
+        let p = AggregatorKafkaProducer::new("localhost:29001", "t").expect("producer");
+        p.mark_failure_and_maybe_rebuild().await;
+        p.mark_failure_and_maybe_rebuild().await;
+        assert_eq!(p.consecutive_failures.load(Ordering::Relaxed), 2);
+        p.mark_success();
+        assert_eq!(p.consecutive_failures.load(Ordering::Relaxed), 0);
     }
 
     #[test]

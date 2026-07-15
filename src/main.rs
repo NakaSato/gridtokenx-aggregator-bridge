@@ -181,9 +181,24 @@ async fn main() -> Result<()> {
     // by the meter-service registration API. The MeterRegistry uses it as tier-3
     // (after local cache + Redis) and backfills Redis on a hit. Degraded-safe like
     // every other edge here: unreachable at boot ⇒ warn + None (Redis-only).
-    let database_url = expand_env(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx".to_string()
-    }));
+    //
+    // DB-per-service Phase 2 (docs/db-split-phase2.md §5): prefer the dedicated
+    // metering DB `gridtokenx_meter` when METER_DATABASE_URL is set — the
+    // aggregator owns it and applies its own migrations at boot. Falls back to the
+    // shared DATABASE_URL (no migrations there; IAM owns that ledger).
+    //
+    // ORDERING: do NOT point METER_DATABASE_URL at gridtokenx_meter in production
+    // until the foreign-read swap (§5 step 4) lands — the meter⋈users owner read
+    // still needs the shared DB until MeterRegistry reads meter_owner_read_model.
+    let (database_url, own_meter_db) = match std::env::var("METER_DATABASE_URL") {
+        Ok(u) if !u.trim().is_empty() => (expand_env(&u), true),
+        _ => (
+            expand_env(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+                "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx".to_string()
+            })),
+            false,
+        ),
+    };
     let pg_pool = match tokio::time::timeout(
         std::time::Duration::from_secs(3),
         sqlx::postgres::PgPoolOptions::new()
@@ -194,7 +209,17 @@ async fn main() -> Result<()> {
     .await
     {
         Ok(Ok(pool)) => {
-            info!("🔗 Postgres meter-owner registry: connected");
+            if own_meter_db {
+                info!("🔗 Postgres metering DB (gridtokenx_meter, own): connected");
+                // Own DB ⇒ own migration runner. Degrade-safe: a migration failure
+                // is loud but non-fatal (DB tier may be incomplete, Redis still serves).
+                match infra::db::run_migrations(&pool).await {
+                    Ok(()) => info!("🗄️ metering DB migrations applied"),
+                    Err(e) => warn!("⚠️ metering DB migration failed ({e}); DB tier may be incomplete"),
+                }
+            } else {
+                info!("🔗 Postgres meter-owner registry (shared DATABASE_URL): connected");
+            }
             Some(pool)
         }
         _ => {
@@ -542,6 +567,44 @@ async fn main() -> Result<()> {
                             let mut handoff = MintHandoff::NotApplicable;
                             match aggregator_api::billing_sink::plan_mint(bin, settle_mint.is_enabled()) {
                                 aggregator_api::billing_sink::MintDecision::Surplus(kwh) => {
+                                    // Gate: only enqueue a surplus mint when the meter has a
+                                    // resolvable OWNER. A meter unknown to meters/users/Redis
+                                    // (e.g. the synthetic sim fleet emitting device-UUID serials)
+                                    // has no wallet to ever credit — enqueuing just bloats the
+                                    // outbox with entries that defer forever until the 7-day park.
+                                    // A KNOWN owner whose wallet isn't set yet is still enqueued
+                                    // (resolve_wallet runs fresh per attempt, so the legit
+                                    // registers-later case mints on a later retry); a lookup
+                                    // ERROR enqueues too — a transient DB blip must not drop
+                                    // surplus. When unknown, `handoff` stays NotApplicable so the
+                                    // bin still evicts below (nothing is retried, nothing leaks).
+                                    let owner_known = match settle_registry
+                                        .resolve_user_id(&bin.meter_serial)
+                                        .await
+                                    {
+                                        Ok(Some(_)) => true,
+                                        Ok(None) => {
+                                            metrics::record_mint_outcome(
+                                                "skipped",
+                                                "unattributed_meter",
+                                            );
+                                            warn!(
+                                                "surplus mint skipped: meter {} has no registered owner (window {} {:.6} kWh) — bin evicted, not enqueued",
+                                                bin.meter_serial,
+                                                bin.window_start_ms(),
+                                                kwh
+                                            );
+                                            false
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "owner lookup failed for meter {} ({e}); enqueuing surplus for durable retry",
+                                                bin.meter_serial
+                                            );
+                                            true
+                                        }
+                                    };
+                                    if owner_known {
                                     let pending = aggregator_api::mint_outbox::PendingMint::new(
                                         bin.meter_serial.clone(),
                                         bin.meter_id,
@@ -647,6 +710,7 @@ async fn main() -> Result<()> {
                                                 }
                                             });
                                         }
+                                    }
                                     }
                                 }
                                 aggregator_api::billing_sink::MintDecision::NoSurplus => {
@@ -1416,8 +1480,11 @@ mod tests {
         // All files exist but contain no PEM key ⇒ "no private key" Err.
         let cert = tmp_file("garbage_cert.pem", b"garbage\n");
         let key = tmp_file("garbage_key.pem", b"also garbage\n");
-        let r =
-            build_mtls_server_config(cert.to_str().unwrap(), key.to_str().unwrap(), cert.to_str().unwrap());
+        let r = build_mtls_server_config(
+            cert.to_str().unwrap(),
+            key.to_str().unwrap(),
+            cert.to_str().unwrap(),
+        );
         let _ = std::fs::remove_file(&cert);
         let _ = std::fs::remove_file(&key);
         assert!(r.is_err(), "no parseable private key must Err");

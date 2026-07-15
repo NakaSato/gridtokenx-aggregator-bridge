@@ -192,17 +192,25 @@ before finalizing which set owns `meters`.
 
 1. Create the physical `gridtokenx_meter` DB + a least-privilege role; add the pgdog
    `[[databases]]` route (mirroring the `gridtokenx_noti` reference model).
-2. Apply `migrations/` to `gridtokenx_meter` (decide runner: sqlx-cli / psql — the aggregator
-   does not run migrations at boot today).
+2. ~~Apply `migrations/` to `gridtokenx_meter` (decide runner)~~ **DONE — boot-time runner.**
+   `infra::db` (`crates/aggregator-persistence/src/infra/db.rs`) embeds `migrations/` via
+   `sqlx::migrate!` and applies them at boot **when `METER_DATABASE_URL` is set** (its own
+   `_sqlx_migrations` ledger; sqlx advisory-locked, so replica-safe). Idempotent + degrade-safe
+   (migration failure ⇒ loud `warn!`, non-fatal). Never runs against the shared `DATABASE_URL`
+   (would collide with IAM's ledger). Verified by `crates/aggregator-persistence/tests/meter_db_migrations.rs`
+   (all 6 migrations apply to a fresh `gridtokenx_meter` + idempotent + schema present) — gated on
+   `METER_TEST_DATABASE_URL`.
 3. Backfill `meter_owner_read_model` from a snapshot (§3) and stand up the IAM (+meter-service)
    NATS consumer that maintains it.
 4. Swap the two foreign reads (`pg_readings.rs`, `meter_registry.rs`) to the local read-model;
    remove the `JOIN users` (and, under recommendation B, the `JOIN meters`).
 5. Optional dual-write/verify window: keep writing the old shared `meter_readings` while the new
    DB is validated.
-6. Flip `AGGREGATOR_PG_READINGS` target + `DATABASE_URL` (or a dedicated `METER_DATABASE_URL`) to
-   `gridtokenx_meter`. Verify the ingest → owner-resolve → zone-stream → 15-min bin → surplus-mint
-   hops (`just` / telemetry-hops).
+6. Set **`METER_DATABASE_URL`** to `gridtokenx_meter` (the seam is wired: when set, the aggregator
+   uses it as the metering pool AND runs its migrations at boot; unset ⇒ legacy shared `DATABASE_URL`,
+   no migrations). **Do this only AFTER step 4** — until the read-model swap lands, the meter⋈users
+   owner read still needs the shared DB. Verify the ingest → owner-resolve → zone-stream → 15-min bin
+   → surplus-mint hops (`just` / telemetry-hops).
 7. Update `ARCHITECTURE.md` topology and resolve §4 ownership of `meters` in the parent plan.
 8. Rollback: flip the env back to `gridtokenx`; no source table is dropped until the new DB
    passes e2e.

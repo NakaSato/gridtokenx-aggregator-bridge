@@ -138,6 +138,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
+ "gridtokenx-blockchain-types",
  "gridtokenx-telemetry",
  "hex",
  "http 1.4.0",
@@ -1979,6 +1980,19 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "gridtokenx-blockchain-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.21.7",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2",
  "tracing",
 ]
 
