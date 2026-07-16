@@ -99,14 +99,24 @@ impl OwnerReadModel {
     /// SAME function the `meters` unique index uses — so a serial written here
     /// resolves identically to a `meters` lookup (no dash/case-variant split).
     ///
-    /// Last-writer-wins: `updated_at` is stamped `now()` on every write. On a
-    /// conflict the `user_id` is refreshed, but the wallet is only overwritten by
-    /// a **non-null** event wallet (`COALESCE(EXCLUDED, existing)`): meter events
-    /// often carry no wallet (a meter registered before/without a wallet — see
-    /// docs §3), and blanking a wallet already set by an authoritative IAM user
-    /// event would regress it. Clearing a wallet is done via the user-event path
-    /// ([`update_wallet_by_user`](Self::update_wallet_by_user)), which is the
-    /// authoritative wallet source.
+    /// The wallet on a meter event is a **stale registration-time snapshot** — it
+    /// is set once at `MeterRegistered` (from the owner's wallet at that instant)
+    /// and never re-emitted, while IAM is the authoritative source and updates the
+    /// primary via `update_wallet_by_user`. Meter and IAM events ride separate
+    /// topics with different partition keys, so there is NO cross-stream ordering:
+    /// a Kafka redelivery (or the first-boot `earliest` replay) of an old
+    /// `MeterRegistered` could arrive after IAM already moved the primary.
+    ///
+    /// So the wallet merge is **owner-aware**, not a blind `COALESCE`:
+    /// - **same owner** — IAM's wallet wins; the meter event only *fills an absent*
+    ///   wallet (`COALESCE(existing, EXCLUDED)`), never overrides a set one. This is
+    ///   what stops a stale meter redelivery from reverting the IAM primary and
+    ///   misdirecting a surplus mint to the wallet the user moved away from.
+    /// - **owner changed** (re-registration to a different `user_id`) — take the
+    ///   event's fresh snapshot; the previous owner's wallet is wrong for the new one.
+    ///
+    /// The `user_id` edge is always refreshed. Authoritative wallet writes / clears
+    /// flow through the user-event path ([`update_wallet_by_user`](Self::update_wallet_by_user)).
     pub async fn upsert_by_serial(
         &self,
         serial: &str,
@@ -119,7 +129,13 @@ impl OwnerReadModel {
             VALUES (canonicalize_meter_serial($1), $2, $3, now())
             ON CONFLICT (serial_number) DO UPDATE
             SET user_id        = EXCLUDED.user_id,
-                wallet_address = COALESCE(EXCLUDED.wallet_address, meter_owner_read_model.wallet_address),
+                wallet_address = CASE
+                    WHEN meter_owner_read_model.user_id = EXCLUDED.user_id
+                        -- same owner: IAM wallet authoritative; meter event fills only
+                        THEN COALESCE(meter_owner_read_model.wallet_address, EXCLUDED.wallet_address)
+                    -- owner changed: the old owner's wallet is stale for the new owner
+                    ELSE EXCLUDED.wallet_address
+                END,
                 updated_at     = now()
             "#,
         )

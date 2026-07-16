@@ -65,10 +65,43 @@ async fn upsert_by_serial_is_last_writer_wins_and_preserves_wallet() {
         "meter event without wallet must preserve the existing wallet"
     );
 
-    // A new owner + new wallet overwrites both (last-writer-wins on user_id, and a
-    // non-null event wallet does replace).
+    // Owner CHANGE (re-registration to a different user): take the event's fresh
+    // snapshot — the previous owner's wallet is wrong for the new owner.
     repo.upsert_by_serial("OWNREPO-1", u2, Some("W2")).await.unwrap();
     assert_eq!(row(&pool, "OWNREPO-1").await, Some((u2, Some("W2".to_string()))));
+}
+
+#[tokio::test]
+async fn stale_meter_redelivery_does_not_regress_iam_wallet() {
+    // Fund-misdirection regression: a meter event carries a STALE registration-time
+    // wallet snapshot (never re-emitted). A Kafka redelivery of the old
+    // MeterRegistered after IAM moved the primary must NOT revert the read-model
+    // wallet — else the surplus mint credits the wallet the user moved away from.
+    let Some(url) = test_url() else {
+        eprintln!("SKIP stale_meter_redelivery_does_not_regress_iam_wallet: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-REG"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let owner = Uuid::new_v4();
+
+    // Meter registered with the owner's then-current wallet W1.
+    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1")).await.unwrap();
+    // IAM moves the primary to W2 (the authoritative user-event path).
+    assert_eq!(repo.update_wallet_by_user(owner, Some("W2")).await.unwrap(), 1);
+    assert_eq!(row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(), Some("W2"));
+
+    // Kafka redelivers the ORIGINAL MeterRegistered(W1) for the SAME owner.
+    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1")).await.unwrap();
+    assert_eq!(
+        row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(),
+        Some("W2"),
+        "stale meter redelivery must not regress the IAM-set primary wallet"
+    );
+
+    // But a first-touch fill (no wallet yet) still works: fresh serial, no IAM event.
+    repo.upsert_by_serial("OWNREPO-REG", owner, None).await.unwrap(); // same owner, no wallet ⇒ keep W2
+    assert_eq!(row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(), Some("W2"));
 }
 
 #[tokio::test]
