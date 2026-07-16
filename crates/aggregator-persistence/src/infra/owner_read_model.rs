@@ -349,10 +349,17 @@ pub async fn spawn_owner_readmodel_feed(
     // First-boot backfill (idempotent, ON CONFLICT DO NOTHING). A failure here is
     // non-fatal: the live event feed + the lazy per-serial DB re-resolve keep the
     // model current, so log and continue rather than abort the feed.
+    //
+    // SCOPE: this seeds from `meters ⋈ users` on THIS pool. It only succeeds while
+    // the pool still points at the shared DB (pre-cutover / dual-write window).
+    // On the dedicated `gridtokenx_meter` DB there is no IAM `users` table, so the
+    // backfill errors (logged, non-fatal) and the read-model is seeded by event
+    // replay instead — a cross-DB seed (old shared DB → new metering DB) is the
+    // cutover tooling's job, not this single-pool runtime path (docs §3 option 1/2).
     match repo.backfill().await {
         Ok(n) => info!("📥 Owner read-model backfilled {n} row(s) from meters ⋈ users"),
         Err(e) => warn!(
-            "⚠️ Owner read-model backfill failed ({e}); feed continues (events + lazy re-resolve)"
+            "⚠️ Owner read-model backfill skipped/failed ({e}); feed continues (events + lazy re-resolve)"
         ),
     }
 

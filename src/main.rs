@@ -232,17 +232,17 @@ async fn main() -> Result<()> {
     // from the same pool the registry uses (PgPool is an Arc); gated on
     // AGGREGATOR_PG_READINGS. Built before the pool moves into MeterRegistry.
     let pg_readings_writer =
-        infra::pg_readings::PgReadingsWriter::start(pg_pool.clone()).map(Arc::new);
+        infra::pg_readings::PgReadingsWriter::start(pg_pool.clone(), own_meter_db).map(Arc::new);
 
     // DB-per-service Phase 2: clone the pool for the (default-OFF) owner/wallet
     // read-model feed before the pool moves into MeterRegistry below. The feed is
     // spawned after the shutdown token exists (gated on AGGREGATOR_OWNER_READMODEL_FEED).
     let owner_readmodel_pool = pg_pool.clone();
 
-    let meter_registry = Arc::new(infra::meter_registry::MeterRegistry::new(
-        early_redis_conn.clone(),
-        pg_pool,
-    ));
+    let meter_registry = Arc::new(
+        infra::meter_registry::MeterRegistry::new(early_redis_conn.clone(), pg_pool)
+            .with_read_model(own_meter_db),
+    );
 
     // 4c. Durable billing-bin store (crash recovery of in-flight 15-min windows).
     // Enabled when Redis is reachable AND DURABLE_BINS != "false" (default on).

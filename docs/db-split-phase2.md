@@ -200,10 +200,27 @@ before finalizing which set owns `meters`.
    (would collide with IAM's ledger). Verified by `crates/aggregator-persistence/tests/meter_db_migrations.rs`
    (all 6 migrations apply to a fresh `gridtokenx_meter` + idempotent + schema present) — gated on
    `METER_TEST_DATABASE_URL`.
-3. Backfill `meter_owner_read_model` from a snapshot (§3) and stand up the IAM (+meter-service)
-   NATS consumer that maintains it.
-4. Swap the two foreign reads (`pg_readings.rs`, `meter_registry.rs`) to the local read-model;
-   remove the `JOIN users` (and, under recommendation B, the `JOIN meters`).
+3. **Feed machinery DONE + verified; live backfill + wiring remain.** `infra::owner_read_model`
+   (`OwnerReadModel` repo + `OwnerReadModelConsumer` Kafka feed + `spawn_owner_readmodel_feed` gate,
+   `AGGREGATOR_OWNER_READMODEL_FEED`) is built and wired in `main.rs`. Write semantics verified live
+   (`tests/owner_read_model_repo.rs`): upsert last-writer-wins + wallet COALESCE-preserve on meter
+   events, authoritative wallet set/clear on user events, cross-user isolation. **Still open:** stand
+   up the IAM/meter-service event producers on the subscribed topics, and the **first-boot backfill**
+   — `OwnerReadModel::backfill` seeds from `meters ⋈ users` on its OWN pool, so it only works while
+   that pool is the shared DB; seeding the dedicated `gridtokenx_meter` from the old shared DB is a
+   **cross-DB** one-shot (cutover tooling), not the single-pool runtime path. On the dedicated DB the
+   read-model is otherwise seeded by event replay + lazy per-serial re-resolve.
+4. ~~Swap the two foreign reads to the local read-model~~ **DONE — flag-gated (not deleted).**
+   Both foreign reads now branch on `own_meter_db` (`METER_DATABASE_URL` set): on the dedicated
+   metering DB they read `meter_owner_read_model` (recommendation B — drops BOTH the `users` and
+   `meters` JOINs); on the legacy shared DB they keep `meters ⋈ users` unchanged (the plan's "don't
+   delete the source read until the read-model is verified" rule — the JOIN is the fallback, not
+   removed). Sites: `meter_registry.rs::fetch_owner_from_db` (via `MeterRegistry::with_read_model`)
+   and `pg_readings.rs::insert_batch` (via `PgReadingsWriter::start(pool, use_read_model)`). Verified
+   by `tests/meter_db_migrations.rs::owner_resolves_from_read_model_without_cross_domain_join` (owner
+   + wallet resolve from the read-model on a metering DB that has no `users` table — the legacy JOIN
+   path errors there, proving the read-model does the work). **Still requires** the read-model to be
+   populated (step 3 feed/backfill) before flipping `METER_DATABASE_URL` in prod.
 5. Optional dual-write/verify window: keep writing the old shared `meter_readings` while the new
    DB is validated.
 6. Set **`METER_DATABASE_URL`** to `gridtokenx_meter` (the seam is wired: when set, the aggregator

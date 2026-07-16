@@ -62,6 +62,11 @@ pub struct MeterRegistry {
     /// Entries expire after [`neg_cache_ttl`] and are dropped on a later positive
     /// resolution / registration.
     neg_cache: RwLock<HashMap<String, Instant>>,
+    /// DB-per-service Phase 2 (docs/db-split-phase2.md §3): when true the Postgres
+    /// tier reads the local `meter_owner_read_model` instead of the cross-domain
+    /// `meters ⋈ users` JOIN. Set on the dedicated `gridtokenx_meter` DB (which has
+    /// no IAM `users` table). Defaults false — legacy shared DB keeps the JOIN.
+    use_read_model: bool,
 }
 
 impl MeterRegistry {
@@ -72,7 +77,17 @@ impl MeterRegistry {
             local_cache: RwLock::new(HashMap::new()),
             wallet_cache: RwLock::new(HashMap::new()),
             neg_cache: RwLock::new(HashMap::new()),
+            use_read_model: false,
         }
+    }
+
+    /// Enable the local owner/wallet read-model as the Postgres tier (Phase 2).
+    /// Pass the aggregator's `own_meter_db` gate — true only when pointed at the
+    /// dedicated metering DB. Builder form so the many `new(None, None)` call sites
+    /// (tests) are unaffected.
+    pub fn with_read_model(mut self, on: bool) -> Self {
+        self.use_read_model = on;
+        self
     }
 
     /// True if `serial` has a live "not found" marker. Drops the entry when expired.
@@ -114,23 +129,24 @@ impl MeterRegistry {
             Some(p) => p,
             None => return Ok(None),
         };
-        // TODO(db-split): this JOINs IAM-owned `users` (u.wallet_address) — a
-        // cross-domain read DB-per-service forbids (Phase 2, docs/db-split-phase2.md).
-        // After cutover to gridtokenx_meter, read (user_id, wallet_address) from the
-        // local `meter_owner_read_model` table instead:
-        //   SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1
-        // The read-model is fed by IAM user.wallet.* NATS events + first-boot backfill,
-        // and is the durable form of the Redis owner cache backfilled below.
-        // Do NOT remove this JOIN until the read-model is populated + verified.
-        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(
+        // DB-per-service Phase 2 (docs/db-split-phase2.md §3): on the dedicated
+        // metering DB read the local `meter_owner_read_model` (no cross-domain
+        // read); on the legacy shared DB keep the `meters ⋈ users` JOIN (that DB
+        // has no read-model populated yet, and the plan forbids deleting the source
+        // read until the read-model is verified). The read-model is the durable
+        // form of the Redis owner cache, fed by IAM user.wallet.* events + backfill.
+        let query = if self.use_read_model {
+            "SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1"
+        } else {
             "SELECT m.user_id, u.wallet_address \
              FROM meters m JOIN users u ON u.id = m.user_id \
-             WHERE m.serial_number = $1",
-        )
-        .bind(meter_serial)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| anyhow!("Postgres owner lookup failed for {}: {}", meter_serial, e))?;
+             WHERE m.serial_number = $1"
+        };
+        let row: Option<(Uuid, Option<String>)> = sqlx::query_as(query)
+            .bind(meter_serial)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow!("Postgres owner lookup failed for {}: {}", meter_serial, e))?;
         Ok(row)
     }
 

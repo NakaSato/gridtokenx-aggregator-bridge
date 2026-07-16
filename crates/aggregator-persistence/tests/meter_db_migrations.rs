@@ -15,6 +15,7 @@
 //! ```
 
 use aggregator_persistence::infra::db;
+use aggregator_persistence::infra::meter_registry::MeterRegistry;
 
 fn test_url() -> Option<String> {
     std::env::var("METER_TEST_DATABASE_URL")
@@ -112,4 +113,55 @@ async fn metering_migrations_apply_and_schema_is_present() {
             .await
             .expect("call canonicalize_meter_serial");
     assert!(!canon.is_empty(), "canonicalize_meter_serial returns a value");
+}
+
+/// Phase-2 step 4: with the read-model flag ON, `MeterRegistry` resolves owner +
+/// wallet purely from the local `meter_owner_read_model` — no `meters ⋈ users`
+/// cross-domain read. Proven by the fact that the legacy JOIN path *cannot* run
+/// on this metering DB (it has no IAM `users` table), so a resolve there errors:
+/// only the read-model path can succeed.
+#[tokio::test]
+async fn owner_resolves_from_read_model_without_cross_domain_join() {
+    let Some(url) = test_url() else {
+        eprintln!("SKIP owner_resolves_from_read_model_without_cross_domain_join: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = db::connect_pool(&url).await.expect("connect");
+    db::run_migrations(&pool).await.expect("migrate"); // idempotent
+
+    const SERIAL: &str = "RM-TEST-0001";
+    const WALLET: &str = "So1anaWa11etAddr1111111111111111111111111111";
+    sqlx::query(
+        "INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
+         VALUES ($1, '11111111-1111-1111-1111-111111111111'::uuid, $2, now())
+         ON CONFLICT (serial_number)
+         DO UPDATE SET wallet_address = EXCLUDED.wallet_address, updated_at = now()",
+    )
+    .bind(SERIAL)
+    .bind(WALLET)
+    .execute(&pool)
+    .await
+    .expect("seed read-model");
+
+    // read-model ON: redis None + empty caches ⇒ the Postgres tier reads the
+    // local read-model. Resolves owner + wallet with zero cross-domain access.
+    let reg = MeterRegistry::new(None, Some(pool.clone())).with_read_model(true);
+    assert!(
+        reg.resolve_user_id(SERIAL).await.expect("resolve_user_id ok").is_some(),
+        "read-model must resolve the owner"
+    );
+    assert_eq!(
+        reg.resolve_wallet(SERIAL).await.expect("resolve_wallet ok").as_deref(),
+        Some(WALLET),
+        "read-model must resolve the wallet"
+    );
+
+    // read-model OFF: the legacy `meters ⋈ users` JOIN references the IAM `users`
+    // table, which does not exist on the metering DB → the query errors. This is
+    // the proof that the ON case above went through the read-model, not the JOIN.
+    let legacy = MeterRegistry::new(None, Some(pool)).with_read_model(false);
+    assert!(
+        legacy.resolve_user_id(SERIAL).await.is_err(),
+        "legacy JOIN path must error on the metering DB (no users table)"
+    );
 }

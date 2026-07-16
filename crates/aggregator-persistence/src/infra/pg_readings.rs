@@ -67,7 +67,10 @@ impl PgReadingsWriter {
     /// Returns `None` when the flag is unset/false or no pool is available —
     /// disabled-by-default, matching the InfluxDB sink. The pool is cloned from
     /// the one the `MeterRegistry` already uses (`PgPool` is an `Arc` internally).
-    pub fn start(pool: Option<PgPool>) -> Option<Self> {
+    /// `use_read_model` (the aggregator's `own_meter_db` gate) selects the owner
+    /// resolution the batch INSERT uses: the local `meter_owner_read_model` on the
+    /// dedicated metering DB, or the legacy `meters ⋈ users` JOIN on the shared DB.
+    pub fn start(pool: Option<PgPool>, use_read_model: bool) -> Option<Self> {
         let enabled = std::env::var("AGGREGATOR_PG_READINGS")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
@@ -81,7 +84,7 @@ impl PgReadingsWriter {
         };
 
         let (tx, rx) = mpsc::channel::<ReadingRow>(CHANNEL_CAPACITY);
-        tokio::spawn(run_writer(pool, rx));
+        tokio::spawn(run_writer(pool, rx, use_read_model));
         info!("🗃️ Postgres meter_readings sink enabled (dashboard Recent Readings)");
         Some(Self { tx })
     }
@@ -98,7 +101,7 @@ impl PgReadingsWriter {
 /// Background batcher: drains the queue, flushing on size or interval — same
 /// shape as `InfluxWriter::run_writer`. A batch is always cleared after an
 /// attempt (success or failure) so one bad batch can't wedge the writer.
-async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>) {
+async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>, use_read_model: bool) {
     let mut batch: Vec<ReadingRow> = Vec::with_capacity(BATCH_SIZE);
     let mut ticker = interval(FLUSH_INTERVAL);
 
@@ -109,11 +112,11 @@ async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>) {
                     Some(row) => {
                         batch.push(row);
                         if batch.len() >= BATCH_SIZE {
-                            flush(&pool, &mut batch).await;
+                            flush(&pool, &mut batch, use_read_model).await;
                         }
                     }
                     None => {
-                        flush(&pool, &mut batch).await;
+                        flush(&pool, &mut batch, use_read_model).await;
                         info!("meter_readings sink channel closed; writer task exiting");
                         return;
                     }
@@ -121,7 +124,7 @@ async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>) {
             }
             _ = ticker.tick() => {
                 if !batch.is_empty() {
-                    flush(&pool, &mut batch).await;
+                    flush(&pool, &mut batch, use_read_model).await;
                 }
             }
         }
@@ -130,8 +133,8 @@ async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>) {
 
 /// Insert the batch in one round-trip and always drain it, logging (not
 /// propagating) a failure so a transient DB fault never kills the sink.
-async fn flush(pool: &PgPool, batch: &mut Vec<ReadingRow>) {
-    if let Err(e) = insert_batch(pool, batch).await {
+async fn flush(pool: &PgPool, batch: &mut Vec<ReadingRow>, use_read_model: bool) {
+    if let Err(e) = insert_batch(pool, batch, use_read_model).await {
         error!("meter_readings batch insert failed for {} row(s) ({e})", batch.len());
     }
     batch.clear();
@@ -160,7 +163,7 @@ fn canonicalize_serial(raw: &str) -> String {
 /// `meter_id` is left NULL: its FK points at the dormant `meter_registry`
 /// table (not the meter-service `meters` table), and the dashboard
 /// identifies readings by `meter_serial`/`user_id`.
-async fn insert_batch(pool: &PgPool, rows: &[ReadingRow]) -> Result<(), sqlx::Error> {
+async fn insert_batch(pool: &PgPool, rows: &[ReadingRow], use_read_model: bool) -> Result<(), sqlx::Error> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -178,19 +181,26 @@ async fn insert_batch(pool: &PgPool, rows: &[ReadingRow]) -> Result<(), sqlx::Er
     let power_factor: Vec<Option<f64>> = rows.iter().map(|r| r.power_factor).collect();
     let frequency: Vec<Option<f64>> = rows.iter().map(|r| r.frequency).collect();
 
-    // TODO(db-split): this INSERT…SELECT JOINs IAM-owned `users` (u.wallet_address)
-    // to fill wallet_address — a cross-domain read that DB-per-service forbids
-    // (Phase 2, docs/db-split-phase2.md). Once cutover to gridtokenx_meter lands,
-    // resolve wallet from the local `meter_owner_read_model` table (or pass the
-    // already-resolved wallet down from MeterRegistry) and drop the `JOIN users u`.
-    // Do NOT remove the JOIN until the read-model is populated + verified.
-    sqlx::query(
-        r#"
-        INSERT INTO meter_readings
-            (id, meter_serial, meter_id, user_id, wallet_address, timestamp,
-             energy_generated, energy_consumed, surplus_energy, deficit_energy, kwh_amount,
-             voltage, power_factor, frequency, verification_status, reading_timestamp)
-        SELECT gen_random_uuid(), m.serial_number, NULL::uuid, m.user_id, u.wallet_address,
+    // DB-per-service Phase 2 (docs/db-split-phase2.md §3): on the dedicated metering
+    // DB resolve `(user_id, wallet_address)` from the local `meter_owner_read_model`
+    // (no cross-domain read, recommendation B — drops BOTH the `meters` and `users`
+    // JOINs); on the legacy shared DB keep the `meters ⋈ users` JOIN until the
+    // read-model is populated + verified (plan forbids deleting the source read).
+    // The SELECT column list + UNNEST binds are identical; only the owner JOIN differs.
+    let owner_join = if use_read_model {
+        "SELECT gen_random_uuid(), t.serial_number, NULL::uuid, rm.user_id, rm.wallet_address,
+               to_timestamp(t.timestamp_ms::double precision / 1000.0),
+               t.generated_kwh, t.consumed_kwh, t.surplus_kwh, t.deficit_kwh, t.generated_kwh,
+               t.voltage, t.power_factor, t.frequency, 'verified',
+               to_timestamp(t.timestamp_ms::double precision / 1000.0)
+        FROM UNNEST($1::text[], $2::bigint[], $3::float8[], $4::float8[], $5::float8[],
+                     $6::float8[], $7::float8[], $8::float8[], $9::float8[])
+             AS t(serial_number, timestamp_ms, generated_kwh, consumed_kwh, surplus_kwh,
+                  deficit_kwh, voltage, power_factor, frequency)
+        JOIN meter_owner_read_model rm ON rm.serial_number = t.serial_number
+        WHERE rm.wallet_address IS NOT NULL"
+    } else {
+        "SELECT gen_random_uuid(), m.serial_number, NULL::uuid, m.user_id, u.wallet_address,
                to_timestamp(t.timestamp_ms::double precision / 1000.0),
                t.generated_kwh, t.consumed_kwh, t.surplus_kwh, t.deficit_kwh, t.generated_kwh,
                t.voltage, t.power_factor, t.frequency, 'verified',
@@ -201,9 +211,16 @@ async fn insert_batch(pool: &PgPool, rows: &[ReadingRow]) -> Result<(), sqlx::Er
                   deficit_kwh, voltage, power_factor, frequency)
         JOIN meters m ON m.serial_number = t.serial_number
         JOIN users u ON u.id = m.user_id
-        WHERE u.wallet_address IS NOT NULL
-        "#,
-    )
+        WHERE u.wallet_address IS NOT NULL"
+    };
+    let sql = format!(
+        "INSERT INTO meter_readings
+            (id, meter_serial, meter_id, user_id, wallet_address, timestamp,
+             energy_generated, energy_consumed, surplus_energy, deficit_energy, kwh_amount,
+             voltage, power_factor, frequency, verification_status, reading_timestamp)
+        {owner_join}"
+    );
+    sqlx::query(&sql)
     .bind(&serial_numbers)
     .bind(&timestamps_ms)
     .bind(&generated_kwh)
