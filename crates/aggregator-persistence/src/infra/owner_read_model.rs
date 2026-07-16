@@ -419,10 +419,14 @@ pub async fn spawn_owner_readmodel_feed(
         ),
     }
 
+    // Defaults match the actual producers so the feed works out of the box:
+    //   meter-service publishes to METER_EVENTS_TOPIC (default `meter_events`);
+    //   IAM publishes to KafkaTopics `{prefix}.user.events` (default `iam.user.events`).
+    // Override per deployment when the IAM topic prefix differs.
     let meter_topic =
         std::env::var("READMODEL_METER_TOPIC").unwrap_or_else(|_| "meter_events".to_string());
     let user_topic =
-        std::env::var("READMODEL_IAM_TOPIC").unwrap_or_else(|_| "user_events".to_string());
+        std::env::var("READMODEL_IAM_TOPIC").unwrap_or_else(|_| "iam.user.events".to_string());
 
     let consumer = match OwnerReadModelConsumer::new(
         &brokers,

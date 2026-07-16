@@ -231,9 +231,12 @@ before finalizing which set owns `meters`.
    **IAM producer already exists**: `iam-core` emits `UserOnboarded`/`UserWalletLinked`/
    `UserWalletPrimaryChanged`/`UserWalletUnlinked` (`{user_id, wallet_address, is_primary?}`) via its
    transactional outbox → Kafka `{prefix}.user.events` (default `iam.user.events`). The consumer now
-   handles all four (`UserWalletUnlinked` → `clear_wallet_if_matches`). **Wiring = topic alignment**:
-   set the aggregator's `READMODEL_IAM_TOPIC=iam.user.events` (its default `user_events` matches
-   nothing) + `READMODEL_METER_TOPIC` to meter-service's actual topic.
+   handles all four (`UserWalletUnlinked` → `clear_wallet_if_matches`). **Topics now aligned by
+   default**: `READMODEL_IAM_TOPIC` defaults to `iam.user.events` (IAM's `{prefix}.user.events`) and
+   `READMODEL_METER_TOPIC` to `meter_events` (meter-service's `METER_EVENTS_TOPIC` default) — both
+   match their producers out of the box; override only if the IAM topic prefix differs. meter-service's
+   envelope (`{event_type: MeterRegistered/MeterUpdated, data:{serial_number, user_id, wallet_address?}}`,
+   `meter-core/src/event.rs`) already matches the consumer.
    **Still open:** the **first-boot backfill**
    — `OwnerReadModel::backfill` seeds from `meters ⋈ users` on its OWN pool, so it only works while
    that pool is the shared DB; seeding the dedicated `gridtokenx_meter` from the old shared DB is a
