@@ -225,8 +225,16 @@ before finalizing which set owns `meters`.
    (`OwnerReadModel` repo + `OwnerReadModelConsumer` Kafka feed + `spawn_owner_readmodel_feed` gate,
    `AGGREGATOR_OWNER_READMODEL_FEED`) is built and wired in `main.rs`. Write semantics verified live
    (`tests/owner_read_model_repo.rs`): upsert last-writer-wins + wallet COALESCE-preserve on meter
-   events, authoritative wallet set/clear on user events, cross-user isolation. **Still open:** stand
-   up the IAM/meter-service event producers on the subscribed topics, and the **first-boot backfill**
+   events, authoritative wallet set/clear on user events, cross-user isolation, and
+   `clear_wallet_if_matches` (unlink) — clears the read-model wallet ONLY when it equals the unlinked
+   one, so a mint never targets a wallet the user unlinked.
+   **IAM producer already exists**: `iam-core` emits `UserOnboarded`/`UserWalletLinked`/
+   `UserWalletPrimaryChanged`/`UserWalletUnlinked` (`{user_id, wallet_address, is_primary?}`) via its
+   transactional outbox → Kafka `{prefix}.user.events` (default `iam.user.events`). The consumer now
+   handles all four (`UserWalletUnlinked` → `clear_wallet_if_matches`). **Wiring = topic alignment**:
+   set the aggregator's `READMODEL_IAM_TOPIC=iam.user.events` (its default `user_events` matches
+   nothing) + `READMODEL_METER_TOPIC` to meter-service's actual topic.
+   **Still open:** the **first-boot backfill**
    — `OwnerReadModel::backfill` seeds from `meters ⋈ users` on its OWN pool, so it only works while
    that pool is the shared DB; seeding the dedicated `gridtokenx_meter` from the old shared DB is a
    **cross-DB** one-shot (cutover tooling), not the single-pool runtime path. On the dedicated DB the

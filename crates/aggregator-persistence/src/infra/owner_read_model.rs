@@ -158,6 +158,31 @@ impl OwnerReadModel {
         Ok(res.rows_affected())
     }
 
+    /// Clear the wallet for `user_id` **only when it currently equals `wallet`** —
+    /// the response to a `UserWalletUnlinked` event. Keyed by `(user_id, wallet)`
+    /// so unlinking a NON-primary wallet (one the read-model never stored) is a
+    /// no-op, and only the actual stored mint-recipient wallet is cleared. Without
+    /// this, a mint keeps resolving to a wallet the user no longer controls.
+    /// Returns the number of rows cleared.
+    pub async fn clear_wallet_if_matches(
+        &self,
+        user_id: Uuid,
+        wallet: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE meter_owner_read_model
+            SET wallet_address = NULL, updated_at = now()
+            WHERE user_id = $1 AND wallet_address = $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(wallet)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// One-time, idempotent first-boot seed from the CURRENT shared source — the
     /// same `meters ⋈ users(wallet_address)` join the aggregator reads today
     /// (reachable pre-cutover on `DATABASE_URL`). `ON CONFLICT DO NOTHING` so a
@@ -305,6 +330,37 @@ impl OwnerReadModelConsumer {
                     ),
                     Err(e) => warn!(
                         "owner read-model: wallet update failed for user {} ({e})",
+                        data.user_id
+                    ),
+                }
+            }
+
+            // A wallet unlink clears the read-model wallet ONLY if it was the
+            // stored (mint-recipient) one — unlinking a different wallet is a
+            // no-op. Prevents a surplus mint from targeting a wallet the user has
+            // unlinked. `UserWalletUnlinked` carries no `is_primary`; the match on
+            // the stored wallet value is what scopes it to the primary.
+            "UserWalletUnlinked" => {
+                let data: UserEventData = match serde_json::from_value(event.data) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("owner read-model: bad UserWalletUnlinked data ({e}); skipping");
+                        return;
+                    }
+                };
+                match wallet_or_none(data.wallet_address.as_deref()) {
+                    Some(w) => match repo.clear_wallet_if_matches(data.user_id, w).await {
+                        Ok(n) => debug!(
+                            "owner read-model: cleared {n} wallet row(s) for user {} (unlink)",
+                            data.user_id
+                        ),
+                        Err(e) => warn!(
+                            "owner read-model: wallet clear failed for user {} ({e})",
+                            data.user_id
+                        ),
+                    },
+                    None => debug!(
+                        "owner read-model: UserWalletUnlinked with empty wallet for user {}, skipping",
                         data.user_id
                     ),
                 }

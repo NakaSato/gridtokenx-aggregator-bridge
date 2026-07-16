@@ -104,3 +104,27 @@ async fn update_wallet_by_user_touches_all_owned_and_can_clear() {
     assert!(row(&pool, "OWNREPO-A").await.unwrap().1.is_none(), "wallet cleared to NULL");
     assert!(row(&pool, "OWNREPO-B").await.unwrap().1.is_none());
 }
+
+#[tokio::test]
+async fn clear_wallet_if_matches_only_clears_the_matching_wallet() {
+    let Some(url) = test_url() else {
+        eprintln!("SKIP clear_wallet_if_matches_only_clears_the_matching_wallet: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-CLR1", "OWNREPO-CLR2"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let owner = Uuid::new_v4();
+
+    repo.upsert_by_serial("OWNREPO-CLR1", owner, Some("WALLET-A")).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-CLR2", owner, Some("WALLET-A")).await.unwrap();
+
+    // Unlinking a DIFFERENT wallet than the stored one is a no-op (a non-primary
+    // wallet the read-model never held).
+    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-OTHER").await.unwrap(), 0);
+    assert_eq!(row(&pool, "OWNREPO-CLR1").await.unwrap().1.as_deref(), Some("WALLET-A"));
+
+    // Unlinking the STORED (mint-recipient) wallet clears it on every row the user owns.
+    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-A").await.unwrap(), 2);
+    assert!(row(&pool, "OWNREPO-CLR1").await.unwrap().1.is_none(), "stored wallet cleared on unlink");
+    assert!(row(&pool, "OWNREPO-CLR2").await.unwrap().1.is_none());
+}
