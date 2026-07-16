@@ -135,12 +135,22 @@ impl MeterRegistry {
         // has no read-model populated yet, and the plan forbids deleting the source
         // read until the read-model is verified). The read-model is the durable
         // form of the Redis owner cache, fed by IAM user.wallet.* events + backfill.
+        //
+        // Match on `canonicalize_meter_serial($1)`, NOT the raw serial: both
+        // `meters.serial_number` (via the `uq_meters_serial_number_canonical` index)
+        // and `meter_owner_read_model.serial_number` are stored canonicalized, and the
+        // readings sink canonicalizes its JOIN key too (`pg_readings::canonicalize_serial`).
+        // A device that emits a UUID serial in a dash/case variant would otherwise get
+        // its reading row WRITTEN (canonicalized JOIN matches) but its owner/wallet
+        // resolution MISSED (raw bind ≠ stored canonical) → the surplus mint silently
+        // skipped. The function is present on both DBs (the meters unique index needs it).
         let query = if self.use_read_model {
-            "SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1"
+            "SELECT user_id, wallet_address FROM meter_owner_read_model \
+             WHERE serial_number = canonicalize_meter_serial($1)"
         } else {
             "SELECT m.user_id, u.wallet_address \
              FROM meters m JOIN users u ON u.id = m.user_id \
-             WHERE m.serial_number = $1"
+             WHERE m.serial_number = canonicalize_meter_serial($1)"
         };
         let row: Option<(Uuid, Option<String>)> = sqlx::query_as(query)
             .bind(meter_serial)

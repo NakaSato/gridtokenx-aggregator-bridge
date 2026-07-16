@@ -165,3 +165,41 @@ async fn owner_resolves_from_read_model_without_cross_domain_join() {
         "legacy JOIN path must error on the metering DB (no users table)"
     );
 }
+
+/// A UUID serial emitted in a dash/case VARIANT must resolve to the canonical
+/// read-model row — the owner lookup matches on `canonicalize_meter_serial($1)`,
+/// so a variant can't miss its owner (which would land readings but skip the mint).
+#[tokio::test]
+async fn read_model_resolves_a_noncanonical_uuid_serial() {
+    let Some(url) = test_url() else {
+        eprintln!("SKIP read_model_resolves_a_noncanonical_uuid_serial: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = db::connect_pool(&url).await.expect("connect");
+    db::run_migrations(&pool).await.expect("migrate");
+
+    const CANON: &str = "22222222-2222-2222-2222-222222222222";
+    const UNDASHED: &str = "22222222222222222222222222222222"; // same UUID, no dashes
+    const WALLET: &str = "WcanonWallet";
+    sqlx::query(
+        "INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
+         VALUES (canonicalize_meter_serial($1), '33333333-3333-3333-3333-333333333333'::uuid, $2, now())
+         ON CONFLICT (serial_number) DO UPDATE SET wallet_address = EXCLUDED.wallet_address, updated_at = now()",
+    )
+    .bind(CANON)
+    .bind(WALLET)
+    .execute(&pool)
+    .await
+    .expect("seed canonical uuid serial");
+
+    // Resolve with the UNDASHED variant (redis None + empty caches ⇒ Postgres tier).
+    let reg = MeterRegistry::new(None, Some(pool)).with_read_model(true);
+    assert!(
+        reg.resolve_user_id(UNDASHED).await.expect("resolve").is_some(),
+        "a dash/case-variant UUID serial must resolve to the canonical read-model row"
+    );
+    assert_eq!(
+        reg.resolve_wallet(UNDASHED).await.expect("wallet").as_deref(),
+        Some(WALLET)
+    );
+}
