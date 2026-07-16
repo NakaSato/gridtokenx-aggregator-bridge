@@ -110,11 +110,13 @@ When **neither** Redis nor Postgres is configured, `resolve_user_id` keeps the l
 fallback for pure-local dev. Compose already sets `DATABASE_URL` (→ `pgdog:6432/gridtokenx`).
 
 **DB-per-service Phase 2 seam (`METER_DATABASE_URL`):** when set, the aggregator uses it as its
-metering pool AND runs its own `migrations/` at boot (`infra::db`, own `_sqlx_migrations` ledger) —
-the dedicated `gridtokenx_meter` DB the metering domain owns. Unset ⇒ legacy shared `DATABASE_URL`
-(no boot migrations; IAM owns that ledger). **Do not point it at `gridtokenx_meter` in production
-until the foreign-read swap lands** (`docs/db-split-phase2.md` §5 step 4) — the `meters ⋈ users`
-owner read still needs the shared DB until `MeterRegistry` reads `meter_owner_read_model`.
+metering pool for the shared `gridtokenx_meter` DB. It does **NOT** migrate at boot — that DB is
+shared with meter-service, so migrations are owned by a single **dedicated migrate job** (`cargo run
+--bin migrate`, `src/bin/migrate.rs`, applying `infra::db::MIGRATOR`), never by two services' boot
+runners racing one `_sqlx_migrations` ledger. Unset ⇒ legacy shared `DATABASE_URL`. Setting
+`METER_DATABASE_URL` also flips the owner reads to the local `meter_owner_read_model` (§4). **Do not
+point it at `gridtokenx_meter` in production until the read-model is populated** (`docs/db-split-phase2.md`
+§5 step 3) — the `meters ⋈ users` read still needs the shared DB until then.
 
 InfluxDB (independent realtime history): `INFLUXDB_URL` enables an InfluxDB v2 sink dedicated to this
 service alone — point it at this service's **own** instance (the superproject's `aggregator-influxdb`

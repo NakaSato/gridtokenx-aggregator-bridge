@@ -210,13 +210,12 @@ async fn main() -> Result<()> {
     {
         Ok(Ok(pool)) => {
             if own_meter_db {
+                // NOTE: the service does NOT migrate at boot. `gridtokenx_meter` is
+                // shared by meter-service + aggregator, so migrations are applied by
+                // a single dedicated migrate job (the `migrate` bin here / the
+                // `_migrate` role), never by two services' boot runners racing one
+                // ledger (drift crash-loop). See docs/db-split-phase2.md §5.
                 info!("🔗 Postgres metering DB (gridtokenx_meter, own): connected");
-                // Own DB ⇒ own migration runner. Degrade-safe: a migration failure
-                // is loud but non-fatal (DB tier may be incomplete, Redis still serves).
-                match infra::db::run_migrations(&pool).await {
-                    Ok(()) => info!("🗄️ metering DB migrations applied"),
-                    Err(e) => warn!("⚠️ metering DB migration failed ({e}); DB tier may be incomplete"),
-                }
             } else {
                 info!("🔗 Postgres meter-owner registry (shared DATABASE_URL): connected");
             }

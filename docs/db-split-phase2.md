@@ -168,6 +168,24 @@ Two options:
   meter-service tables — it resolves owners purely from its local `meter_owner_read_model`
   (fed by meter-service meter-enrollment events + IAM wallet events).
 
+> **RESOLVED (parent plan §3.5): rec-A — ONE shared `gridtokenx_meter`**, meter-service owns
+> `meters`/`meter_registry`/`meter_verification_attempts` (sole writer), aggregator owns the rest.
+> meter-service now carries its own canonical DDL at
+> `gridtokenx-meter-service/migrations/0001_meter_registry.sql` (self-contained, IAM FKs dropped).
+> **Verified**: it applies standalone AND composes into the full `gridtokenx_meter` schema when the
+> dedicated job applies it BEFORE the aggregator set MINUS `0002` (dependency order — `meter_readings`
+> FKs `meter_registry`).
+>
+> **Applier model (decided): aggregator applies the COMPLETE set.** The aggregator's `migrations/`
+> stays the canonical full `gridtokenx_meter` schema that the dedicated `migrate` bin applies;
+> meter-service's `0001` is the ownership source-of-truth (what it solely writes), NOT a second
+> applier — so there is NO dedup, no cross-submodule combined job, and nothing breaks. The two copies
+> of the meters/registry/verification DDL are kept byte-identical by
+> `scripts/check-metering-ddl-sync.sh` (`just check-ddl-sync`), which fails on any DDL drift. A strict
+> single-applier-per-table split (remove from aggregator + combined ordered job) is deferred: it needs
+> global re-versioning + a superproject merge tool + dropping the dead `meter_readings.meter_id` FK,
+> and buys nothing under one shared DB.
+
 **Recommendation: (B) — split by writer.** The clean DB-per-service rule is "one writer per
 table." `meters` has exactly one writer (meter-service) and one reader (aggregator); a reader
 should hold a **read-model**, not the table. Since Phase 2 already introduces
@@ -192,14 +210,17 @@ before finalizing which set owns `meters`.
 
 1. Create the physical `gridtokenx_meter` DB + a least-privilege role; add the pgdog
    `[[databases]]` route (mirroring the `gridtokenx_noti` reference model).
-2. ~~Apply `migrations/` to `gridtokenx_meter` (decide runner)~~ **DONE — boot-time runner.**
-   `infra::db` (`crates/aggregator-persistence/src/infra/db.rs`) embeds `migrations/` via
-   `sqlx::migrate!` and applies them at boot **when `METER_DATABASE_URL` is set** (its own
-   `_sqlx_migrations` ledger; sqlx advisory-locked, so replica-safe). Idempotent + degrade-safe
-   (migration failure ⇒ loud `warn!`, non-fatal). Never runs against the shared `DATABASE_URL`
-   (would collide with IAM's ledger). Verified by `crates/aggregator-persistence/tests/meter_db_migrations.rs`
-   (all 6 migrations apply to a fresh `gridtokenx_meter` + idempotent + schema present) — gated on
-   `METER_TEST_DATABASE_URL`.
+2. ~~Apply `migrations/` to `gridtokenx_meter` (decide runner)~~ **DONE — dedicated migrate job.**
+   `gridtokenx_meter` is SHARED (meter-service + aggregator), so it has ONE `_sqlx_migrations`
+   ledger and needs a SINGLE migration authority — **neither service migrates at boot** (two boot
+   runners would each see the other's migrations as "applied but missing locally" and crash-loop).
+   The standalone **`migrate` binary** (`src/bin/migrate.rs`) owns applying the full set via
+   `infra::db::MIGRATOR`; run it as an init container / CI step / the `_migrate` role:
+   `METER_DATABASE_URL=… cargo run --bin migrate` (falls back to `DATABASE_URL`). Idempotent, exit 0
+   on success / non-zero on failure so a job runner can gate on it. `infra::db` still owns the pool +
+   `MIGRATOR`; the aggregator process only CONNECTS (never migrates). Verified: the `migrate` bin
+   applies + is idempotent against a fresh `gridtokenx_meter`; migrations also checked by
+   `crates/aggregator-persistence/tests/meter_db_migrations.rs` (gated `METER_TEST_DATABASE_URL`).
 3. **Feed machinery DONE + verified; live backfill + wiring remain.** `infra::owner_read_model`
    (`OwnerReadModel` repo + `OwnerReadModelConsumer` Kafka feed + `spawn_owner_readmodel_feed` gate,
    `AGGREGATOR_OWNER_READMODEL_FEED`) is built and wired in `main.rs`. Write semantics verified live
