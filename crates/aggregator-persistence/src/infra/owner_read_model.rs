@@ -416,7 +416,7 @@ pub async fn spawn_owner_readmodel_feed(
         return;
     };
 
-    let repo = OwnerReadModel::new(pool);
+    let repo = OwnerReadModel::new(pool.clone());
 
     // First-boot backfill (idempotent, ON CONFLICT DO NOTHING). A failure here is
     // non-fatal: the live event feed + the lazy per-serial DB re-resolve keep the
@@ -444,21 +444,86 @@ pub async fn spawn_owner_readmodel_feed(
     let user_topic =
         std::env::var("READMODEL_IAM_TOPIC").unwrap_or_else(|_| "iam.user.events".to_string());
 
-    let consumer = match OwnerReadModelConsumer::new(
+    // The two source streams can live on DIFFERENT Kafka clusters: meter-service
+    // publishes `meter_events` to this service's KAFKA_BOOTSTRAP_SERVERS, while IAM
+    // publishes `iam.user.events` to ITS broker (KAFKA_CMD in this deploy) — the same
+    // one noti-service consumes from, so the topic can't just be moved. When
+    // READMODEL_IAM_BROKERS names that other cluster we run a SECOND consumer there
+    // for the user topic; unset ⇒ same broker as everything else (single consumer,
+    // original behavior, zero change).
+    let iam_brokers =
+        std::env::var("READMODEL_IAM_BROKERS").unwrap_or_else(|_| brokers.clone());
+
+    if iam_brokers == brokers {
+        // One cluster carries both topics — single consumer, single repo.
+        let consumer = match OwnerReadModelConsumer::new(
+            &brokers,
+            "aggregator-owner-readmodel-group",
+            &[user_topic.as_str(), meter_topic.as_str()],
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("❌ Owner read-model consumer init failed: {e}; feed disabled");
+                return;
+            }
+        };
+        info!("🗃️ Owner read-model feed ENABLED (broker {brokers}; topics: {user_topic}, {meter_topic})");
+        tokio::spawn(async move {
+            consumer.run(repo, shutdown).await;
+        });
+        return;
+    }
+
+    // Split brokers: `meter_events` on `brokers`, `iam.user.events` on `iam_brokers`.
+    // Two consumers feed the same read-model (distinct group-ids). Both must observe
+    // the one `shutdown` future, so fan it out over a watch channel.
+    let meter_consumer = match OwnerReadModelConsumer::new(
         &brokers,
-        "aggregator-owner-readmodel-group",
-        &[user_topic.as_str(), meter_topic.as_str()],
+        "aggregator-owner-readmodel-meter-group",
+        &[meter_topic.as_str()],
     ) {
         Ok(c) => c,
         Err(e) => {
-            error!("❌ Owner read-model consumer init failed: {e}; feed disabled");
+            error!("❌ Owner read-model meter consumer init failed: {e}; feed disabled");
+            return;
+        }
+    };
+    let iam_consumer = match OwnerReadModelConsumer::new(
+        &iam_brokers,
+        "aggregator-owner-readmodel-iam-group",
+        &[user_topic.as_str()],
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("❌ Owner read-model IAM consumer init failed: {e}; feed disabled");
             return;
         }
     };
 
-    info!("🗃️ Owner read-model feed ENABLED (topics: {user_topic}, {meter_topic})");
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let rx2 = rx.clone();
     tokio::spawn(async move {
-        consumer.run(repo, shutdown).await;
+        shutdown.await;
+        let _ = tx.send(true);
+    });
+    // Resolve once the flag flips true; a dropped sender (changed() Err) also stops us.
+    async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                break;
+            }
+        }
+    }
+
+    let repo_iam = OwnerReadModel::new(pool);
+    info!(
+        "🗃️ Owner read-model feed ENABLED (split brokers: {meter_topic}@{brokers}, {user_topic}@{iam_brokers})"
+    );
+    tokio::spawn(async move {
+        meter_consumer.run(repo, wait_shutdown(rx)).await;
+    });
+    tokio::spawn(async move {
+        iam_consumer.run(repo_iam, wait_shutdown(rx2)).await;
     });
 }
 
