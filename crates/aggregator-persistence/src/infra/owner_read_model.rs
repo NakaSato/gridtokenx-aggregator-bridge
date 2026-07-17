@@ -539,4 +539,62 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn meter_event_data_rejects_missing_serial() {
+        // A meter event without a serial has no read-model key — it must fail
+        // parse (→ dispatcher logs + skips), never land as an empty serial.
+        assert!(serde_json::from_str::<MeterEventData>(
+            r#"{"user_id":"00000000-0000-0000-0000-000000000001"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn user_event_data_rejects_missing_or_bad_user_id() {
+        // The user path is keyed by user_id: absent or malformed must fail parse
+        // (→ dispatcher logs + skips, never panics) — mirror of the meter guard.
+        assert!(serde_json::from_str::<UserEventData>(r#"{"wallet_address":"W"}"#).is_err());
+        assert!(serde_json::from_str::<UserEventData>(
+            r#"{"user_id":"nope","wallet_address":"W"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn user_event_data_parses_explicit_is_primary_true() {
+        // Some(true) must ride the same path as absent (only Some(false) skips).
+        let promoted: UserEventData = serde_json::from_str(
+            r#"{"user_id":"00000000-0000-0000-0000-000000000001","wallet_address":"W","is_primary":true}"#,
+        )
+        .unwrap();
+        assert_eq!(promoted.is_primary, Some(true));
+    }
+
+    #[test]
+    fn blank_wallets_normalize_to_none_after_parse() {
+        // A whitespace/empty wallet on the wire parses as Some(..) but must
+        // normalize to None before hitting SQL — meter path ⇒ fill-only treats it
+        // as absent, user path ⇒ explicit NULL — never stored as an empty string.
+        let meter: MeterEventData = serde_json::from_str(
+            r#"{"serial_number":"MTR-3","user_id":"00000000-0000-0000-0000-000000000003","wallet_address":"   "}"#,
+        )
+        .unwrap();
+        assert_eq!(wallet_or_none(meter.wallet_address.as_deref()), None);
+
+        let user: UserEventData = serde_json::from_str(
+            r#"{"user_id":"00000000-0000-0000-0000-000000000003","wallet_address":""}"#,
+        )
+        .unwrap();
+        assert_eq!(wallet_or_none(user.wallet_address.as_deref()), None);
+    }
+
+    #[test]
+    fn typed_payloads_reject_null_data() {
+        // A recognised event_type with missing `data` (⇒ Null, per
+        // feed_event_defaults_missing_data_and_type) must fail the typed parse —
+        // the dispatcher logs + skips it, it is never treated as a valid event.
+        assert!(serde_json::from_value::<MeterEventData>(serde_json::Value::Null).is_err());
+        assert!(serde_json::from_value::<UserEventData>(serde_json::Value::Null).is_err());
+    }
 }
