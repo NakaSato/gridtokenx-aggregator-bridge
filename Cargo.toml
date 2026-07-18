@@ -52,4 +52,9 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = 'abort'
-strip = true
+# strip MUST stay off: `strip = true` also strips the sqlx_macros proc-macro
+# dylib, mis-aligning its Mach-O LINKEDIT on macOS (Darwin 27) so rustc's dlopen
+# fails ("mis-aligned LINKEDIT string pool") — the release build then dies with a
+# misleading sqlx E0432 (unresolved Encode/Decode/FromRow/Type). Debug is fine
+# (no strip). Strip the final binary in packaging instead if size matters.
+strip = false
