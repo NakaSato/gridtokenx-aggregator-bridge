@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package gridtokenx.dispatch;
+package gridtokenx.dispatch.v1;
 
 service DispatchController {
   // Executes a flexible dispatch command to a Load Aggregator

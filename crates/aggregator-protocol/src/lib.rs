@@ -18,7 +18,7 @@ pub mod oracle {
 
 pub mod dispatch {
     include!(concat!(env!("OUT_DIR"), "/_dispatch_include.rs"));
-    pub use gridtokenx::dispatch::*;
+    pub use gridtokenx::dispatch::v1::*;
 }
 
 pub mod identity {
