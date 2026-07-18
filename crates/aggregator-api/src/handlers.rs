@@ -3,6 +3,7 @@ use crate::models::{
 };
 use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use futures::stream::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -29,6 +30,11 @@ pub async fn health() -> impl IntoResponse {
 /// ignored, the unsigned `simulator` protocol is refused, and the REST meter path
 /// requires an authenticated `dlms-enc` frame (no plaintext downgrade). Default
 /// off so dev/e2e keep their bypasses.
+/// Max in-flight XADDs during a batch's concurrent dissemination phase. Bounds
+/// fan-out onto the multiplexed Redis connection so a huge batch can't open an
+/// unbounded number of concurrent commands.
+const DISSEMINATE_CONCURRENCY: usize = 64;
+
 pub fn secure_mode_enabled() -> bool {
     std::env::var("AGGREGATOR_REQUIRE_SECURE").unwrap_or_default() == "true"
 }
@@ -655,7 +661,12 @@ pub async fn ingest_private_network_batch(
         "📥 Received private network batch ingestion: protocol={}",
         payload.protocol
     );
-    let mut responses = Vec::new();
+    // Decode/verify each reading in-loop (fail-closed, unchanged), collecting the
+    // accepted `DeviceReading`s. Dissemination is deferred to a concurrent phase
+    // after the loop — a batch of N readings previously did N *serial* Redis XADDs
+    // ("sequentially for simplicity"), which capped batch ingest throughput; the
+    // multiplexed Redis connection handles the fan-out fine.
+    let mut to_disseminate: Vec<DeviceReading> = Vec::new();
     // DLMS/COSEM is the only meter protocol; `auto`/empty resolve to `dlms`,
     // `simulator` is the unsigned dev bypass. Validate the declared top protocol
     // once: empty/`auto` are allowed (they resolve to dlms), else it must be a
@@ -768,24 +779,7 @@ pub async fn ingest_private_network_batch(
                     .collect(),
             };
 
-            let reading_id = reading.reading_id.clone();
-            let device_type = reading.device_type;
-            let status = match state.router.disseminate(&reading).await {
-                Ok(_) => "accepted",
-                Err(e) => {
-                    error!(
-                        "❌ Failed to disseminate reading {} for device {}: {}",
-                        reading_id, device_id, e
-                    );
-                    "failed"
-                }
-            };
-            responses.push(IngestResponse {
-                status,
-                reading_id,
-                device_type,
-                stream: device_type.target_stream().to_string(),
-            });
+            to_disseminate.push(reading);
             continue;
         }
 
@@ -795,33 +789,42 @@ pub async fn ingest_private_network_batch(
         // Only DLMS/COSEM remains; `simulator` handled above, `auto`/empty mapped to dlms.
         let stack: Arc<dyn crate::protocol::stacks::ProtocolStack> = state.dlms_stack.clone();
 
-        match stack.handle_message(device_id, &raw_data).await {
-            Ok(Some(reading)) => {
-                let reading_id = reading.reading_id.clone();
-                let device_type = reading.device_type;
+        if let Ok(Some(reading)) = stack.handle_message(device_id, &raw_data).await {
+            to_disseminate.push(reading);
+        }
+    }
 
-                // In batch mode, we handle dissemination sequentially for simplicity
+    // Concurrent dissemination phase: XADD every accepted reading with bounded
+    // in-flight concurrency instead of one-at-a-time. `buffered` preserves input
+    // order, so the response array still lines up with the accepted readings.
+    // Per-reading fail-closed status is unchanged (Err → "failed").
+    let responses: Vec<IngestResponse> = futures::stream::iter(to_disseminate)
+        .map(|reading| {
+            let state = &state;
+            async move {
+                let reading_id = reading.reading_id;
+                let device_type = reading.device_type;
                 let status = match state.router.disseminate(&reading).await {
                     Ok(_) => "accepted",
                     Err(e) => {
                         error!(
                             "❌ Failed to disseminate reading {} for device {}: {}",
-                            reading_id, device_id, e
+                            reading_id, reading.device_id, e
                         );
                         "failed"
                     }
                 };
-
-                responses.push(IngestResponse {
+                IngestResponse {
                     status,
                     reading_id,
                     device_type,
                     stream: device_type.target_stream().to_string(),
-                });
+                }
             }
-            _ => {}
-        }
-    }
+        })
+        .buffered(DISSEMINATE_CONCURRENCY)
+        .collect()
+        .await;
 
     (StatusCode::OK, Json(responses)).into_response()
 }
