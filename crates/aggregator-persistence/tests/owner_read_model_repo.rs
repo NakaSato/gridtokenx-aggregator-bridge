@@ -161,3 +161,49 @@ async fn clear_wallet_if_matches_only_clears_the_matching_wallet() {
     assert!(row(&pool, "OWNREPO-CLR1").await.unwrap().1.is_none(), "stored wallet cleared on unlink");
     assert!(row(&pool, "OWNREPO-CLR2").await.unwrap().1.is_none());
 }
+
+#[tokio::test]
+async fn wallet_event_before_first_meter_event_is_not_lost() {
+    // The two feed streams (IAM user events / meter-service meter events) have no
+    // cross-topic ordering. A user's wallet event consumed BEFORE their first
+    // MeterRegistered row used to match 0 rows and vanish — the read-model row
+    // then stayed wallet-NULL forever and surplus mints deferred with
+    // "no wallet registered" (observed live 2026-07-18). The durable
+    // user_wallet_read_model edge makes the merge order-independent.
+    let Some(url) = test_url() else {
+        eprintln!("SKIP wallet_event_before_first_meter_event_is_not_lost: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-RACE1", "OWNREPO-RACE2"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let owner = Uuid::new_v4();
+
+    // 1. Wallet event first — user owns no meters yet: 0 meter rows touched,
+    //    but the user → wallet edge must be recorded durably.
+    let n = repo.update_wallet_by_user(owner, Some("WALLET-EARLY")).await.unwrap();
+    assert_eq!(n, 0, "no meter rows yet");
+
+    // 2. Meter event arrives later WITHOUT a wallet snapshot (registration-time
+    //    wallet was not provisioned yet) — the upsert must fill from the edge.
+    repo.upsert_by_serial("OWNREPO-RACE1", owner, None).await.unwrap();
+    assert_eq!(
+        row(&pool, "OWNREPO-RACE1").await.unwrap().1.as_deref(),
+        Some("WALLET-EARLY"),
+        "serial upsert back-fills the wallet from user_wallet_read_model"
+    );
+
+    // 3. A meter event that DOES carry a snapshot still wins over the edge for
+    //    a fresh row (COALESCE order: event snapshot first).
+    repo.upsert_by_serial("OWNREPO-RACE2", owner, Some("WALLET-SNAP")).await.unwrap();
+    assert_eq!(row(&pool, "OWNREPO-RACE2").await.unwrap().1.as_deref(), Some("WALLET-SNAP"));
+
+    // 4. Unlink clears BOTH the meter rows and the durable edge — a later meter
+    //    event must not resurrect the unlinked wallet.
+    repo.update_wallet_by_user(owner, Some("WALLET-EARLY")).await.unwrap(); // realign both rows
+    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-EARLY").await.unwrap(), 2);
+    repo.upsert_by_serial("OWNREPO-RACE1", owner, None).await.unwrap();
+    assert!(
+        row(&pool, "OWNREPO-RACE1").await.unwrap().1.is_none(),
+        "unlinked wallet must not come back from the edge table"
+    );
+}

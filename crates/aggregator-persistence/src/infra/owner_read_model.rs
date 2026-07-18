@@ -126,7 +126,14 @@ impl OwnerReadModel {
         sqlx::query(
             r#"
             INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
-            VALUES (canonicalize_meter_serial($1), $2, $3, now())
+            VALUES (
+                canonicalize_meter_serial($1), $2,
+                -- A wallet event with no meter rows yet lands only in
+                -- user_wallet_read_model; consult it so either arrival order of
+                -- the two streams produces the same merged row.
+                COALESCE($3, (SELECT wallet_address FROM user_wallet_read_model WHERE user_id = $2)),
+                now()
+            )
             ON CONFLICT (serial_number) DO UPDATE
             SET user_id        = EXCLUDED.user_id,
                 wallet_address = CASE
@@ -148,18 +155,36 @@ impl OwnerReadModel {
     }
 
     /// UPDATE the wallet for every meter owned by `user_id` (an IAM wallet event
-    /// is keyed by user, not serial). Returns the number of rows touched (0 when
-    /// the user owns no meters yet — the meter event fills the edge later, and a
-    /// subsequent wallet event / the backfill re-applies the wallet).
+    /// is keyed by user, not serial). Returns the number of meter rows touched.
     ///
     /// This is the authoritative wallet writer: it sets the wallet directly
     /// (including to NULL when a wallet is unlinked), unlike the serial upsert
     /// which only fills an absent wallet.
+    ///
+    /// The wallet is ALSO upserted into `user_wallet_read_model` — the durable
+    /// user → wallet edge — so a wallet event consumed before the user's first
+    /// `MeterRegistered` row exists (the two streams have no cross-topic
+    /// ordering) is not lost: the later serial upsert back-fills from that edge.
+    /// Both writes ride one transaction so a crash can't record the wallet on
+    /// one side only.
     pub async fn update_wallet_by_user(
         &self,
         user_id: Uuid,
         wallet: Option<&str>,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO user_wallet_read_model (user_id, wallet_address, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (user_id) DO UPDATE
+            SET wallet_address = EXCLUDED.wallet_address, updated_at = now()
+            "#,
+        )
+        .bind(user_id)
+        .bind(wallet)
+        .execute(&mut *tx)
+        .await?;
         let res = sqlx::query(
             r#"
             UPDATE meter_owner_read_model
@@ -169,8 +194,9 @@ impl OwnerReadModel {
         )
         .bind(wallet)
         .bind(user_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(res.rows_affected())
     }
 
@@ -185,6 +211,20 @@ impl OwnerReadModel {
         user_id: Uuid,
         wallet: &str,
     ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Clear the durable user → wallet edge under the same match rule, so a
+        // later meter event can't resurrect the unlinked wallet from it.
+        sqlx::query(
+            r#"
+            UPDATE user_wallet_read_model
+            SET wallet_address = NULL, updated_at = now()
+            WHERE user_id = $1 AND wallet_address = $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(wallet)
+        .execute(&mut *tx)
+        .await?;
         let res = sqlx::query(
             r#"
             UPDATE meter_owner_read_model
@@ -194,8 +234,9 @@ impl OwnerReadModel {
         )
         .bind(user_id)
         .bind(wallet)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(res.rows_affected())
     }
 
