@@ -13,6 +13,35 @@ use aggregator_persistence::infra::pg_readings::{PgReadingsWriter, ReadingRow};
 /// Default maximum number of entries per Redis stream.
 const DEFAULT_MAX_STREAM_LEN: usize = 100_000;
 
+/// Borrowed wire envelope for a plaintext stream entry (`{event_type, payload}`).
+///
+/// Serialized directly from borrowed fields on the per-reading hot path — this
+/// avoids the throwaway `serde_json::Value` tree that `json!({..})` builds (a
+/// full nested-map clone of the whole reading) before re-serializing it to a
+/// string. One pass, no intermediate allocation. The consumer
+/// (`zone_ingester::decode_entry` → `from_str::<Event>`) deserializes by key,
+/// so field order is irrelevant to it.
+#[derive(serde::Serialize)]
+struct StreamEnvelope<'a> {
+    event_type: &'a str,
+    payload: &'a DeviceReading,
+}
+
+/// Borrowed wire envelope for an at-rest-encrypted stream entry
+/// (`{event_type, enc:{nonce, ciphertext}}`). Same zero-intermediate rationale
+/// as [`StreamEnvelope`].
+#[derive(serde::Serialize)]
+struct EncStreamEnvelope<'a> {
+    event_type: &'a str,
+    enc: EncBody<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct EncBody<'a> {
+    nonce: &'a str,
+    ciphertext: &'a str,
+}
+
 /// Self-healing cache of a reconnecting resource (here a Redis `ConnectionManager`).
 ///
 /// Holds the last-built handle; [`invalidate`](Self::invalidate) drops it so the
@@ -172,16 +201,23 @@ impl Router {
             let (nonce, ciphertext) = cipher
                 .encrypt(&payload_bytes, event_type.as_bytes())
                 .context("Failed to encrypt stream payload")?;
-            serde_json::to_string(&serde_json::json!({
-                "event_type": event_type,
-                "enc": { "nonce": nonce, "ciphertext": ciphertext },
-            }))
+            // Serialize the envelope in one pass from borrowed fields — no
+            // intermediate `serde_json::Value` tree (see `EncStreamEnvelope`).
+            serde_json::to_string(&EncStreamEnvelope {
+                event_type,
+                enc: EncBody {
+                    nonce: &nonce,
+                    ciphertext: &ciphertext,
+                },
+            })
             .context("Failed to serialize encrypted reading")?
         } else {
-            serde_json::to_string(&serde_json::json!({
-                "event_type": event_type,
-                "payload": reading,
-            }))
+            // Borrow the reading straight into the envelope — no throwaway Value
+            // clone of the whole reading (see `StreamEnvelope`).
+            serde_json::to_string(&StreamEnvelope {
+                event_type,
+                payload: reading,
+            })
             .context("Failed to serialize reading")?
         };
 
@@ -498,6 +534,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok, 7);
+    }
+
+    /// The borrowed `StreamEnvelope` serialization must be byte-for-value
+    /// identical to the old `json!({"event_type", "payload": reading})` path —
+    /// the optimization only removes the intermediate Value tree, never changes
+    /// the wire contract the zone ingester deserializes.
+    #[test]
+    fn stream_envelope_matches_legacy_json_macro_output() {
+        let reading = energy_reading_with_metadata(std::collections::HashMap::new());
+        let event_type = "SmartMeterReading";
+
+        let new_str = serde_json::to_string(&StreamEnvelope {
+            event_type,
+            payload: &reading,
+        })
+        .unwrap();
+        let legacy_str = serde_json::to_string(&serde_json::json!({
+            "event_type": event_type,
+            "payload": &reading,
+        }))
+        .unwrap();
+
+        // Compare as parsed Values (key order is irrelevant to the consumer,
+        // which deserializes by key) — proves identical semantic content.
+        let new_val: serde_json::Value = serde_json::from_str(&new_str).unwrap();
+        let legacy_val: serde_json::Value = serde_json::from_str(&legacy_str).unwrap();
+        assert_eq!(new_val, legacy_val);
+    }
+
+    /// Same equivalence guarantee for the encrypted `enc` envelope branch.
+    #[test]
+    fn enc_stream_envelope_matches_legacy_json_macro_output() {
+        let (nonce, ciphertext) = ("bm9uY2U=".to_string(), "Y2lwaGVy".to_string());
+        let event_type = "SmartMeterReading";
+
+        let new_str = serde_json::to_string(&EncStreamEnvelope {
+            event_type,
+            enc: EncBody {
+                nonce: &nonce,
+                ciphertext: &ciphertext,
+            },
+        })
+        .unwrap();
+        let legacy_str = serde_json::to_string(&serde_json::json!({
+            "event_type": event_type,
+            "enc": { "nonce": nonce, "ciphertext": ciphertext },
+        }))
+        .unwrap();
+
+        let new_val: serde_json::Value = serde_json::from_str(&new_str).unwrap();
+        let legacy_val: serde_json::Value = serde_json::from_str(&legacy_str).unwrap();
+        assert_eq!(new_val, legacy_val);
     }
 
     #[tokio::test]

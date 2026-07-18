@@ -44,3 +44,12 @@ tracing = "0.1"
 # Metrics
 metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
+
+[dev-dependencies]
+# default-features off drops the plotters/html-report dep tree (keeps the CLI
+# timing output) — smaller compile, avoids OOM in the 8 GiB OrbStack build VM.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "serialize_envelope"
+harness = false
