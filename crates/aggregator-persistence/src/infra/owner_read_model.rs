@@ -361,7 +361,17 @@ impl OwnerReadModelConsumer {
             }
 
             // IAM wallet events are keyed by user → touch every serial that user owns.
-            "UserWalletLinked" | "UserOnboarded" | "UserWalletPrimaryChanged" => {
+            //
+            // `EmailVerified` belongs here too: IAM auto-provisions the custodial
+            // wallet at e-mail verification and that event is the FIRST (and in the
+            // common self-service flow, the ONLY) user event carrying the wallet —
+            // `UserOnboarded`/`UserWalletLinked` fire only on the separate on-chain
+            // onboarding path. Without it a verified user who claims a meter never
+            // gets a wallet into the read-model and every surplus mint defers.
+            // Its payload has no `is_primary` (⇒ treated primary) and a missing
+            // `wallet_address` deserializes to None, which `wallet_or_none` keeps
+            // as NULL — same contract as the other arms.
+            "EmailVerified" | "UserWalletLinked" | "UserOnboarded" | "UserWalletPrimaryChanged" => {
                 let data: UserEventData = match serde_json::from_value(event.data) {
                     Ok(d) => d,
                     Err(e) => {
@@ -380,6 +390,17 @@ impl OwnerReadModelConsumer {
                     return;
                 }
                 let wallet = wallet_or_none(data.wallet_address.as_deref());
+                // EmailVerified stamps the wallet with `unwrap_or("")` on the IAM
+                // side — an empty wallet there means provisioning hadn't landed
+                // yet (or a re-verify raced it), NOT an authoritative unlink. A
+                // clear must come from the explicit wallet events only.
+                if wallet.is_none() && event.event_type == "EmailVerified" {
+                    debug!(
+                        "owner read-model: EmailVerified without wallet for user {}, skipping",
+                        data.user_id
+                    );
+                    return;
+                }
                 match repo.update_wallet_by_user(data.user_id, wallet).await {
                     Ok(n) => debug!(
                         "owner read-model: updated {n} meter row(s) for user {}",
