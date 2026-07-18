@@ -240,18 +240,23 @@ impl OwnerReadModel {
         Ok(res.rows_affected())
     }
 
-    /// One-time, idempotent first-boot seed from the CURRENT shared source — the
-    /// same `meters ⋈ users(wallet_address)` join the aggregator reads today
-    /// (reachable pre-cutover on `DATABASE_URL`). `ON CONFLICT DO NOTHING` so a
+    /// One-time, idempotent first-boot seed. `ON CONFLICT DO NOTHING` so a
     /// re-run (or a row already advanced by a live event) is never clobbered.
     /// Returns the number of rows seeded.
     ///
-    /// NOTE: this JOIN reads IAM-owned `users` — that is the very cross-domain
-    /// read Phase 2 removes. It is used HERE only to seed the read-model at
-    /// cutover; the live path keeps using it until the read-model is verified,
-    /// per the `TODO(db-split)` markers (not touched by this change).
+    /// Two sources, picked by what the connected DB actually contains:
+    /// - **Pre-cutover** (shared DB): the legacy `meters ⋈ users(wallet_address)`
+    ///   join — the same cross-domain read Phase 2 removes, used here only to seed.
+    /// - **Post-cutover** (dedicated `gridtokenx_meter` DB): IAM's `users` table no
+    ///   longer exists (SQLSTATE 42P01), so seed the serial → user edge from the
+    ///   local `meters` table, taking any wallet already known to
+    ///   `user_wallet_read_model`. Wallets IAM assigned before the cutover are NOT
+    ///   here (their events pre-date the consumer group's offsets) — those rows
+    ///   seed with a NULL wallet and are healed by
+    ///   [`repair_missing_wallets`](Self::repair_missing_wallets) via IAM
+    ///   `GetUserWallet`, not by this seed.
     pub async fn backfill(&self) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(
+        let legacy = sqlx::query(
             r#"
             INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
             SELECT canonicalize_meter_serial(m.serial_number), m.user_id, u.wallet_address, now()
@@ -261,9 +266,114 @@ impl OwnerReadModel {
             "#,
         )
         .execute(&self.pool)
+        .await;
+        match legacy {
+            Ok(res) => Ok(res.rows_affected()),
+            Err(e) if is_undefined_table(&e) => {
+                info!("owner read-model backfill: no IAM `users` table here (post-split DB) — seeding from local meters ⋈ user_wallet_read_model");
+                self.backfill_local().await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Post-cutover seed from tables that live in the metering DB itself:
+    /// `meters` for the serial → user edge, `user_wallet_read_model` for any
+    /// wallet the event feed has already recorded.
+    async fn backfill_local(&self) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
+            SELECT canonicalize_meter_serial(m.serial_number), m.user_id, uw.wallet_address, now()
+            FROM meters m
+            LEFT JOIN user_wallet_read_model uw ON uw.user_id = m.user_id
+            ON CONFLICT (serial_number) DO NOTHING
+            "#,
+        )
+        .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
     }
+
+    /// Users whose read-model rows have no wallet — the mint-blocking state the
+    /// repair pass resolves against IAM. Bounded so a huge fleet can't turn the
+    /// one-shot repair into an unbounded IAM scan (leftovers heal next boot).
+    async fn users_missing_wallet(&self) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT user_id FROM meter_owner_read_model
+            WHERE wallet_address IS NULL
+            LIMIT 1000
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// One-shot repair: for every read-model row missing a wallet, ask `resolve`
+    /// (IAM `GetUserWallet`, wired by the server layer) for the user's primary
+    /// wallet and write it through [`update_wallet_by_user`](Self::update_wallet_by_user).
+    /// Covers users whose IAM wallet events pre-date the feed's consumer offsets
+    /// (e.g. registrations before the DB-per-service cutover), which neither the
+    /// event stream nor the local seed can recover.
+    ///
+    /// `resolve` returns `Ok(None)` when the user simply has no wallet yet (kept
+    /// NULL, retried next boot) and `Err` on transport failure (logged, skipped).
+    /// Returns `(rows_fixed, users_checked)`.
+    pub async fn repair_missing_wallets<F, Fut>(&self, resolve: F) -> (u64, u64)
+    where
+        F: Fn(Uuid) -> Fut,
+        Fut: Future<Output = Result<Option<String>>>,
+    {
+        let users = match self.users_missing_wallet().await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("owner read-model wallet repair: scan failed ({e}); skipping");
+                return (0, 0);
+            }
+        };
+        let checked = users.len() as u64;
+        let mut fixed = 0u64;
+        for user_id in users {
+            match resolve(user_id).await {
+                Ok(Some(raw)) => match wallet_or_none(Some(&raw)) {
+                    Some(wallet) => match self.update_wallet_by_user(user_id, Some(wallet)).await {
+                        Ok(n) => {
+                            debug!("owner read-model wallet repair: filled {n} row(s) for user {user_id}");
+                            fixed += n;
+                        }
+                        Err(e) => warn!(
+                            "owner read-model wallet repair: write failed for user {user_id} ({e})"
+                        ),
+                    },
+                    None => debug!(
+                        "owner read-model wallet repair: IAM returned blank wallet for user {user_id}; leaving NULL"
+                    ),
+                },
+                Ok(None) => debug!(
+                    "owner read-model wallet repair: user {user_id} has no wallet yet; leaving NULL"
+                ),
+                Err(e) => warn!(
+                    "owner read-model wallet repair: resolve failed for user {user_id} ({e}); leaving NULL"
+                ),
+            }
+        }
+        (fixed, checked)
+    }
+}
+
+/// SQLSTATE 42P01 (`undefined_table`) — the discriminator between the shared
+/// pre-cutover DB (IAM `users` present) and the dedicated metering DB (absent).
+fn is_undefined_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01"))
+}
+
+/// Whether the owner read-model feed is enabled (`AGGREGATOR_OWNER_READMODEL_FEED`).
+/// Shared with the server layer so the wallet-repair pass rides the same gate.
+pub fn feed_enabled() -> bool {
+    std::env::var("AGGREGATOR_OWNER_READMODEL_FEED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
 }
 
 /// Kafka consumer feeding the read-model. Mirrors
@@ -461,10 +571,7 @@ pub async fn spawn_owner_readmodel_feed(
     pool: Option<PgPool>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
-    let enabled = std::env::var("AGGREGATOR_OWNER_READMODEL_FEED")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    if !enabled {
+    if !feed_enabled() {
         info!("ℹ️ Owner read-model feed disabled (AGGREGATOR_OWNER_READMODEL_FEED != true)");
         return;
     }
@@ -484,14 +591,13 @@ pub async fn spawn_owner_readmodel_feed(
     // non-fatal: the live event feed + the lazy per-serial DB re-resolve keep the
     // model current, so log and continue rather than abort the feed.
     //
-    // SCOPE: this seeds from `meters ⋈ users` on THIS pool. It only succeeds while
-    // the pool still points at the shared DB (pre-cutover / dual-write window).
-    // On the dedicated `gridtokenx_meter` DB there is no IAM `users` table, so the
-    // backfill errors (logged, non-fatal) and the read-model is seeded by event
-    // replay instead — a cross-DB seed (old shared DB → new metering DB) is the
-    // cutover tooling's job, not this single-pool runtime path (docs §3 option 1/2).
+    // SCOPE: pre-cutover (shared DB) this seeds from `meters ⋈ users`; on the
+    // dedicated `gridtokenx_meter` DB (no IAM `users` table) it falls back to the
+    // local `meters ⋈ user_wallet_read_model` seed. Wallets whose IAM events
+    // pre-date the consumer offsets are healed separately by the server-layer
+    // wallet-repair pass (`repair_missing_wallets` over IAM `GetUserWallet`).
     match repo.backfill().await {
-        Ok(n) => info!("📥 Owner read-model backfilled {n} row(s) from meters ⋈ users"),
+        Ok(n) => info!("📥 Owner read-model backfilled {n} row(s)"),
         Err(e) => warn!(
             "⚠️ Owner read-model backfill skipped/failed ({e}); feed continues (events + lazy re-resolve)"
         ),

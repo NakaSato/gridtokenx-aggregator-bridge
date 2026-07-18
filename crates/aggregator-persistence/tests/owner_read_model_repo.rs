@@ -207,3 +207,128 @@ async fn wallet_event_before_first_meter_event_is_not_lost() {
         "unlinked wallet must not come back from the edge table"
     );
 }
+
+#[tokio::test]
+async fn backfill_seeds_from_local_meters_when_users_table_absent() {
+    // Post-split regression (observed live 2026-07-18): the dedicated metering DB
+    // has no IAM `users` table, so the legacy `meters ⋈ users` seed 42P01'd on
+    // every boot and pre-cutover meters never entered the read-model. The fallback
+    // must seed the serial → user edge from the local `meters` table, taking any
+    // wallet the user_wallet_read_model edge already knows.
+    let Some(url) = test_url() else {
+        eprintln!("SKIP backfill_seeds_from_local_meters_when_users_table_absent: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-BF1", "OWNREPO-BF2"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let (u_walleted, u_bare) = (Uuid::new_v4(), Uuid::new_v4());
+
+    // Precondition: this throwaway DB must be the post-split shape (no `users`),
+    // else the legacy join succeeds and the fallback under test never runs.
+    let users_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.users') IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("regclass probe");
+    assert!(
+        !users_exists,
+        "test DB has a users table — fallback path not exercised; point METER_TEST_DATABASE_URL at a bridge-migrations-only DB"
+    );
+
+    for s in ["OWNREPO-BF1", "OWNREPO-BF2"] {
+        sqlx::query("DELETE FROM meters WHERE serial_number = $1")
+            .bind(s)
+            .execute(&pool)
+            .await
+            .expect("meters cleanup");
+    }
+    sqlx::query("INSERT INTO meters (user_id, serial_number) VALUES ($1, $2)")
+        .bind(u_walleted)
+        .bind("OWNREPO-BF1")
+        .execute(&pool)
+        .await
+        .expect("insert meter 1");
+    sqlx::query("INSERT INTO meters (user_id, serial_number) VALUES ($1, $2)")
+        .bind(u_bare)
+        .bind("OWNREPO-BF2")
+        .execute(&pool)
+        .await
+        .expect("insert meter 2");
+    // u_walleted already has a durable wallet edge (0 meter rows in the read-model
+    // yet, so this writes only user_wallet_read_model); u_bare has none.
+    repo.update_wallet_by_user(u_walleted, Some("W-EDGE")).await.unwrap();
+
+    let n = repo.backfill().await.expect("backfill must not error on a users-less DB");
+    assert!(n >= 2, "both meters rows must seed (got {n})");
+    assert_eq!(
+        row(&pool, "OWNREPO-BF1").await,
+        Some((u_walleted, Some("W-EDGE".to_string()))),
+        "seed must pick up the known wallet edge"
+    );
+    assert_eq!(
+        row(&pool, "OWNREPO-BF2").await,
+        Some((u_bare, None)),
+        "no edge ⇒ seeded with NULL wallet (repair pass fills it later)"
+    );
+}
+
+#[tokio::test]
+async fn repair_missing_wallets_resolves_via_callback() {
+    // Wallet events consumed before the cutover never reached this DB — the
+    // repair pass resolves those users through the injected callback (IAM
+    // GetUserWallet in production). Ok(Some) fills the row + durable edge,
+    // Ok(None) ("no wallet yet") and Err (IAM down) both leave NULL for the
+    // next boot.
+    let Some(url) = test_url() else {
+        eprintln!("SKIP repair_missing_wallets_resolves_via_callback: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-RP1", "OWNREPO-RP2", "OWNREPO-RP3"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let (u_fixed, u_no_wallet, u_iam_down) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+    repo.upsert_by_serial("OWNREPO-RP1", u_fixed, None).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-RP2", u_no_wallet, None).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-RP3", u_iam_down, None).await.unwrap();
+
+    // The scan is table-wide (other tests' NULL rows may be in flight in the same
+    // DB), so the stub answers by user_id and the assertions check rows, not counts.
+    let (fixed, checked) = repo
+        .repair_missing_wallets(|uid| async move {
+            if uid == u_fixed {
+                Ok(Some("  W-REPAIRED  ".to_string())) // resolver output gets normalized
+            } else if uid == u_iam_down {
+                Err(anyhow::anyhow!("iam unreachable"))
+            } else {
+                Ok(None)
+            }
+        })
+        .await;
+    assert!(checked >= 3, "all three NULL-wallet users must be scanned (got {checked})");
+    assert!(fixed >= 1, "the resolvable user's row must be counted as fixed");
+
+    assert_eq!(
+        row(&pool, "OWNREPO-RP1").await.unwrap().1.as_deref(),
+        Some("W-REPAIRED"),
+        "resolved wallet must land trimmed"
+    );
+    assert!(
+        row(&pool, "OWNREPO-RP2").await.unwrap().1.is_none(),
+        "user without a wallet stays NULL"
+    );
+    assert!(
+        row(&pool, "OWNREPO-RP3").await.unwrap().1.is_none(),
+        "resolver failure leaves NULL (healed next boot)"
+    );
+
+    // The repair writes through update_wallet_by_user, so the durable edge is
+    // recorded too — a later meter event for this user back-fills from it.
+    let edge: Option<String> = sqlx::query_scalar(
+        "SELECT wallet_address FROM user_wallet_read_model WHERE user_id = $1",
+    )
+    .bind(u_fixed)
+    .fetch_one(&pool)
+    .await
+    .expect("edge row");
+    assert_eq!(edge.as_deref(), Some("W-REPAIRED"));
+}

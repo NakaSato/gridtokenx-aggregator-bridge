@@ -238,6 +238,10 @@ async fn main() -> Result<()> {
     // spawned after the shutdown token exists (gated on AGGREGATOR_OWNER_READMODEL_FEED).
     let owner_readmodel_pool = pg_pool.clone();
 
+    // ...and once more for the one-shot wallet-repair pass, spawned further down
+    // once the IAM gRPC client exists (it resolves missing wallets via IAM).
+    let wallet_repair_pool = pg_pool.clone();
+
     let meter_registry = Arc::new(
         infra::meter_registry::MeterRegistry::new(early_redis_conn.clone(), pg_pool)
             .with_read_model(own_meter_db),
@@ -397,6 +401,11 @@ async fn main() -> Result<()> {
     // Both share the same async fire-and-forget queue.
     let billing_influx = influx_writer.clone();
 
+    // Keep a handle for the mint write-back (marks reading rows minted + stamps
+    // the tx signature when a surplus mint confirms) before the writer moves into
+    // the router. `None` when the readings sink is disabled → write-back is skipped.
+    let mint_writeback = pg_readings_writer.clone();
+
     let iot_router = Arc::new(
         router::Router::new(&redis_url, num_zones, influx_writer)
             .await
@@ -485,6 +494,7 @@ async fn main() -> Result<()> {
         let billing_shutdown = shutdown_token.clone();
         let settle_mint = mint_gateway.clone();
         let settle_registry = meter_registry.clone();
+        let settle_writeback = mint_writeback.clone();
         let billing_influx = billing_influx;
         let settle_bin_store = bin_store.clone();
         let settle_outbox = mint_outbox.clone();
@@ -617,6 +627,7 @@ async fn main() -> Result<()> {
                                                 handoff = MintHandoff::Enqueued;
                                                 let gw = settle_mint.clone();
                                                 let reg = settle_registry.clone();
+                                                let wb = settle_writeback.clone();
                                                 let outbox = outbox.clone();
                                                 let field = pending.field();
                                                 let inflight = sink_inflight.clone();
@@ -629,7 +640,7 @@ async fn main() -> Result<()> {
                                                     let Ok(_permit) = inflight.acquire_owned().await else {
                                                         return;
                                                     };
-                                                    if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await {
+                                                    if mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, wb.as_deref(), &pending).await {
                                                         if let Err(e) = outbox.remove(&field).await {
                                                             warn!("mint outbox remove failed for {field} ({e}); a stale entry only causes one idempotent retry");
                                                         }
@@ -662,7 +673,7 @@ async fn main() -> Result<()> {
                                                             "mint outbox enqueue failed twice for meter {} window {}: {e2}; attempting immediate mint as last resort",
                                                             pending.meter_serial, pending.window_start_ms
                                                         );
-                                                        if mint_settlement::attempt_mint(&settle_mint, &settle_registry, &sink_inflight_keys, &pending).await {
+                                                        if mint_settlement::attempt_mint(&settle_mint, &settle_registry, &sink_inflight_keys, settle_writeback.as_deref(), &pending).await {
                                                             handoff = MintHandoff::MintedDirectly;
                                                         } else {
                                                             error!(
@@ -690,13 +701,14 @@ async fn main() -> Result<()> {
                                             handoff = MintHandoff::BestEffortOnly;
                                             let gw = settle_mint.clone();
                                             let reg = settle_registry.clone();
+                                            let wb = settle_writeback.clone();
                                             let inflight = sink_inflight.clone();
                                             let inflight_keys = sink_inflight_keys.clone();
                                             let handle = tokio::spawn(async move {
                                                 let Ok(_permit) = inflight.acquire_owned().await else {
                                                     return;
                                                 };
-                                                let _ = mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, &pending).await;
+                                                let _ = mint_settlement::attempt_mint(&gw, &reg, &inflight_keys, wb.as_deref(), &pending).await;
                                             });
                                             // No durable outbox in this branch (Redis is off), so
                                             // a panic here is the only failure signal there is —
@@ -748,6 +760,7 @@ async fn main() -> Result<()> {
     if let Some(outbox) = mint_outbox.clone() {
         let drain_gw = mint_gateway.clone();
         let drain_reg = meter_registry.clone();
+        let drain_writeback = mint_writeback.clone();
         let drain_shutdown = shutdown_token.clone();
         let drain_inflight = mint_inflight.clone();
         let drain_inflight_keys = mint_inflight_keys.clone();
@@ -830,6 +843,7 @@ async fn main() -> Result<()> {
                         for batch in to_mint.chunks(batch_size).map(|c| c.to_vec()) {
                             let gw = drain_gw.clone();
                             let reg = drain_reg.clone();
+                            let wb = drain_writeback.clone();
                             let outbox = outbox.clone();
                             let inflight = drain_inflight.clone();
                             let inflight_keys = drain_inflight_keys.clone();
@@ -841,7 +855,7 @@ async fn main() -> Result<()> {
                                 // on-chain; the rest stay for the next tick (no_wallet
                                 // / bridge down / sim rejection / reply timeout).
                                 let confirmed = mint_settlement::attempt_mint_batch(
-                                    &gw, &reg, &inflight_keys, &batch,
+                                    &gw, &reg, &inflight_keys, wb.as_deref(), &batch,
                                 )
                                 .await;
                                 for field in confirmed {
@@ -1126,6 +1140,46 @@ async fn main() -> Result<()> {
         Some(Arc::new(client))
     }
     .await;
+
+    // DB-per-service Phase 2 — one-shot wallet repair for owner read-model rows
+    // whose IAM wallet events pre-date the feed's consumer offsets (e.g. users
+    // registered before the metering-DB cutover): resolve each missing wallet via
+    // IAM GetUserWallet (the RPC the settlement path is already allowed to call)
+    // and write it through the read-model. Rides the same gate as the feed;
+    // degrade-safe: no pool / no IAM client ⇒ no-op, resolve errors leave NULL.
+    if infra::owner_read_model::feed_enabled() {
+        if let (Some(pool), Some(client)) = (wallet_repair_pool, identity_client.clone()) {
+            let repo = infra::owner_read_model::OwnerReadModel::new(pool);
+            tokio::spawn(async move {
+                let (fixed, checked) = repo
+                    .repair_missing_wallets(|user_id| {
+                        let client = client.clone();
+                        async move {
+                            let req = state::identity::GetUserWalletRequest {
+                                user_id: user_id.to_string(),
+                                ..Default::default()
+                            };
+                            match client.get_user_wallet(req).await {
+                                Ok(resp) => {
+                                    let wallet = resp.into_owned().wallet_address;
+                                    Ok((!wallet.trim().is_empty())
+                                        .then(|| wallet.trim().to_string()))
+                                }
+                                // "No wallet yet" is a normal state, not a failure.
+                                Err(e) if e.code == connectrpc::ErrorCode::NotFound => Ok(None),
+                                Err(e) => Err(anyhow::anyhow!("GetUserWallet: {e:?}")),
+                            }
+                        }
+                    })
+                    .await;
+                if checked > 0 {
+                    info!(
+                        "🩹 Owner read-model wallet repair: filled {fixed} row(s) across {checked} user(s) missing a wallet"
+                    );
+                }
+            });
+        }
+    }
 
     // 7b. Initialize Prometheus metrics exporter
     let metrics_recorder = metrics_exporter_prometheus::PrometheusBuilder::new()
