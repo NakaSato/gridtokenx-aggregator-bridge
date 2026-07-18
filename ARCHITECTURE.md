@@ -191,15 +191,18 @@ no external SCADA feed:
   resolved by name before create — blind create 409s forever after a restart.
 - **OpenADR 3, VEN side (inbound).** `OpenLeadrVenListener` (verified
   `crates/aggregator-logic/src/standards/openleadr_ven.rs:47`) polls a
-  (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for
-  `DISPATCH_SETPOINT` events and executes them through an injected adapter —
+  (typically utility-operated) VTN (`OPENLEADR_VEN_VTN_URL`) for dispatch
+  setpoint events — both absolute `DISPATCH_SETPOINT` and relative
+  `DISPATCH_SETPOINT_RELATIVE` (`setpoint_kind`, both actuate the same signed-kW
+  FLEX path, relative tagged only in logs/metrics `executed_relative`) — and
+  executes them through an injected adapter —
   at startup it self-registers a VEN object named `OPENLEADR_VEN_CLIENT_NAME`
   on the VTN, best-effort (`ensure_registered`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:191`) —
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:194`) —
   `ieee` default or `grpc`, **never** `openleadr`, which would loop events back
   to a VTN. Event schedules are honored across **all** setpoint intervals
   (`decide`, verified
-  `crates/aggregator-logic/src/standards/openleadr_ven.rs:552`): each interval
+  `crates/aggregator-logic/src/standards/openleadr_ven.rs:583`): each interval
   executes as its window opens (deduped per interval), future windows wait,
   an event is done only when no pending interval remains, the interval-level
   period wins over the event-level default, and a period-less interval

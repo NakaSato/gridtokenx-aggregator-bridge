@@ -204,8 +204,10 @@ seeded by the one-shot `openleadr-vtn-seed` service). The dispatch trigger is a 
 bin (capacity > 0), so ingest telemetry first.
 
 OpenADR VEN side: `OPENLEADR_VEN_VTN_URL` enables a polling listener
-(`crates/aggregator-logic/src/standards/openleadr_ven.rs`) that consumes `DISPATCH_SETPOINT` events
-from a (utility) VTN and executes them via `OPENLEADR_VEN_DISPATCH_ADAPTER` (`ieee` default, `grpc`
+(`crates/aggregator-logic/src/standards/openleadr_ven.rs`) that consumes dispatch setpoint events —
+both absolute `DISPATCH_SETPOINT` and relative `DISPATCH_SETPOINT_RELATIVE` (same signed-kW FLEX path,
+relative tagged `executed_relative` on `/metrics`) — from a (utility) VTN and executes them via
+`OPENLEADR_VEN_DISPATCH_ADAPTER` (`ieee` default, `grpc`
 → `DISPATCH_GRPC_URL`) — never `openleadr`, or events would loop back to a VTN. Note: `ieee` is a
 simulation stub (logs, no actuation) — main.rs warns loud when the VEN uses it because execution
 reports would attest simulated dispatch. Positive setpoint = FLEX_UP, negative = FLEX_DOWN;

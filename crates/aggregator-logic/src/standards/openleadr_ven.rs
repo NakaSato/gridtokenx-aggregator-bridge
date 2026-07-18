@@ -72,11 +72,15 @@ enum EventDecision {
     /// An active, not-yet-executed dispatch interval — execute this setpoint.
     /// `more_pending` means other intervals (future, or also active) remain,
     /// so the event must stay live for the next poll instead of being marked
-    /// fully seen.
+    /// fully seen. `relative` is set for a `DISPATCH_SETPOINT_RELATIVE` payload
+    /// (a delta from the current operating point) vs the absolute
+    /// `DISPATCH_SETPOINT` — both actuate through the same signed-kW FLEX path,
+    /// the flag only distinguishes them in logs.
     Execute {
         setpoint_kw: f64,
         interval_id: i32,
         more_pending: bool,
+        relative: bool,
     },
     /// Dispatch event with no active interval yet — re-check next poll.
     NotYetActive,
@@ -297,13 +301,15 @@ impl OpenLeadrVenListener {
                     setpoint_kw,
                     interval_id,
                     more_pending,
+                    relative,
                 } => {
                     let (action, capacity_kw) = setpoint_to_dispatch(setpoint_kw);
+                    let kind = if relative { "relative" } else { "absolute" };
                     match self.adapter.execute_dispatch(action, capacity_kw).await {
                         Ok(()) => {
                             info!(
-                                "OpenADR VEN event executed: event_id={} interval_id={} setpoint_kw={} action={:?} capacity_kw={}",
-                                id, interval_id, setpoint_kw, action, capacity_kw
+                                "OpenADR VEN event executed: event_id={} interval_id={} kind={} setpoint_kw={} action={:?} capacity_kw={}",
+                                id, interval_id, kind, setpoint_kw, action, capacity_kw
                             );
                             self.executed_active
                                 .insert(id.clone(), active_window_end(event.content(), now));
@@ -316,7 +322,11 @@ impl OpenLeadrVenListener {
                                 self.mark_seen(id.clone(), modified).await;
                             }
                             dispatched += 1;
-                            crate::metrics::record_ven_event("executed");
+                            crate::metrics::record_ven_event(if relative {
+                                "executed_relative"
+                            } else {
+                                "executed"
+                            });
                             // Best-effort: the dispatch already happened, so a
                             // report failure must not fail (or retry) it.
                             if self.reports_enabled {
@@ -517,10 +527,30 @@ impl RedisSeenStore {
     }
 }
 
-/// Every numeric DISPATCH_SETPOINT payload in the event: (interval id,
-/// setpoint, interval-level period). One entry per interval (first numeric
-/// setpoint payload of each).
-fn find_setpoints(event: &EventRequest) -> Vec<(i32, f64, Option<&IntervalPeriod>)> {
+/// One numeric dispatch setpoint drawn from an event interval.
+struct Setpoint<'a> {
+    interval_id: i32,
+    value_kw: f64,
+    /// `true` for `DISPATCH_SETPOINT_RELATIVE` (delta from baseline), `false`
+    /// for absolute `DISPATCH_SETPOINT`. Both actuate identically here.
+    relative: bool,
+    period: Option<&'a IntervalPeriod>,
+}
+
+/// `true` if this payload type carries a dispatch setpoint (absolute or
+/// relative). Returns `Some(relative)` so callers can tell the two apart.
+fn setpoint_kind(value_type: &EventType) -> Option<bool> {
+    match value_type {
+        EventType::DispatchSetpoint => Some(false),
+        EventType::DispatchSetpointRelative => Some(true),
+        _ => None,
+    }
+}
+
+/// Every numeric dispatch-setpoint payload in the event — both absolute
+/// (`DISPATCH_SETPOINT`) and relative (`DISPATCH_SETPOINT_RELATIVE`). One entry
+/// per interval (first numeric setpoint payload of each).
+fn find_setpoints(event: &EventRequest) -> Vec<Setpoint<'_>> {
     event
         .intervals
         .as_deref()
@@ -528,11 +558,14 @@ fn find_setpoints(event: &EventRequest) -> Vec<(i32, f64, Option<&IntervalPeriod
         .iter()
         .filter_map(|interval| {
             interval.payloads.iter().find_map(|payload| {
-                if payload.value_type != EventType::DispatchSetpoint {
-                    return None;
-                }
+                let relative = setpoint_kind(&payload.value_type)?;
                 payload.values.iter().find_map(|v| match v {
-                    Value::Number(n) => Some((interval.id, *n, interval.interval_period.as_ref())),
+                    Value::Number(n) => Some(Setpoint {
+                        interval_id: interval.id,
+                        value_kw: *n,
+                        relative,
+                        period: interval.interval_period.as_ref(),
+                    }),
                     _ => None,
                 })
             })
@@ -554,9 +587,9 @@ fn decide(event: &EventRequest, now: DateTime<Utc>, executed: &HashSet<i32>) -> 
     }
 
     let mut any_future = false;
-    let mut active_unexecuted: Vec<(i32, f64)> = Vec::new();
-    for (interval_id, setpoint_kw, interval_period) in setpoints {
-        let active = match interval_period.or(event.interval_period.as_ref()) {
+    let mut active_unexecuted: Vec<(i32, f64, bool)> = Vec::new();
+    for sp in setpoints {
+        let active = match sp.period.or(event.interval_period.as_ref()) {
             // No schedule: an "as soon as possible" dispatch, always active.
             None => true,
             Some(period) if now < period.start => {
@@ -571,16 +604,17 @@ fn decide(event: &EventRequest, now: DateTime<Utc>, executed: &HashSet<i32>) -> 
                 }
             }
         };
-        if active && !executed.contains(&interval_id) {
-            active_unexecuted.push((interval_id, setpoint_kw));
+        if active && !executed.contains(&sp.interval_id) {
+            active_unexecuted.push((sp.interval_id, sp.value_kw, sp.relative));
         }
     }
 
-    if let Some(&(interval_id, setpoint_kw)) = active_unexecuted.first() {
+    if let Some(&(interval_id, setpoint_kw, relative)) = active_unexecuted.first() {
         return EventDecision::Execute {
             setpoint_kw,
             interval_id,
             more_pending: any_future || active_unexecuted.len() > 1,
+            relative,
         };
     }
     if any_future {
@@ -599,7 +633,7 @@ fn active_window_end(event: &EventRequest, now: DateTime<Utc>) -> DateTime<Utc> 
     find_setpoints(event)
         .iter()
         .map(
-            |(_, _, interval_period)| match interval_period.or(event.interval_period.as_ref()) {
+            |sp| match sp.period.or(event.interval_period.as_ref()) {
                 Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
                     Some(d) => p.start + d.to_chrono_at_datetime(p.start),
                     None => fallback,
@@ -702,7 +736,25 @@ mod tests {
             EventDecision::Execute {
                 setpoint_kw: 42.0,
                 interval_id: 0,
-                more_pending: false
+                more_pending: false,
+                relative: false,
+            }
+        );
+    }
+
+    #[test]
+    fn relative_setpoint_executes_and_is_flagged() {
+        // DISPATCH_SETPOINT_RELATIVE actuates through the same signed-kW FLEX
+        // path as absolute, but is tagged relative=true for observability.
+        let event =
+            event_with_payload(EventType::DispatchSetpointRelative, vec![Value::Number(-15.0)]);
+        assert_eq!(
+            decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
+            EventDecision::Execute {
+                setpoint_kw: -15.0,
+                interval_id: 0,
+                more_pending: false,
+                relative: true,
             }
         );
     }
@@ -716,7 +768,8 @@ mod tests {
             EventDecision::Execute {
                 setpoint_kw: 42.0,
                 interval_id: 0,
-                more_pending: false
+                more_pending: false,
+                relative: false,
             }
         );
     }
@@ -800,7 +853,8 @@ mod tests {
             EventDecision::Execute {
                 setpoint_kw: 10.0,
                 interval_id: 0,
-                more_pending: true
+                more_pending: true,
+                relative: false,
             }
         );
         // Interval 0 executed: hold for interval 1, do NOT expire the event.
@@ -813,7 +867,8 @@ mod tests {
             EventDecision::Execute {
                 setpoint_kw: -20.0,
                 interval_id: 1,
-                more_pending: false
+                more_pending: false,
+                relative: false,
             }
         );
         // Both executed, nothing future: done.
