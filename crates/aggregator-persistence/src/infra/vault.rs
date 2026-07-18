@@ -47,8 +47,21 @@ impl VaultTransitClient {
         token: impl Into<String>,
         kek_name: impl Into<String>,
     ) -> Self {
+        // Bounded HTTP client — an unbounded Vault Transit call can hang the
+        // per-reading enckey-unwrap path indefinitely on a slow/wedged Vault.
+        // Tunable request budget (10s), tight connect (5s).
+        let timeout_secs = std::env::var("VAULT_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            // SAFETY: only fails if the TLS backend can't initialise — fatal at boot.
+            .expect("vault reqwest client: static TLS config must build");
         Self {
-            http: reqwest::Client::new(),
+            http,
             addr: addr.into().trim_end_matches('/').to_string(),
             token: token.into(),
             kek_name: kek_name.into(),

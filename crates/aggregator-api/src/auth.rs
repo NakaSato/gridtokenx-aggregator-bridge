@@ -54,6 +54,41 @@ fn negative_ttl() -> Duration {
     *T.get_or_init(|| ttl_from_env("API_KEY_NEG_CACHE_TTL_SECS", API_KEY_NEGATIVE_TTL_SECS))
 }
 
+/// Optional circuit breaker over IAM `VerifyApiKey`. The per-key cache already
+/// bounds IAM load while IAM is *up*; the breaker covers IAM being *down* — after
+/// a run of connection failures it opens, so cache-missing requests fast-fall to
+/// the static-key fallback instead of each eating the gRPC timeout. Opt-in
+/// (`AGGREGATOR_IAM_CIRCUIT_BREAKER_ENABLED=true`, default off) so existing
+/// behaviour is unchanged until it's canaried on. Only *connection errors* count
+/// as failures — a definitive IAM reject means IAM is up and closes the breaker.
+fn iam_breaker() -> Option<&'static gridtokenx_telemetry::breaker::CircuitBreaker> {
+    static CB: OnceLock<Option<gridtokenx_telemetry::breaker::CircuitBreaker>> = OnceLock::new();
+    CB.get_or_init(|| {
+        let enabled = std::env::var("AGGREGATOR_IAM_CIRCUIT_BREAKER_ENABLED")
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let threshold = std::env::var("AGGREGATOR_IAM_CB_FAILURE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(5);
+        let cooldown_secs = std::env::var("AGGREGATOR_IAM_CB_COOLDOWN_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(5);
+        info!(
+            "⚡ IAM circuit breaker enabled (threshold={threshold}, cooldown={cooldown_secs}s)"
+        );
+        Some(gridtokenx_telemetry::breaker::CircuitBreaker::new(
+            threshold,
+            Duration::from_secs(cooldown_secs),
+        ))
+    })
+    .as_ref()
+}
+
 /// Normalized result of the IAM `VerifyApiKey` round-trip, collapsing the
 /// gRPC `Ok`/`Err` + `valid` flag into the three cases the auth policy cares
 /// about. Keeping this separate from the action keeps the reject-vs-error
@@ -195,7 +230,14 @@ pub async fn api_key_auth(
     // 2. Verify with IAM Service (gRPC) if available, normalizing the outcome to
     //    an `IamVerdict` so the reject-vs-error policy is one pure, tested
     //    decision (`post_iam_action`) rather than tangled control flow.
-    let verdict = if let Some(ref identity_client) = state.identity_client {
+    let breaker = iam_breaker();
+    let verdict = if breaker.is_some_and(|cb| !cb.should_allow()) {
+        // Breaker OPEN: IAM has been failing — skip the round-trip and fall
+        // through to the static-key fallback instead of eating the gRPC timeout.
+        warn!("⚡ IAM circuit breaker OPEN — skipping VerifyApiKey, using static-key fallback");
+        metrics::counter!("aggregator_iam_circuit_breaker_skips_total").increment(1);
+        IamVerdict::Unavailable
+    } else if let Some(ref identity_client) = state.identity_client {
         let start = std::time::Instant::now();
         let request = ApiKeyRequest {
             key: api_key.clone(),
@@ -204,6 +246,10 @@ pub async fn api_key_auth(
 
         match identity_client.verify_api_key(request).await {
             Ok(response) => {
+                // IAM responded (authorized OR rejected) — it's up; close the breaker.
+                if let Some(cb) = breaker {
+                    cb.record_success();
+                }
                 let latency_us = start.elapsed().as_micros() as u64;
                 let res: ApiKeyResponse = response.into_owned();
                 if res.valid {
@@ -223,6 +269,10 @@ pub async fn api_key_auth(
                 }
             }
             Err(e) => {
+                // Connection error — IAM unreachable; count toward opening the breaker.
+                if let Some(cb) = breaker {
+                    cb.record_failure();
+                }
                 let latency_us = start.elapsed().as_micros() as u64;
                 warn!(
                     "⚠️ IAM Service error: {} [{}us]. Falling back to static keys.",
