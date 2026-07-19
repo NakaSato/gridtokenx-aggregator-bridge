@@ -12,7 +12,8 @@ use aggregator_persistence::infra::meter_registry::MeterRegistry;
 use aggregator_persistence::infra::mint::{
     wallet_is_valid, BatchMintInput, MintBatchItemResult, MintGateway, MintReplyTimeout,
 };
-use tracing::{info, warn};
+use aggregator_persistence::infra::pg_readings::PgReadingsWriter;
+use tracing::{debug, info, warn};
 
 use crate::metrics;
 use crate::mint_outbox::PendingMint;
@@ -69,6 +70,7 @@ pub async fn attempt_mint(
     gw: &MintGateway,
     reg: &MeterRegistry,
     inflight: &Arc<MintInFlight>,
+    writeback: Option<&PgReadingsWriter>,
     p: &PendingMint,
 ) -> bool {
     let Some(_guard) = inflight.try_begin(p.field()) else {
@@ -128,6 +130,24 @@ pub async fn attempt_mint(
                 p.energy_kwh, p.meter_serial, out.signature, out.slot
             );
             metrics::record_mint_outcome("settled", "ok");
+            // Reflect the confirmed mint onto the reading rows so the trading UI's
+            // Reading History flips pending → minted and shows the signature.
+            // Best-effort: a DB fault must not fail the (already on-chain) mint.
+            if let Some(wb) = writeback {
+                match wb
+                    .mark_minted(&p.meter_serial, p.window_start_ms, &out.signature, out.slot)
+                    .await
+                {
+                    Ok(n) => debug!(
+                        "mint write-back marked {n} reading row(s) minted for meter {} window {}",
+                        p.meter_serial, p.window_start_ms
+                    ),
+                    Err(e) => warn!(
+                        "mint write-back failed for meter {} window {} ({e}); Reading History stays pending until a retry re-confirms",
+                        p.meter_serial, p.window_start_ms
+                    ),
+                }
+            }
             true
         }
         Err(e) => {
@@ -187,6 +207,7 @@ pub async fn attempt_mint_batch(
     gw: &MintGateway,
     reg: &MeterRegistry,
     inflight: &Arc<MintInFlight>,
+    writeback: Option<&PgReadingsWriter>,
     pending: &[PendingMint],
 ) -> Vec<String> {
     // Resolve wallets and claim in-flight keys, holding each guard across the
@@ -254,6 +275,11 @@ pub async fn attempt_mint_batch(
             for _ in 0..c.failed {
                 metrics::record_mint_outcome("failed", "mint_err");
             }
+            // Write each confirmed mint back onto its window's reading rows (same
+            // pending → minted flip as `attempt_mint`). Best-effort per item.
+            if let Some(wb) = writeback {
+                write_back_confirmed(wb, &results).await;
+            }
             c.confirmed_fields
         }
         Err(e) => {
@@ -271,6 +297,51 @@ pub async fn attempt_mint_batch(
     };
     // `guards` drop here, releasing every claimed in-flight key.
     result
+}
+
+/// Parse a batch item's `idempotency_key` (`mint:{serial}:{window_start_ms}`)
+/// into `(meter_serial, window_start_ms)` for the mint write-back. The serial is
+/// a UUID (no colon); the window is the trailing all-digit segment, so splitting
+/// on the LAST colon separates them even though the `mint:` prefix adds one.
+/// Returns `None` for an unexpected shape or unparsable window (skip write-back,
+/// never panic — the outbox removal already keyed off the same field).
+fn parse_mint_field(idempotency_key: &str) -> Option<(&str, i64)> {
+    let field = idempotency_key
+        .strip_prefix("mint:")
+        .unwrap_or(idempotency_key);
+    let (serial, window) = field.rsplit_once(':')?;
+    let window_start_ms = window.parse::<i64>().ok()?;
+    Some((serial, window_start_ms))
+}
+
+/// Write every confirmed batch item back onto its window's reading rows. Skips
+/// items that failed, carry no signature, or whose key doesn't parse. Each row
+/// UPDATE is best-effort: a DB error is logged, never propagated (the mints are
+/// already on-chain; the outbox has already dropped these fields).
+async fn write_back_confirmed(wb: &PgReadingsWriter, results: &[MintBatchItemResult]) {
+    for r in results {
+        if !r.success {
+            continue;
+        }
+        let Some(sig) = r.signature.as_deref() else {
+            continue;
+        };
+        let Some((serial, window_start_ms)) = parse_mint_field(&r.idempotency_key) else {
+            warn!(
+                "mint write-back skipped: unparsable idempotency_key '{}'",
+                r.idempotency_key
+            );
+            continue;
+        };
+        match wb.mark_minted(serial, window_start_ms, sig, r.slot).await {
+            Ok(n) => debug!(
+                "mint write-back marked {n} reading row(s) minted for meter {serial} window {window_start_ms}"
+            ),
+            Err(e) => warn!(
+                "mint write-back failed for meter {serial} window {window_start_ms} ({e}); Reading History stays pending until a retry re-confirms"
+            ),
+        }
+    }
 }
 
 /// Maps a mint error to its metric `reason` label. A reply timeout is counted
@@ -354,6 +425,28 @@ mod tests {
     #[test]
     fn classify_empty_is_empty() {
         assert_eq!(classify_batch_results(&[]), BatchClassification::default());
+    }
+
+    #[test]
+    fn parse_mint_field_splits_uuid_serial_and_window() {
+        // Real key shape: UUID serial (contains no colon) + trailing window ms.
+        let (serial, window) =
+            parse_mint_field("mint:3eb13b90-4668-4257-bdd6-40fb06671ad1:1781078400000").unwrap();
+        assert_eq!(serial, "3eb13b90-4668-4257-bdd6-40fb06671ad1");
+        assert_eq!(window, 1_781_078_400_000);
+    }
+
+    #[test]
+    fn parse_mint_field_tolerates_missing_prefix() {
+        let (serial, window) = parse_mint_field("MTR-1:2000").unwrap();
+        assert_eq!(serial, "MTR-1");
+        assert_eq!(window, 2000);
+    }
+
+    #[test]
+    fn parse_mint_field_rejects_bad_shapes() {
+        assert!(parse_mint_field("mint:no-window").is_none()); // no colon after strip
+        assert!(parse_mint_field("mint:MTR-1:notanumber").is_none()); // window unparsable
     }
 
     #[test]

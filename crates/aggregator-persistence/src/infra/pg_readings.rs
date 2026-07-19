@@ -35,6 +35,11 @@ const CHANNEL_CAPACITY: usize = 10_000;
 const BATCH_SIZE: usize = 500;
 /// Max time a partial batch waits before being flushed. Mirrors `InfluxWriter`.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(2);
+/// Billing/mint aggregation window length in ms — matches the aggregator's
+/// 15-minute bin (`aggregator.rs` `WINDOW_MINUTES = 15`). A confirmed surplus
+/// mint marks every reading row whose `reading_timestamp` falls in
+/// `[window_start_ms, window_start_ms + WINDOW_MS)`.
+const WINDOW_MS: i64 = 15 * 60 * 1000;
 
 /// One meter reading destined for the shared `meter_readings` table.
 ///
@@ -59,6 +64,9 @@ pub struct ReadingRow {
 #[derive(Clone)]
 pub struct PgReadingsWriter {
     tx: mpsc::Sender<ReadingRow>,
+    /// Direct handle for the low-volume mint write-back (`mark_minted`), which
+    /// UPDATEs confirmed rows synchronously rather than through the insert queue.
+    pool: PgPool,
 }
 
 impl PgReadingsWriter {
@@ -84,9 +92,92 @@ impl PgReadingsWriter {
         };
 
         let (tx, rx) = mpsc::channel::<ReadingRow>(CHANNEL_CAPACITY);
-        tokio::spawn(run_writer(pool, rx, use_read_model));
+        tokio::spawn(run_writer(pool.clone(), rx, use_read_model));
         info!("🗃️ Postgres meter_readings sink enabled (dashboard Recent Readings)");
-        Some(Self { tx })
+        Some(Self { tx, pool })
+    }
+
+    /// Write-back a confirmed surplus mint onto the reading rows of its 15-minute
+    /// billing window. Flips those rows `pending → minted` for the meter-service's
+    /// `MINT_STATUS_CASE` (which derives the status from `minted`/`on_chain_confirmed`)
+    /// and surfaces the tx signature/slot that the trading UI's Reading History
+    /// renders — without this, a settled on-chain mint never touches `meter_readings`
+    /// and every row stays `pending` forever.
+    ///
+    /// Idempotent: `AND NOT minted` skips rows a prior confirmation already marked,
+    /// so a mint retry that re-confirms the same window is a no-op. Awaited (not
+    /// queued through the insert channel): confirmed mints are low-volume (one per
+    /// meter per 15-minute window). Best-effort at the call site — the caller logs a
+    /// DB error and never fails the mint, since the on-chain token has already moved.
+    /// Returns the number of reading rows marked.
+    pub async fn mark_minted(
+        &self,
+        meter_serial: &str,
+        window_start_ms: i64,
+        tx_signature: &str,
+        slot: u64,
+    ) -> Result<u64, sqlx::Error> {
+        // Canonicalize the same way the insert path does, so the UPDATE's
+        // `meter_serial =` predicate matches the rows this window wrote.
+        let serial = canonicalize_serial(meter_serial);
+        let window_end_ms = window_start_ms + WINDOW_MS;
+        let res = sqlx::query(
+            "UPDATE meter_readings
+                SET minted = true,
+                    on_chain_confirmed = true,
+                    on_chain_confirmed_at = now(),
+                    on_chain_slot = $1,
+                    mint_tx_signature = $2,
+                    blockchain_status = 'confirmed'
+              WHERE meter_serial = $3
+                AND reading_timestamp >= to_timestamp($4::double precision / 1000.0)
+                AND reading_timestamp <  to_timestamp($5::double precision / 1000.0)
+                AND NOT COALESCE(minted, false)",
+        )
+        .bind(slot as i64) // on_chain_slot is bigint; Solana slots fit in i64
+        .bind(tx_signature)
+        .bind(&serial)
+        .bind(window_start_ms)
+        .bind(window_end_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Write-back a completed bin that closed with **no surplus** (net
+    /// consumption/zero) — the sibling of [`Self::mark_minted`] for a
+    /// `MintDecision::NoSurplus` bin. Without this, a reading whose billing
+    /// window never generates a surplus has no code path that ever leaves
+    /// `blockchain_status = 'pending'`, so `MINT_STATUS_CASE` shows it as
+    /// "Pending" in the trading UI forever even though nothing was ever going
+    /// to mint for it.
+    ///
+    /// Only touches rows still at the default `'pending'` status, so it never
+    /// clobbers a `'confirmed'` (minted) or `'failed'` (denied) row — same
+    /// idempotency shape as `mark_minted`'s `AND NOT minted`. Best-effort: the
+    /// caller logs a DB error and moves on, since the bin is evicted either way.
+    pub async fn mark_no_surplus(
+        &self,
+        meter_serial: &str,
+        window_start_ms: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let serial = canonicalize_serial(meter_serial);
+        let window_end_ms = window_start_ms + WINDOW_MS;
+        let res = sqlx::query(
+            "UPDATE meter_readings
+                SET blockchain_status = 'no_surplus'
+              WHERE meter_serial = $1
+                AND reading_timestamp >= to_timestamp($2::double precision / 1000.0)
+                AND reading_timestamp <  to_timestamp($3::double precision / 1000.0)
+                AND NOT COALESCE(minted, false)
+                AND blockchain_status = 'pending'",
+        )
+        .bind(&serial)
+        .bind(window_start_ms)
+        .bind(window_end_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
     }
 
     /// Enqueue a reading for insertion. Fire-and-forget: never blocks, drops

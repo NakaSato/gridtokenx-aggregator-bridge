@@ -728,6 +728,23 @@ async fn main() -> Result<()> {
                                     // Net consumption — nothing to mint. Counted as the
                                     // denominator so "skipped" rates are interpretable.
                                     metrics::record_mint_outcome("no_surplus", "ok");
+                                    // Flip this window's rows off the default 'pending'
+                                    // status so the trading UI's Reading History doesn't
+                                    // show a consumption-only window as "Pending" forever
+                                    // (nothing was ever going to mint for it). Best-effort:
+                                    // a DB fault here is a display nit, not a data-loss bug.
+                                    if let Some(wb) = settle_writeback.as_deref() {
+                                        if let Err(e) = wb
+                                            .mark_no_surplus(&bin.meter_serial, bin.window_start_ms())
+                                            .await
+                                        {
+                                            warn!(
+                                                "no-surplus write-back failed for meter {} window {} ({e}); Reading History stays pending",
+                                                bin.meter_serial,
+                                                bin.window_start_ms()
+                                            );
+                                        }
+                                    }
                                 }
                                 aggregator_api::billing_sink::MintDecision::Disabled => {}
                             }
