@@ -67,6 +67,41 @@ pub fn wallet_is_valid(wallet: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Connect to NATS honoring credentials embedded in the URL.
+///
+/// async-nats (0.37) ignores the userinfo component of a
+/// `nats://user:pass@host` URL — auth is taken only from `ConnectOptions` — so
+/// a broker with `authorization` enabled rejects a plain `async_nats::connect`
+/// even when the URL carries valid credentials. Mirrors
+/// `gridtokenx-blockchain-core`'s `rpc::nats_provider::connect_with_url_creds`
+/// (this crate stays chain-light, so no shared dep). Credentials are used
+/// verbatim (no percent-decoding).
+async fn connect_with_url_creds(
+    url: &str,
+) -> Result<async_nats::Client, async_nats::ConnectError> {
+    match url_userinfo(url) {
+        Some((user, pass)) => {
+            async_nats::ConnectOptions::with_user_and_password(user, pass)
+                .connect(url)
+                .await
+        }
+        None => async_nats::connect(url).await,
+    }
+}
+
+/// `(user, password)` from a URL's userinfo, if present. Password defaults to
+/// empty when the userinfo has no `:`.
+fn url_userinfo(url: &str) -> Option<(String, String)> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    let (userinfo, _host) = authority.rsplit_once('@')?;
+    let (user, pass) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    Some((user.to_string(), pass.to_string()))
+}
+
 /// Interprets the bridge's reply: `success` requires a signature; otherwise the
 /// reported error (or a default) surfaces as an `Err`.
 fn parse_mint_result(result: MintEnergyResultMessage) -> Result<MintOutcome> {
@@ -181,7 +216,7 @@ impl MintGateway {
         service_identity: String,
     ) -> Self {
         match (mint_via_chain_bridge, nats_url) {
-            (true, Some(url)) => match async_nats::connect(url).await {
+            (true, Some(url)) => match connect_with_url_creds(url).await {
                 Ok(client) => Self::Nats(NatsMintGateway::new(
                     client,
                     service_identity,
@@ -453,6 +488,23 @@ impl NatsMintGateway {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+
+    // --- NATS URL userinfo: auth-enabled broker needs creds via ConnectOptions ---
+
+    #[test]
+    fn url_userinfo_extracts_user_and_password() {
+        assert_eq!(
+            url_userinfo("nats://alice:s3cret@nats:4222"),
+            Some(("alice".to_string(), "s3cret".to_string()))
+        );
+    }
+
+    #[test]
+    fn url_userinfo_absent_returns_none() {
+        assert_eq!(url_userinfo("nats://nats:4222"), None);
+        // '@' beyond the authority (path/query) must not be mistaken for userinfo
+        assert_eq!(url_userinfo("nats://host:4222/path@x"), None);
+    }
 
     // --- idempotency key: stable per (meter, window) so the bridge dedups replays ---
 
