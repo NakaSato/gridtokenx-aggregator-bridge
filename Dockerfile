@@ -38,7 +38,7 @@ COPY gridtokenx-telemetry/ gridtokenx-telemetry/
 WORKDIR /app/gridtokenx-aggregator-bridge
 
 # Build in release mode with cargo cache mounts
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/gridtokenx-aggregator-bridge/target \
     cargo build --release --bin gridtokenx-aggregator-bridge && \
     strip target/release/gridtokenx-aggregator-bridge && \
