@@ -53,6 +53,13 @@ mod obis {
     // Demand Response / Abstract
     pub const DR_STATUS: &str = "0.0.96.10.0.255";
     pub const ACTIVE_TARIFF: &str = "0.0.96.14.0.255";
+
+    // Grid-asset state (BESS / EV), abstract manufacturer-specific range. Metadata
+    // only — they do not drive settlement energy. Values arrive in engineering
+    // units (SoC %, kW) and are stored as-is.
+    pub const BATTERY_SOC: &str = "0.0.96.130.0.255";
+    pub const BATTERY_DISPATCH: &str = "0.0.96.131.0.255";
+    pub const EV_CHARGE_POWER: &str = "0.0.96.132.0.255";
 }
 
 impl DlmsStack {
@@ -197,6 +204,19 @@ impl DlmsStack {
                     metadata.insert("active_tariff".to_string(), val.clone());
                 }
 
+                // Grid-asset state (BESS / EV). Named so the Influx/Kafka
+                // named-key sinks can promote them; without a name they would sit
+                // in metadata under their raw OBIS code and stay invisible.
+                obis::BATTERY_SOC => {
+                    metadata.insert("battery_soc_percent".to_string(), val.clone());
+                }
+                obis::BATTERY_DISPATCH => {
+                    metadata.insert("battery_dispatch_kw".to_string(), val.clone());
+                }
+                obis::EV_CHARGE_POWER => {
+                    metadata.insert("ev_charging_kw".to_string(), val.clone());
+                }
+
                 // Fallback for metadata (non-OBIS extra fields)
                 _ => {
                     metadata.insert(key.clone(), val.clone());
@@ -318,6 +338,38 @@ mod tests {
             reading.metadata.get("demand_response_status").unwrap(),
             &json!("load_shedding")
         );
+    }
+
+    #[tokio::test]
+    async fn test_dlms_bess_ev_registers_decode_to_named_metadata() {
+        let stack = DlmsStack::new();
+        // Grid-asset registers must decode to named metadata keys so the Influx /
+        // Kafka named-key sinks can promote them (raw OBIS codes are invisible).
+        let payload = json!({
+            "1.1.1.8.0.255": 10000.0,     // keep it a valid energy reading
+            "1.1.2.8.0.255": 5000.0,
+            "0.0.96.130.0.255": 57.5,     // battery SoC %
+            "0.0.96.131.0.255": 160.0,    // battery dispatch kW (discharge)
+            "0.0.96.132.0.255": 128.4     // EV charging kW
+        });
+        let raw = serde_json::to_vec(&payload).unwrap();
+
+        let reading = stack.handle_message("OBIS-BESS", &raw).await.unwrap().unwrap();
+
+        assert_eq!(
+            reading.metadata.get("battery_soc_percent").unwrap(),
+            &json!(57.5)
+        );
+        assert_eq!(
+            reading.metadata.get("battery_dispatch_kw").unwrap(),
+            &json!(160.0)
+        );
+        assert_eq!(
+            reading.metadata.get("ev_charging_kw").unwrap(),
+            &json!(128.4)
+        );
+        // Raw OBIS codes must NOT leak through once named.
+        assert!(reading.metadata.get("0.0.96.130.0.255").is_none());
     }
 
     #[tokio::test]

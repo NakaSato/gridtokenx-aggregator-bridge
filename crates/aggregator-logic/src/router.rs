@@ -382,6 +382,10 @@ fn reading_to_point(reading: &DeviceReading) -> Option<TelemetryPoint> {
             "voltage_l1_v",
             "frequency_hz",
             "power_factor",
+            // Grid-asset state (BESS / EV) — decoded by dlms.rs.
+            "battery_soc_percent",
+            "battery_dispatch_kw",
+            "ev_charging_kw",
         ];
         for &name in EXTRA_FIELDS {
             if let Some(v) = reading.metadata.get(name).and_then(|v| v.as_f64()) {
