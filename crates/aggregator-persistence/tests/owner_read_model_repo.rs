@@ -273,6 +273,85 @@ async fn backfill_seeds_from_local_meters_when_users_table_absent() {
 }
 
 #[tokio::test]
+async fn backfill_seeds_the_reverse_user_wallet_edge() {
+    // TD-004: meter-service resolves owner wallets through `user_wallet_read_model`
+    // ALONE (keyed on its own meters.user_id) — it no longer reads this service's
+    // serial-keyed projection. Both backfills only ever flowed serial-ward, so an
+    // owner whose wallet arrived via a backfill (not a live IAM event) had a wallet
+    // in meter_owner_read_model and NO row in user_wallet_read_model. That owner is
+    // invisible to repair_missing_wallets (it only targets NULL wallets), so the
+    // hole was permanent and blanked the wallet on meter-service's list/map.
+    let Some(url) = test_url() else {
+        eprintln!("SKIP backfill_seeds_the_reverse_user_wallet_edge: METER_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pool = setup(&url, &["OWNREPO-REV1", "OWNREPO-REV2"]).await;
+    let repo = OwnerReadModel::new(pool.clone());
+    let (u_seeded, u_live) = (Uuid::new_v4(), Uuid::new_v4());
+    for u in [u_seeded, u_live] {
+        sqlx::query("DELETE FROM user_wallet_read_model WHERE user_id = $1")
+            .bind(u)
+            .execute(&pool)
+            .await
+            .expect("edge cleanup");
+    }
+
+    // u_seeded: the pre-split shape — a wallet on the serial row, nothing on the
+    // user edge. Written directly, as the legacy `meters ⋈ users` backfill did.
+    sqlx::query(
+        "INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
+         VALUES ($1, $2, $3, now())",
+    )
+    .bind("OWNREPO-REV1")
+    .bind(u_seeded)
+    .bind("W-FROM-BACKFILL")
+    .execute(&pool)
+    .await
+    .expect("seed serial row");
+
+    // u_live: already has an authoritative edge row from a live IAM event, and a
+    // STALER wallet on its serial row. The seed must not regress it.
+    repo.update_wallet_by_user(u_live, Some("W-AUTHORITATIVE"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO meter_owner_read_model (serial_number, user_id, wallet_address, updated_at)
+         VALUES ($1, $2, $3, now())",
+    )
+    .bind("OWNREPO-REV2")
+    .bind(u_live)
+    .bind("W-STALE")
+    .execute(&pool)
+    .await
+    .expect("seed stale serial row");
+
+    repo.backfill().await.expect("backfill");
+
+    let edge = |u: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT wallet_address FROM user_wallet_read_model WHERE user_id = $1",
+            )
+            .bind(u)
+            .fetch_optional(&pool)
+            .await
+            .expect("read edge")
+        }
+    };
+    assert_eq!(
+        edge(u_seeded).await,
+        Some(Some("W-FROM-BACKFILL".to_string())),
+        "a backfill-sourced wallet must also land on the user edge, or meter-service blanks it"
+    );
+    assert_eq!(
+        edge(u_live).await,
+        Some(Some("W-AUTHORITATIVE".to_string())),
+        "an existing IAM-written edge row must NOT be regressed by the derived seed"
+    );
+}
+
+#[tokio::test]
 async fn repair_missing_wallets_resolves_via_callback() {
     // Wallet events consumed before the cutover never reached this DB — the
     // repair pass resolves those users through the injected callback (IAM

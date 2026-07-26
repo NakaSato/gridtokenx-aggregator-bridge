@@ -183,18 +183,23 @@ async fn main() -> Result<()> {
     // every other edge here: unreachable at boot ⇒ warn + None (Redis-only).
     //
     // DB-per-service Phase 2 (docs/db-split-phase2.md §5): prefer the dedicated
-    // metering DB `gridtokenx_meter` when METER_DATABASE_URL is set — the
-    // aggregator owns it and applies its own migrations at boot. Falls back to the
-    // shared DATABASE_URL (no migrations there; IAM owns that ledger).
+    // metering DB `gridtokenx_meter` when METER_DATABASE_URL is set. That DB is
+    // SHARED with meter-service, so nothing migrates at boot here — see the NOTE
+    // on the connect arm below. Falls back to the shared DATABASE_URL (also no
+    // migrations; IAM owns that ledger).
     //
-    // ORDERING: do NOT point METER_DATABASE_URL at gridtokenx_meter in production
-    // until the foreign-read swap (§5 step 4) lands — the meter⋈users owner read
-    // still needs the shared DB until MeterRegistry reads meter_owner_read_model.
+    // ORDERING: the foreign-read swap (§5 step 4) has landed — `own_meter_db`
+    // routes MeterRegistry + the readings sink onto `meter_owner_read_model`, so
+    // pointing this at `gridtokenx_meter` no longer needs the meters⋈users JOIN.
+    // It does require the read-model to be POPULATED first (§5 step 3: the
+    // AGGREGATOR_OWNER_READMODEL_FEED consumer, plus a cutover backfill) —
+    // otherwise every owner resolves empty and surplus mints skip on `no_wallet`.
     let (database_url, own_meter_db) = match std::env::var("METER_DATABASE_URL") {
         Ok(u) if !u.trim().is_empty() => (expand_env(&u), true),
         _ => (
             expand_env(&std::env::var("DATABASE_URL").unwrap_or_else(|_| {
-                "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx".to_string()
+                "postgresql://gridtokenx_user:gridtokenx_password@127.0.0.1:7001/gridtokenx"
+                    .to_string()
             })),
             false,
         ),

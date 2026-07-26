@@ -267,14 +267,51 @@ impl OwnerReadModel {
         )
         .execute(&self.pool)
         .await;
-        match legacy {
-            Ok(res) => Ok(res.rows_affected()),
+        let seeded = match legacy {
+            Ok(res) => res.rows_affected(),
             Err(e) if is_undefined_table(&e) => {
                 info!("owner read-model backfill: no IAM `users` table here (post-split DB) — seeding from local meters ⋈ user_wallet_read_model");
-                self.backfill_local().await
+                self.backfill_local().await?
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+        // The seeds above only flow serial-ward. Complete the reverse edge, or
+        // any owner whose wallet arrived via a backfill (rather than a live IAM
+        // event) would have a wallet in `meter_owner_read_model` and NO row in
+        // `user_wallet_read_model` — invisible to `repair_missing_wallets`,
+        // which only targets NULL wallets. meter-service resolves every owner
+        // wallet through the user edge alone (TD-004), so that hole would blank
+        // the wallet on its meter list / map for exactly those owners.
+        self.backfill_user_edge().await?;
+        Ok(seeded)
+    }
+
+    /// Seed the durable user → primary-wallet edge from the wallets already
+    /// known per serial. Idempotent and non-regressing: `DO NOTHING` on conflict
+    /// so a row written by a live IAM event (authoritative) is never overwritten
+    /// by this derived one. When a user owns several serials carrying different
+    /// wallets, the most recently updated one wins.
+    async fn backfill_user_edge(&self) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            INSERT INTO user_wallet_read_model (user_id, wallet_address, updated_at)
+            SELECT DISTINCT ON (user_id) user_id, wallet_address, now()
+            FROM meter_owner_read_model
+            WHERE wallet_address IS NOT NULL AND wallet_address <> ''
+            ORDER BY user_id, updated_at DESC
+            ON CONFLICT (user_id) DO NOTHING
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        let n = res.rows_affected();
+        if n > 0 {
+            info!(
+                seeded = n,
+                "owner read-model: seeded user→wallet edge from existing serial rows"
+            );
         }
+        Ok(n)
     }
 
     /// Post-cutover seed from tables that live in the metering DB itself:
@@ -453,12 +490,18 @@ impl OwnerReadModelConsumer {
                 let data: MeterEventData = match serde_json::from_value(event.data) {
                     Ok(d) => d,
                     Err(e) => {
-                        warn!("owner read-model: bad {} data ({e}); skipping", event.event_type);
+                        warn!(
+                            "owner read-model: bad {} data ({e}); skipping",
+                            event.event_type
+                        );
                         return;
                     }
                 };
                 let wallet = wallet_or_none(data.wallet_address.as_deref());
-                match repo.upsert_by_serial(&data.serial_number, data.user_id, wallet).await {
+                match repo
+                    .upsert_by_serial(&data.serial_number, data.user_id, wallet)
+                    .await
+                {
                     Ok(()) => debug!(
                         "owner read-model: upserted serial {} → user {}",
                         data.serial_number, data.user_id
@@ -485,7 +528,10 @@ impl OwnerReadModelConsumer {
                 let data: UserEventData = match serde_json::from_value(event.data) {
                     Ok(d) => d,
                     Err(e) => {
-                        warn!("owner read-model: bad {} data ({e}); skipping", event.event_type);
+                        warn!(
+                            "owner read-model: bad {} data ({e}); skipping",
+                            event.event_type
+                        );
                         return;
                     }
                 };
@@ -619,8 +665,7 @@ pub async fn spawn_owner_readmodel_feed(
     // READMODEL_IAM_BROKERS names that other cluster we run a SECOND consumer there
     // for the user topic; unset ⇒ same broker as everything else (single consumer,
     // original behavior, zero change).
-    let iam_brokers =
-        std::env::var("READMODEL_IAM_BROKERS").unwrap_or_else(|_| brokers.clone());
+    let iam_brokers = std::env::var("READMODEL_IAM_BROKERS").unwrap_or_else(|_| brokers.clone());
 
     if iam_brokers == brokers {
         // One cluster carries both topics — single consumer, single repo.
@@ -755,13 +800,20 @@ mod tests {
             r#"{"user_id":"00000000-0000-0000-0000-000000000001","wallet_address":"W"}"#,
         )
         .unwrap();
-        assert_eq!(linked.is_primary, None, "absent is_primary ⇒ None ⇒ treated as primary");
+        assert_eq!(
+            linked.is_primary, None,
+            "absent is_primary ⇒ None ⇒ treated as primary"
+        );
 
         let demoted: UserEventData = serde_json::from_str(
             r#"{"user_id":"00000000-0000-0000-0000-000000000001","wallet_address":"W","is_primary":false}"#,
         )
         .unwrap();
-        assert_eq!(demoted.is_primary, Some(false), "non-primary change must be skippable");
+        assert_eq!(
+            demoted.is_primary,
+            Some(false),
+            "non-primary change must be skippable"
+        );
     }
 
     #[test]

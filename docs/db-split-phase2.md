@@ -242,6 +242,17 @@ before finalizing which set owns `meters`.
    that pool is the shared DB; seeding the dedicated `gridtokenx_meter` from the old shared DB is a
    **cross-DB** one-shot (cutover tooling), not the single-pool runtime path. On the dedicated DB the
    read-model is otherwise seeded by event replay + lazy per-serial re-resolve.
+   **Reverse edge added (2026-07-27, TD-004).** Every seed above flowed serial-ward only, and
+   `repair_missing_wallets` only targets NULL wallets — so an owner whose wallet came from a backfill
+   rather than a live IAM event ended up with a wallet on its `meter_owner_read_model` row and **no**
+   `user_wallet_read_model` row, permanently. That was invisible while this service read the
+   serial-keyed row first, but meter-service now resolves owner wallets from the user edge **alone**
+   (it must not read this service's private projection), so the hole blanked wallets there.
+   `backfill()` now also calls `backfill_user_edge()` — a non-regressing `ON CONFLICT DO NOTHING`
+   seed of `user_wallet_read_model` from the wallets already known per serial (most recent
+   `updated_at` wins when an owner's serials disagree), so a live IAM-written row is never
+   overwritten by the derived one. Pinned by
+   `tests/owner_read_model_repo.rs::backfill_seeds_the_reverse_user_wallet_edge`.
 4. ~~Swap the two foreign reads to the local read-model~~ **DONE — flag-gated (not deleted).**
    Both foreign reads now branch on `own_meter_db` (`METER_DATABASE_URL` set): on the dedicated
    metering DB they read `meter_owner_read_model` (recommendation B — drops BOTH the `users` and
@@ -253,10 +264,20 @@ before finalizing which set owns `meters`.
    + wallet resolve from the read-model on a metering DB that has no `users` table — the legacy JOIN
    path errors there, proving the read-model does the work). **Still requires** the read-model to be
    populated (step 3 feed/backfill) before flipping `METER_DATABASE_URL` in prod.
+   **meter-service side (2026-07-27, TD-004):** it reads neither `users` nor `meter_owner_read_model`.
+   Reading the latter was circular — this service builds it by consuming meter-service's own
+   `MeterRegistered` events — so meter-service now joins `user_wallet_read_model` on its own
+   `meters.user_id` at both read sites. `user_wallet_read_model` is therefore a **shared contract**
+   of the metering context, not an aggregator-private table: this service is its sole writer, both
+   services read it, and its DDL is mirrored at
+   `gridtokenx-meter-service/contracts/user_wallet_read_model.sql` with
+   `scripts/check-metering-ddl-sync.sh` failing on drift. Changing its shape here breaks a service
+   that never runs migrations — mirror the change and re-run the guard.
 5. Optional dual-write/verify window: keep writing the old shared `meter_readings` while the new
    DB is validated.
 6. Set **`METER_DATABASE_URL`** to `gridtokenx_meter` (the seam is wired: when set, the aggregator
-   uses it as the metering pool AND runs its migrations at boot; unset ⇒ legacy shared `DATABASE_URL`,
+   uses it as the metering pool — it does **not** migrate at boot, per step 2's single-authority
+   rule; that claim was stale in `src/main.rs` until 2026-07-27; unset ⇒ legacy shared `DATABASE_URL`,
    no migrations). **Do this only AFTER step 4** — until the read-model swap lands, the meter⋈users
    owner read still needs the shared DB. Verify the ingest → owner-resolve → zone-stream → 15-min bin
    → surplus-mint hops (`just` / telemetry-hops).
