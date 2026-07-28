@@ -160,8 +160,8 @@ cargo test test_name -- --nocapture
 cargo build --release             # LTO + panic=abort (slow; see [profile.release])
 ```
 
-Tests live in `#[cfg(test)] mod tests` inline (no `tests/` dirs). See [TEST.md](TEST.md) for the full
-inventory and [BENCHMARKS.md](BENCHMARKS.md) for throughput numbers.
+Tests live in `#[cfg(test)] mod tests` inline (no `tests/` dirs). `cargo test --workspace` runs every
+crate; live-infra tests are `#[ignore]`-gated (`cargo test -- --ignored`, needs `just orb-up`).
 
 > Note: `strip=true` in the release profile corrupts `sqlx_macros` on some macOS toolchains. Workaround:
 > `CARGO_PROFILE_RELEASE_STRIP=false cargo build --release`.
@@ -293,6 +293,4 @@ dependency** — it sends intent only and mirrors the wire types locally.
   components, telemetry verification, aggregation, dissemination, flex dispatch.
 - [PROTOCOL.md](PROTOCOL.md) — v4 UTT-S+ binary frame layout + TLV dictionary.
 - [CLAUDE.md](CLAUDE.md) — service-specific conventions, invariants, and full env reference.
-- [TEST.md](TEST.md) — test inventory. [TEST_COVERAGE.md](TEST_COVERAGE.md) — coverage detail.
-- [BENCHMARKS.md](BENCHMARKS.md) — ingest throughput and settlement compute-unit numbers.
 - [DLMS_ENCRYPTION_PLAN.md](DLMS_ENCRYPTION_PLAN.md) — DLMS encryption design.

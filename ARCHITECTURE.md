@@ -246,4 +246,5 @@ no external SCADA feed:
 - **Market Engines:** P2P Order Book, REC minting.
 
 ## 5. Testing
-- See [TEST.md](TEST.md) — unit-test inventory (per crate/file) + the superproject pytest e2e suite (`20_oracle`, `30_settlement`, `90_golden_path` cover this layer).
+- Unit tests are inline (`#[cfg(test)] mod tests`, no `tests/` dirs) — `cargo test --workspace`. Live-infra tests are `#[ignore]`-gated (`cargo test -- --ignored`).
+- The cross-service pytest e2e suite lives in the superproject (`tests/e2e/`); `20_oracle`, `30_settlement` and `90_golden_path` cover this layer.

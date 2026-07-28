@@ -43,7 +43,10 @@ cargo build --release             # LTO + panic=abort + strip (slow; see [profil
 `cargo test` is the test path — tests live in `#[cfg(test)] mod tests` inline (no `tests/` dirs). The README references
 `scripts/test-e2e.sh` / `scripts/register-edge-key.sh`, but those scripts are **not** in this submodule (provided by the superproject's tooling).
 
-See [TEST.md](TEST.md) for the full test inventory — unit tests (per crate/file) and the superproject pytest e2e suite.
+`cargo test --workspace` runs every crate (the root is a package, so bare `cargo test` runs the binary only).
+Integration tests that need live infra are `#[ignore]`-gated — `cargo test -- --ignored` once `just orb-up` is up.
+The cross-service e2e suite lives in the superproject (`tests/e2e/`, pytest); `20_oracle`, `30_settlement` and
+`90_golden_path` cover this service.
 
 ## Crate layout & dependency direction
 
