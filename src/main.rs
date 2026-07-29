@@ -597,19 +597,55 @@ async fn main() -> Result<()> {
                                         .await
                                     {
                                         Ok(Some(_)) => true,
-                                        Ok(None) => {
-                                            metrics::record_mint_outcome(
-                                                "skipped",
-                                                "unattributed_meter",
-                                            );
-                                            warn!(
-                                                "surplus mint skipped: meter {} has no registered owner (window {} {:.6} kWh) — bin evicted, not enqueued",
-                                                bin.meter_serial,
-                                                bin.window_start_ms(),
-                                                kwh
-                                            );
-                                            false
-                                        }
+                                        // A read-model miss is AMBIGUOUS: either the
+                                        // meter is genuinely unattributed, or the
+                                        // owner projection is stale (its Kafka
+                                        // consumer died) and the meter is perfectly
+                                        // well registered. Evicting on the second
+                                        // case destroys real metered energy with
+                                        // nothing to replay, so check the
+                                        // authoritative `meters` table before
+                                        // deciding. Only runs on this cold path.
+                                        Ok(None) => match settle_registry
+                                            .owner_in_source_of_truth(&bin.meter_serial)
+                                            .await
+                                        {
+                                            Ok(Some(uid)) => {
+                                                metrics::record_mint_outcome(
+                                                    "queued",
+                                                    "readmodel_stale",
+                                                );
+                                                warn!(
+                                                    "owner projection STALE for meter {} (registered to {uid} in `meters` but absent from meter_owner_read_model) — enqueuing surplus (window {} {:.6} kWh) instead of evicting. Check the OwnerReadModelConsumer: kafka-consumer-groups --describe --group aggregator-owner-readmodel-iam-group",
+                                                    bin.meter_serial,
+                                                    bin.window_start_ms(),
+                                                    kwh
+                                                );
+                                                true
+                                            }
+                                            Ok(None) => {
+                                                metrics::record_mint_outcome(
+                                                    "skipped",
+                                                    "unattributed_meter",
+                                                );
+                                                warn!(
+                                                    "surplus mint skipped: meter {} has no registered owner (window {} {:.6} kWh) — bin evicted, not enqueued",
+                                                    bin.meter_serial,
+                                                    bin.window_start_ms(),
+                                                    kwh
+                                                );
+                                                false
+                                            }
+                                            // Same rule as the lookup error below:
+                                            // never drop surplus on a transient blip.
+                                            Err(e) => {
+                                                warn!(
+                                                    "authoritative owner check failed for meter {} ({e}); enqueuing surplus for durable retry",
+                                                    bin.meter_serial
+                                                );
+                                                true
+                                            }
+                                        },
                                         Err(e) => {
                                             warn!(
                                                 "owner lookup failed for meter {} ({e}); enqueuing surplus for durable retry",

@@ -369,7 +369,7 @@ mod tests {
             &json!(128.4)
         );
         // Raw OBIS codes must NOT leak through once named.
-        assert!(reading.metadata.get("0.0.96.130.0.255").is_none());
+        assert!(!reading.metadata.contains_key("0.0.96.130.0.255"));
     }
 
     #[tokio::test]

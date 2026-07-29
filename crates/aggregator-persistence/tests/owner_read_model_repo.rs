@@ -411,3 +411,91 @@ async fn repair_missing_wallets_resolves_via_callback() {
     .expect("edge row");
     assert_eq!(edge.as_deref(), Some("W-REPAIRED"));
 }
+
+// ---------------------------------------------------------------------------
+// Read-model staleness must not be mistaken for an unattributed meter.
+// ---------------------------------------------------------------------------
+
+/// A registered meter whose projection row is MISSING must still be recognised as
+/// owned.
+///
+/// `resolve_user_id` reads `meter_owner_read_model`, a projection fed
+/// asynchronously by `OwnerReadModelConsumer`. When that consumer dies the
+/// projection freezes and the lookup returns `None` — identical to a genuinely
+/// unattributed meter. The settlement gate evicts the billing bin on that `None`,
+/// so the ambiguity silently destroyed real metered surplus (observed: consumer
+/// group with no members, projection frozen 27h, every newly onboarded meter's
+/// energy discarded with nothing to replay).
+///
+/// `owner_in_source_of_truth` is the tie-breaker. This test reproduces the exact
+/// shape of that outage: a row in `meters`, no row in the projection.
+#[tokio::test]
+async fn stale_projection_is_distinguishable_from_an_unattributed_meter() {
+    let Some(url) = test_url() else { return };
+    let serial = "STALE-PROJECTION-METER-1";
+    let unknown = "NEVER-REGISTERED-METER-1";
+    let pool = setup(&url, &[serial, unknown]).await;
+    let user_id = Uuid::new_v4();
+
+    sqlx::query("DELETE FROM meters WHERE serial_number = canonicalize_meter_serial($1)")
+        .bind(serial)
+        .execute(&pool)
+        .await
+        .expect("cleanup meters");
+    sqlx::query(
+        "INSERT INTO meters (serial_number, user_id) \
+         VALUES (canonicalize_meter_serial($1), $2)",
+    )
+    .bind(serial)
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("insert authoritative meter");
+
+    let registry = aggregator_persistence::infra::meter_registry::MeterRegistry::new(
+        None,
+        Some(pool.clone()),
+    )
+    .with_read_model(true);
+
+    // Precondition: the projection really is empty for this serial.
+    assert!(
+        row(&pool, serial).await.is_none(),
+        "projection must be empty to reproduce the outage"
+    );
+
+    // The ambiguous answer the settlement gate used to act on.
+    assert_eq!(
+        registry.resolve_user_id(serial).await.expect("resolve"),
+        None,
+        "a stale projection still resolves to None — that is the ambiguity"
+    );
+
+    // The tie-breaker resolves it: registered, so the surplus must be enqueued.
+    assert_eq!(
+        registry
+            .owner_in_source_of_truth(serial)
+            .await
+            .expect("authoritative lookup"),
+        Some(user_id),
+        "a registered meter must be recognised even when the projection is stale"
+    );
+
+    // And a meter that was never registered stays unattributed, so evicting it
+    // remains correct — the fix must not turn every unknown serial into outbox
+    // backlog.
+    assert_eq!(
+        registry
+            .owner_in_source_of_truth(unknown)
+            .await
+            .expect("authoritative lookup"),
+        None,
+        "an unregistered serial must remain unattributed"
+    );
+
+    sqlx::query("DELETE FROM meters WHERE serial_number = canonicalize_meter_serial($1)")
+        .bind(serial)
+        .execute(&pool)
+        .await
+        .ok();
+}

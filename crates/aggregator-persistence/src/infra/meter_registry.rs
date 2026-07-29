@@ -160,6 +160,52 @@ impl MeterRegistry {
         Ok(row)
     }
 
+    /// Is this serial registered in the **authoritative** `meters` table?
+    ///
+    /// [`resolve_user_id`](Self::resolve_user_id) answers "can I resolve an owner
+    /// right now", reading `meter_owner_read_model` — a *projection*, fed
+    /// asynchronously by `OwnerReadModelConsumer` off IAM/meter-service events.
+    /// When that consumer is down the projection freezes and every lookup returns
+    /// `Ok(None)`, which is **indistinguishable from a genuinely unattributed
+    /// meter** even though the meter is registered and its owner is known.
+    ///
+    /// That ambiguity had teeth: the settlement gate evicts the billing bin on
+    /// `Ok(None)`, so a stale projection silently destroyed the metered surplus of
+    /// every legitimately onboarded meter — not deferred, *discarded*, with
+    /// nothing to replay. Observed frozen for 27h after the Kafka consumer group
+    /// lost its members.
+    ///
+    /// This is the tie-breaker, called ONLY on the `None` path (already behind the
+    /// negative cache), so it adds no hot-path cost. Reading `meters` is a
+    /// same-database read inside the metering bounded context (DB-per-service
+    /// Phase 2 rec-A shares one physical DB) and reveals nothing new: this service
+    /// already derives `meter_owner_read_model` from the very `MeterRegistered`
+    /// events that write it. It only reads it *synchronously* instead of waiting
+    /// for a projection that may never catch up.
+    ///
+    /// `Ok(None)` here means genuinely unregistered — evicting is then correct.
+    pub async fn owner_in_source_of_truth(&self, meter_serial: &str) -> Result<Option<Uuid>> {
+        let Some(pool) = &self.pg else {
+            return Ok(None);
+        };
+        // On the legacy shared DB `fetch_owner_from_db` already JOINs `meters`, so
+        // a miss there is authoritative and this check would be redundant.
+        if !self.use_read_model {
+            return Ok(None);
+        }
+        // Same canonicalization as every other serial lookup — a dash/case variant
+        // must not read as unregistered.
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT user_id FROM meters \
+             WHERE serial_number = canonicalize_meter_serial($1) AND user_id IS NOT NULL",
+        )
+        .bind(meter_serial)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow!("authoritative owner lookup failed for {}: {}", meter_serial, e))?;
+        Ok(row.map(|(uid,)| uid))
+    }
+
     /// Populate the local caches and (best-effort) Redis from a durable Postgres
     /// hit, so subsequent resolves are served from the hot tiers. Redis write
     /// failures are logged but never fail resolution — Redis is only a cache here.
