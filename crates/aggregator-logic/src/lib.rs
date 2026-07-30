@@ -21,3 +21,4 @@ pub mod mint_settlement;
 pub mod redis_hash;
 pub mod router;
 pub mod standards;
+pub mod zone_balance;

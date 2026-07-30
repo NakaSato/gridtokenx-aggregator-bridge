@@ -11,7 +11,7 @@
 pub use aggregator_core::models;
 pub use aggregator_logic::{
     aggregator, billing_sink, bin_store, dispatch, grid_status, metrics, mint_outbox,
-    mint_settlement, router, standards,
+    mint_settlement, router, standards, zone_balance,
 };
 pub use aggregator_persistence::infra;
 pub use aggregator_stacks as protocol;

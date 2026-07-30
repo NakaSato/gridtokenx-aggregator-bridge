@@ -669,6 +669,14 @@ impl ZoneEventIngester {
         // order and leave Redis holding a stale, undercounted bin.
         {
             let mut agg = self.aggregator.lock().await;
+            // Same function and same inputs the partitioner used to route this
+            // reading, so the zone recorded on the bin cannot disagree with the
+            // zone the reading was actually processed in.
+            let zone_index = u16::try_from(
+                self.get_zone_index(reading.zone_code.clone(), &reading.serial_number),
+            )
+            .ok();
+
             let updated_bin = agg.handle_reading(
                 meter_id,
                 user_id,
@@ -678,6 +686,7 @@ impl ZoneEventIngester {
                 reading.timestamp,
                 tariff_period,
                 demand_kw,
+                zone_index,
             );
 
             // 1b. Durable write-through (crash recovery of the in-flight

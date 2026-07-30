@@ -125,6 +125,7 @@ mod tests {
             energy_consumed_peak: Decimal::new(30, 1),
             energy_consumed_offpeak: Decimal::new(10, 1),
             max_demand_kw: Decimal::new(33, 1),
+            zone_index: Some(5),
         }
     }
 
