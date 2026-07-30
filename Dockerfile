@@ -5,6 +5,24 @@
 # -----------------------------------------------------------------------------
 FROM rust:1.91-bookworm AS builder
 
+# Use the toolchain the base image already ships instead of letting rustup resolve
+# `rust-toolchain.toml`.
+#
+# WHY: the pin is `channel = "1.91"`, and rustup treats that as a DIFFERENT
+# toolchain name from the `1.91.1` this image installs — so every build re-synced
+# the channel manifest and re-downloaded cargo/clippy/rust-std from
+# static.rust-lang.org, several hundred MB, on a layer that is otherwise cached.
+# It also made the build require internet: on 2026-07-30 that download timed out
+# and later stalled mid-component, failing the image build twice with an error
+# ("could not download channel-rust-1.91.toml: operation timed out") that looks
+# nothing like its cause. RUSTUP_TOOLCHAIN overrides the toolchain file, so the
+# pre-installed toolchain is used and nothing is fetched.
+#
+# Keep this value equal to `rustc --version` of the base image above; bump both
+# together. The pin in rust-toolchain.toml is deliberately left alone — it is what
+# keeps local/CI fmt+clippy deterministic.
+ENV RUSTUP_TOOLCHAIN=1.91.1
+
 # apt archives live in BuildKit caches shared with the sibling service images, so
 # the .debs are downloaded once rather than per-image whenever this layer
 # invalidates. docker-clean must go, or apt deletes what we are caching.
