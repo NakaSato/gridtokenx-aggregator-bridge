@@ -553,30 +553,7 @@ async fn main() -> Result<()> {
                         // Nothing below reads these numbers; they are logged so the
                         // real imbalance can be seen for real windows before any
                         // mint/burn or demand-response behaviour is built on it.
-                        {
-                            use aggregator_api::zone_balance::{system_net_kwh, zone_balances};
-                            let balances = zone_balances(&bins);
-                            for zb in &balances {
-                                let zone = zb
-                                    .zone_index
-                                    .map(|z| z.to_string())
-                                    .unwrap_or_else(|| "none".to_string());
-                                info!(
-                                    zone = %zone,
-                                    bins = zb.bin_count,
-                                    generated_kwh = zb.generated_kwh,
-                                    consumed_kwh = zb.consumed_kwh,
-                                    net_kwh = zb.net_kwh,
-                                    imbalance_ratio = zb.imbalance_ratio().unwrap_or(0.0),
-                                    "⚖️  zone energy balance (observation only)"
-                                );
-                            }
-                            info!(
-                                zones = balances.len(),
-                                system_net_kwh = system_net_kwh(&balances),
-                                "⚖️  system energy balance across zones"
-                            );
-                        }
+                        aggregator_api::zone_balance::log_zone_balances(&bins);
 
                         let mut written = 0usize;
                         for bin in &bins {

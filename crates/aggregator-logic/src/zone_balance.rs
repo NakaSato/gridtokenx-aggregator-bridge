@@ -99,6 +99,35 @@ pub fn system_net_kwh(balances: &[ZoneBalance]) -> f64 {
     balances.iter().map(|b| b.net_kwh).sum()
 }
 
+/// Emit one sweep's zone balances. Lives here rather than inline in the binary,
+/// which is a wiring-only entrypoint by contract (see CLAUDE.md "Runtime shape").
+///
+/// The only side effect is logging — deliberately, so the caller cannot mistake
+/// this for something that mints, burns, dispatches, or gates settlement.
+pub fn log_zone_balances(bins: &[BillingBin]) {
+    let balances = zone_balances(bins);
+    for zb in &balances {
+        let zone = zb
+            .zone_index
+            .map(|z| z.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        tracing::info!(
+            zone = %zone,
+            bins = zb.bin_count,
+            generated_kwh = zb.generated_kwh,
+            consumed_kwh = zb.consumed_kwh,
+            net_kwh = zb.net_kwh,
+            imbalance_ratio = zb.imbalance_ratio().unwrap_or(0.0),
+            "⚖️  zone energy balance (observation only)"
+        );
+    }
+    tracing::info!(
+        zones = balances.len(),
+        system_net_kwh = system_net_kwh(&balances),
+        "⚖️  system energy balance across zones"
+    );
+}
+
 fn to_f64(d: rust_decimal::Decimal) -> f64 {
     use rust_decimal::prelude::ToPrimitive;
     d.to_f64().unwrap_or(0.0)
