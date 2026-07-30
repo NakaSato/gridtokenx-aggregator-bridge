@@ -266,6 +266,50 @@ publishes to **JetStream and awaits the PubAck** before awaiting the reply,
 rather than a fire-and-forget core NATS publish — closing the silent-drop gap
 when the consumer is momentarily absent. The reply rides core NATS.
 
+### 3.5 Per-zone energy balance (observation only)
+
+Groundwork for a mint-on-surplus / burn-on-consumption model, which needs to know
+whether a zone's generation and consumption actually net out. **Nothing in this
+path mints, burns, dispatches, or gates settlement** — the numbers are logged at
+each sweep (`src/main.rs:552`) so the real imbalance can be observed before any
+behaviour is built on it.
+
+`zone_balances` (`crates/aggregator-logic/src/zone_balance.rs:75`) groups
+completed bins by zone and totals generation, consumption and signed net, with a
+scale-free `imbalance_ratio`; `system_net_kwh`
+(`crates/aggregator-logic/src/zone_balance.rs:98`) sums across zones. Pure and
+sync, per Sync Core — it takes bins and returns numbers.
+
+Three details that are easy to get wrong:
+
+- **`net_deficit_kwh`** (`crates/aggregator-logic/src/aggregator.rs:83`) is the
+  exact mirror of `net_surplus_kwh` and returns the deficit **positive**. Exactly
+  one of the two is `Some` for a bin; both are `None` at exact net zero.
+- **The zone is recorded on the bin** (`BillingBin.zone_index`,
+  `crates/aggregator-logic/src/aggregator.rs:48`), written by the ingester from
+  the *same* `get_zone_index` call that routed the reading
+  (`crates/aggregator-api/src/ingester/zone_ingester.rs:675`). It is deliberately
+  NOT re-derived at sweep time: the ingester hashes `zone_code` when a reading has
+  one and only falls back to `meter_serial`, so a serial-only re-derivation would
+  silently mis-attribute every zone-tagged meter. `serde(default)` keeps
+  crash-restored bins deserializable.
+- **Unzoned bins stay their own group** rather than being folded into zone 0 —
+  attributing unzoned energy to a real zone would corrupt the very number this
+  exists to measure.
+
+> **A zone here is a hash partition, not a feeder.** `get_zone_index` hashes
+> `zone_code` (or the serial) modulo `IOT_NUM_ZONES`, so these balances are per
+> partition, not per electrical boundary. Any invariant that depends on a zone
+> being one piece of grid needs zone identity to mean network topology first.
+
+> **Expect a large diurnal swing, and do not read one window as steady state.**
+> Measured 2026-07-30 on the 80-meter simulator fleet (20 solar prosumers,
+> 200 kW installed, ~210 kW load): at simulated dawn generation ran ~0.5% of
+> consumption (zones ~99% net import), and by mid-morning it had risen to ~31% as
+> solar climbed 5.6% → 31% of capacity. A per-window balance invariant would
+> therefore burn heavily all morning and approach balance near local noon; any
+> such invariant has to hold over a daily cycle, not per 15-minute window.
+
 > **SECURITY.** The gateway signs the mint envelope with this service's mTLS
 > client key (P-256/ECDSA over canonical bytes) and attaches an `EnvelopeAuth`
 > (cert PEM + signature), so the bridge binds the self-asserted

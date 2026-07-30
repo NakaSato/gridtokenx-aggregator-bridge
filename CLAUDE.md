@@ -44,6 +44,18 @@ cargo build --release             # LTO + panic=abort + strip (slow; see [profil
 `scripts/test-e2e.sh` / `scripts/register-edge-key.sh`, but those scripts are **not** in this submodule (provided by the superproject's tooling).
 
 `cargo test --workspace` runs every crate (the root is a package, so bare `cargo test` runs the binary only).
+
+> **Toolchain pin vs the Docker base — keep them equal.** `rust-toolchain.toml` pins
+> `channel = "1.91"`, but rustup treats that as a *different toolchain name* from the `1.91.1`
+> that the `rust:1.91-bookworm` base image installs — so the image build used to re-sync the
+> channel manifest and re-download cargo/clippy/rust-std on every build, and required internet
+> to do it. Two builds failed on 2026-07-30 when that download timed out, with an error
+> (`could not download channel-rust-1.91.toml: operation timed out`) that looks nothing like
+> its cause. The Dockerfile now sets `ENV RUSTUP_TOOLCHAIN=1.91.1`, which overrides the
+> toolchain file so the pre-installed toolchain is used and nothing is fetched. **Bump that
+> value together with the base image tag.** The same mismatch makes a host `cargo`/`rustc`
+> command in this directory hang while rustup fetches 1.91 — `rustup toolchain install 1.91`
+> once settles it locally.
 Integration tests that need live infra are `#[ignore]`-gated — `cargo test -- --ignored` once `just orb-up` is up.
 The cross-service e2e suite lives in the superproject (`tests/e2e/`, pytest); `20_oracle`, `30_settlement` and
 `90_golden_path` cover this service.
@@ -62,7 +74,7 @@ core ← protocol ← stacks ← persistence ← logic ← api ← (src/main.rs 
 | `aggregator-protocol` | Generated ConnectRPC/prost types from `proto/{oracle,dispatch}.proto` via `build.rs` → `OUT_DIR`. Packages: `oracle::*`, `dispatch::*`, `identity::*`. |
 | `aggregator-stacks` | DLMS/COSEM meter decoder (`dlms`) + `binary_decoder` (secure v4 frame). DLMS/COSEM is the only meter protocol; `protocol="auto"`/omitted resolves to `dlms`. |
 | `aggregator-persistence` | Edges: Redis crypto verifier, Kafka, RabbitMQ, meter registry (3-tier owner resolver: local cache → Redis → Postgres source of truth, `infra/meter_registry.rs`), circular-buffer/sync storage, independent InfluxDB v2 history sink (`infra/influxdb.rs`). |
-| `aggregator-logic` | Aggregator (15-min billing bins w/ TOU split + max-demand), Router (dissemination), `billing_sink` (bins → InfluxDB `billing`), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
+| `aggregator-logic` | Aggregator (15-min billing bins w/ TOU split + max-demand), Router (dissemination), `billing_sink` (bins → InfluxDB `billing`), `zone_balance` (per-zone energy balance — **measurement only**, see ARCHITECTURE.md §3.5), dispatch engine, IEEE 2030.5 / OpenADR standards. No blockchain deps. |
 | `aggregator-api` | HTTP handlers, gRPC service, auth, ingesters (zone, batcher), `AppState`. Depends on `gridtokenx-telemetry` (sibling submodule). |
 
 `src/main.rs` is a wiring-only entrypoint: it re-imports everything through `aggregator_api::{...}` and runs the HTTP + gRPC servers. New business logic goes in the crate that matches the dependency rule, **not** in `main.rs`.
