@@ -37,15 +37,24 @@ pub struct BillingBin {
     /// Peak net import demand seen in the window (kW), for demand-charge billing.
     #[serde(default)]
     pub max_demand_kw: Decimal,
-    /// Zone partition this meter's readings were routed to, as computed by the
-    /// ingester (`ZoneIngester::get_zone_index`). Carried on the bin rather than
-    /// re-derived at settlement time because the ingester hashes `zone_code` when
-    /// the reading has one and only falls back to `meter_serial` otherwise — a
-    /// sweep-time re-derivation from the serial alone would silently mis-attribute
-    /// every zone-tagged meter. `None` = pre-existing bin restored from the durable
-    /// store before this field existed, or a path that supplies no zone.
-    #[serde(default)]
-    pub zone_index: Option<u16>,
+    /// The meter's **real** electrical zone, as reported on the reading
+    /// (`DeviceReading.zone_code` — derived by the simulator from the GLM
+    /// transformer topology, i.e. an actual feeder).
+    ///
+    /// Deliberately NOT the ingester's `get_zone_index` partition. That partition
+    /// exists to spread load over a bounded set of Redis streams, so it hashes the
+    /// zone modulo `IOT_NUM_ZONES` and therefore COLLIDES distinct feeders: on the
+    /// 80-meter fixture, real zones 1 (29 meters) and 2 (31) both land in bucket 5
+    /// while zone 3 (20) lands in bucket 9 — so a "per-zone" balance computed from
+    /// the partition silently sums two unrelated feeders and cannot tell you which
+    /// one is importing. Energy conservation is a property of a physical zone, so
+    /// the balance has to key on the physical zone.
+    ///
+    /// `None` = the reading carried no zone (unzoned/grid-edge meters, code 0 in
+    /// the simulator), or a bin restored from the durable store before this field
+    /// existed.
+    #[serde(default, alias = "zone_code")]
+    pub zone_code: Option<u16>,
 }
 
 impl BillingBin {
@@ -129,8 +138,8 @@ impl Aggregator {
         tariff_period: Option<u8>,
         demand_kw: Option<Decimal>,
         // Zone partition the ingester routed this reading to. Recorded on the bin
-        // for per-zone energy balance; see `BillingBin::zone_index`.
-        zone_index: Option<u16>,
+        // for per-zone energy balance; see `BillingBin::zone_code`.
+        zone_code: Option<u16>,
     ) -> BillingBin {
         let start_time = self.get_window_start(timestamp);
         let end_time = start_time + chrono::Duration::minutes(WINDOW_MINUTES as i64);
@@ -157,7 +166,7 @@ impl Aggregator {
                     energy_consumed_peak: Decimal::ZERO,
                     energy_consumed_offpeak: Decimal::ZERO,
                     max_demand_kw: Decimal::ZERO,
-                    zone_index,
+                    zone_code,
                 }
             });
 
@@ -166,8 +175,8 @@ impl Aggregator {
         bin.reading_count += 1;
         // Backfill for a bin restored from the durable store before this field
         // existed, or created by a path that had no zone at the time.
-        if bin.zone_index.is_none() {
-            bin.zone_index = zone_index;
+        if bin.zone_code.is_none() {
+            bin.zone_code = zone_code;
         }
 
         // TOU split: route this reading's energy into the active tariff's bucket.
@@ -462,7 +471,7 @@ mod tests {
             energy_consumed_peak: Decimal::ZERO,
             energy_consumed_offpeak: Decimal::ZERO,
             max_demand_kw: Decimal::ZERO,
-            zone_index: None,
+            zone_code: None,
         };
         agg.restore_bins(vec![restored]);
 
@@ -494,7 +503,7 @@ mod tests {
             energy_consumed_peak: Decimal::ZERO,
             energy_consumed_offpeak: Decimal::ZERO,
             max_demand_kw: Decimal::ZERO,
-            zone_index: None,
+            zone_code: None,
         };
         agg.active_bins.insert(bin.key(), bin);
 

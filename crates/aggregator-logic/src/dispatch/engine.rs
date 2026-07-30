@@ -459,7 +459,7 @@ mod tests {
                 ts,
                 None,
                 None,
-                None, // zone_index — irrelevant to the dispatch-capacity fixture
+                None, // zone_code — irrelevant to the dispatch-capacity fixture
             );
         }
         DispatchEngine {

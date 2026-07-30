@@ -669,13 +669,19 @@ impl ZoneEventIngester {
         // order and leave Redis holding a stale, undercounted bin.
         {
             let mut agg = self.aggregator.lock().await;
-            // Same function and same inputs the partitioner used to route this
-            // reading, so the zone recorded on the bin cannot disagree with the
-            // zone the reading was actually processed in.
-            let zone_index = u16::try_from(
-                self.get_zone_index(reading.zone_code.clone(), &reading.serial_number),
-            )
-            .ok();
+            // The meter's REAL electrical zone, straight off the reading —
+            // deliberately NOT `get_zone_index`. That partition hashes the zone
+            // modulo IOT_NUM_ZONES to bound the Redis stream count, which is right
+            // for load spreading and wrong for energy accounting: on the 80-meter
+            // fixture it collapses real zones 1 (29 meters) and 2 (31) into the
+            // same bucket, so a "per-zone" balance built on it sums two unrelated
+            // feeders and cannot say which one is importing. Conservation is a
+            // property of a physical zone, so the bin records the physical zone.
+            // Unparseable/absent stays None rather than guessing a zone.
+            let zone_code = reading
+                .zone_code
+                .as_deref()
+                .and_then(|z| z.trim().parse::<u16>().ok());
 
             let updated_bin = agg.handle_reading(
                 meter_id,
@@ -686,7 +692,7 @@ impl ZoneEventIngester {
                 reading.timestamp,
                 tariff_period,
                 demand_kw,
-                zone_index,
+                zone_code,
             );
 
             // 1b. Durable write-through (crash recovery of the in-flight

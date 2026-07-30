@@ -31,8 +31,8 @@ use std::collections::BTreeMap;
 /// Energy balance for one zone over a set of bins, all in kWh.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZoneBalance {
-    /// `None` for bins with no recorded zone (see `BillingBin::zone_index`).
-    pub zone_index: Option<u16>,
+    /// `None` for bins with no recorded zone (see `BillingBin::zone_code`).
+    pub zone_code: Option<u16>,
     /// Total generation across the zone's bins.
     pub generated_kwh: f64,
     /// Total consumption across the zone's bins.
@@ -67,7 +67,7 @@ impl ZoneBalance {
 
 /// Group bins by their recorded zone and total each zone's energy.
 ///
-/// Bins with `zone_index == None` are kept as their own group rather than dropped
+/// Bins with `zone_code == None` are kept as their own group rather than dropped
 /// or folded into zone 0 — silently attributing unzoned energy to a real zone would
 /// corrupt exactly the number this module exists to measure.
 ///
@@ -76,8 +76,8 @@ pub fn zone_balances(bins: &[BillingBin]) -> Vec<ZoneBalance> {
     let mut by_zone: BTreeMap<Option<u16>, ZoneBalance> = BTreeMap::new();
 
     for bin in bins {
-        let entry = by_zone.entry(bin.zone_index).or_insert(ZoneBalance {
-            zone_index: bin.zone_index,
+        let entry = by_zone.entry(bin.zone_code).or_insert(ZoneBalance {
+            zone_code: bin.zone_code,
             generated_kwh: 0.0,
             consumed_kwh: 0.0,
             net_kwh: 0.0,
@@ -108,7 +108,7 @@ pub fn log_zone_balances(bins: &[BillingBin]) {
     let balances = zone_balances(bins);
     for zb in &balances {
         let zone = zb
-            .zone_index
+            .zone_code
             .map(|z| z.to_string())
             .unwrap_or_else(|| "none".to_string());
         tracing::info!(
@@ -156,7 +156,7 @@ mod tests {
             energy_consumed_peak: Decimal::ZERO,
             energy_consumed_offpeak: Decimal::ZERO,
             max_demand_kw: Decimal::ZERO,
-            zone_index: zone,
+            zone_code: zone,
         }
     }
 
@@ -210,10 +210,31 @@ mod tests {
         let balances = zone_balances(&[bin(None, 8, 0), bin(Some(0), 0, 8)]);
         assert_eq!(balances.len(), 2);
         // BTreeMap orders None before Some(0).
-        assert_eq!(balances[0].zone_index, None);
+        assert_eq!(balances[0].zone_code, None);
         assert_eq!(balances[0].net_kwh, 8.0);
-        assert_eq!(balances[1].zone_index, Some(0));
+        assert_eq!(balances[1].zone_code, Some(0));
         assert_eq!(balances[1].net_kwh, -8.0);
+    }
+
+    #[test]
+    fn distinct_feeders_must_not_be_summed_into_one_balance() {
+        // Regression guard for the bug this keying fixes. The bin's zone used to be
+        // the ingester's hash partition (zone hashed % IOT_NUM_ZONES), which on the
+        // 80-meter fixture put real zones 1 and 2 in the SAME bucket. Two feeders,
+        // one exporting and one importing by the same amount, then netted to zero
+        // and reported a perfectly balanced "zone" while both were badly unbalanced.
+        //
+        // Keyed on the real zone_code the two stay separate and each imbalance is
+        // visible; the system total is zero either way, which is exactly why the
+        // system total alone cannot detect this.
+        let balances = zone_balances(&[bin(Some(1), 30, 0), bin(Some(2), 0, 30)]);
+        assert_eq!(balances.len(), 2, "distinct feeders must not be merged");
+        assert_eq!(balances[0].net_kwh, 30.0, "zone 1 exports");
+        assert_eq!(balances[1].net_kwh, -30.0, "zone 2 imports");
+        assert_eq!(balances[0].imbalance_ratio(), Some(1.0));
+        assert_eq!(balances[1].imbalance_ratio(), Some(1.0));
+        // The system nets to zero — the very reading that hid the per-feeder problem.
+        assert_eq!(system_net_kwh(&balances), 0.0);
     }
 
     #[test]
