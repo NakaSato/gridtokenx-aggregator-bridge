@@ -17,3 +17,21 @@ pub fn record_cache_lookup(cache: &'static str, hit: bool) {
     )
     .increment(1);
 }
+
+/// Readings the `meter_readings` sink could not attribute to an owner, and so did
+/// not persist at all.
+///
+/// The insert joins the owner projection and keeps only rows with a wallet, which
+/// means telemetry from a meter with no registry row is accepted at ingest, counted
+/// nowhere, and silently dropped at write time — the reading leaves no trace but a
+/// log line. That is how 16 unregistered simulator meters streamed for days while
+/// only their (unmintable) surplus bins hinted anything was wrong.
+///
+/// `aggregator_readings_unattributed_total` is the signal to alert on: sustained
+/// non-zero means meters are producing telemetry nobody owns. It is a counter, not a
+/// log, precisely because the condition persists until a human registers the meter.
+pub fn record_unattributed_readings(dropped: u64) {
+    if dropped > 0 {
+        metrics::counter!("aggregator_readings_unattributed_total").increment(dropped);
+    }
+}

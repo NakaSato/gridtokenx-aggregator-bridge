@@ -311,24 +311,61 @@ async fn insert_batch(pool: &PgPool, rows: &[ReadingRow], use_read_model: bool) 
              voltage, power_factor, frequency, verification_status, reading_timestamp)
         {owner_join}"
     );
-    sqlx::query(&sql)
-    .bind(&serial_numbers)
-    .bind(&timestamps_ms)
-    .bind(&generated_kwh)
-    .bind(&consumed_kwh)
-    .bind(&surplus_kwh)
-    .bind(&deficit_kwh)
-    .bind(&voltage)
-    .bind(&power_factor)
-    .bind(&frequency)
-    .execute(pool)
-    .await
-    .map(|_| ())
+    let submitted = serial_numbers.len();
+    let res = sqlx::query(&sql)
+        .bind(&serial_numbers)
+        .bind(&timestamps_ms)
+        .bind(&generated_kwh)
+        .bind(&consumed_kwh)
+        .bind(&surplus_kwh)
+        .bind(&deficit_kwh)
+        .bind(&voltage)
+        .bind(&power_factor)
+        .bind(&frequency)
+        .execute(pool)
+        .await?;
+
+    // The owner join keeps only rows whose meter resolves to a wallet, so anything
+    // missing from `rows_affected` was DROPPED — not stored, not counted, invisible.
+    // Surface it as a counter rather than a log: the condition lasts until someone
+    // registers the meter, so logging it per batch is exactly the noise the mint
+    // drain had to be fixed for. `debug!` keeps a breadcrumb for a live session.
+    let dropped = unattributed_count(submitted, res.rows_affected());
+    if dropped > 0 {
+        crate::metrics::record_unattributed_readings(dropped);
+        tracing::debug!(
+            "meter_readings: {dropped} of {submitted} readings had no owner row and were not persisted"
+        );
+    }
+    Ok(())
+}
+
+/// Readings submitted minus readings actually written. Saturating: a driver that
+/// ever reported more affected rows than submitted must read as "none dropped"
+/// rather than underflow into a huge bogus count.
+fn unattributed_count(submitted: usize, inserted: u64) -> u64 {
+    (submitted as u64).saturating_sub(inserted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_serial;
+    use super::{canonicalize_serial, unattributed_count};
+
+    /// Every submitted reading that the owner join did not keep was dropped.
+    #[test]
+    fn unattributed_count_is_submitted_minus_inserted() {
+        assert_eq!(unattributed_count(8, 8), 0, "all attributed ⇒ nothing dropped");
+        assert_eq!(unattributed_count(8, 3), 5);
+        assert_eq!(unattributed_count(8, 0), 8, "no owner rows at all ⇒ every reading dropped");
+        assert_eq!(unattributed_count(0, 0), 0, "empty batch");
+    }
+
+    /// Saturating on purpose: an impossible driver answer must read as "none
+    /// dropped", never underflow into a huge bogus counter increment.
+    #[test]
+    fn unattributed_count_saturates_instead_of_underflowing() {
+        assert_eq!(unattributed_count(3, 9), 0);
+    }
 
     #[test]
     fn canonicalizes_undashed_uppercase_uuid_to_meters_form() {
