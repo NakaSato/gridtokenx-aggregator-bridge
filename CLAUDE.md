@@ -155,7 +155,9 @@ dedup any replay (e.g. a crash before eviction); the on-chain `(meter_id, window
 backstop. Recipient wallet is resolved from the meter registry (`gridtokenx:meters:{serial}:wallet`); a
 missing wallet skips the mint (logged, bin still evicts). No on-chain confirmer (fire-and-forget).
 Tunables: `BILLING_FLUSH_INTERVAL_SECS` (default 30), `BILLING_FLUSH_GRACE_SECS` (default 120). Mint config:
-`MINT_VIA_CHAIN_BRIDGE`, `NATS_URL`, `CHAIN_BRIDGE_SERVICE_IDENTITY`. `BillingBin` carries `#[serde(default)]`
+`MINT_VIA_CHAIN_BRIDGE`, `NATS_URL`, `CHAIN_BRIDGE_SERVICE_IDENTITY`,
+`MINT_DEFER_LOG_INTERVAL_SECS` (default 60 — how often the outbox drain may repeat its aggregated
+deferral summary at `warn!`; `0` = every batch). `BillingBin` carries `#[serde(default)]`
 TOU/demand fields so bins persisted before these existed still deserialize on crash recovery.
 
 Durability (two crash-safety closures, both degrade-safe):
@@ -186,7 +188,16 @@ Durability (two crash-safety closures, both degrade-safe):
   an entry that hasn't landed after `MINT_OUTBOX_MAX_AGE_SECS` (default 7 days, `0` = retry forever) is
   **parked** — moved to `gridtokenx:billing:mint_outbox:parked`, out of the retry path, loud `warn!` +
   `aggregator_mint_total{outcome="parked",reason="expired"}` — never silently deleted; re-enqueue manually
-  to resume. A resolved wallet that isn't a parseable Solana address (e.g. e2e-fixture junk) is skipped
+  to resume. **Deferral logging is aggregated, not per entry.** The outbox holds one entry per
+  `(serial, 15-min window)`, so a meter that can never mint — no registry row at all, not merely a missing
+  wallet — adds a fresh entry every window and every one is retried on every tick. Measured on the dev
+  stack: 503 entries from 20 unregistered meters at `MINT_RETRY_INTERVAL_SECS=5` produced **~100 identical
+  `warn!` lines per second (~8.6M/day)**. `attempt_mint_batch` now tallies the reasons and emits ONE summary
+  (`no_wallet=… invalid_wallet=… lookup_err=… in_flight=…` plus a sample serial), throttled to
+  `MINT_DEFER_LOG_INTERVAL_SECS` (default 60, `0` = log every batch) with the first summary after a quiet
+  period always logged; the per-entry lines dropped to `debug!`. The per-recipient
+  `aggregator_mint_total{outcome,reason}` counters are unchanged, so dashboards keep full resolution —
+  alert on the counter, never on the log volume. A resolved wallet that isn't a parseable Solana address (e.g. e2e-fixture junk) is skipped
   aggregator-side *before* the NATS publish (`wallet_is_valid`,
   `crates/aggregator-persistence/src/infra/mint.rs`; `skipped/invalid_wallet`) — it still retries (the
   registry may be corrected) until the age bound parks it.

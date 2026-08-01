@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aggregator_persistence::infra::meter_registry::MeterRegistry;
 use aggregator_persistence::infra::mint::{
@@ -193,6 +194,76 @@ fn classify_batch_results(results: &[MintBatchItemResult]) -> BatchClassificatio
     c
 }
 
+/// Per-recipient deferral tally for one batch attempt, so the reasons are logged
+/// ONCE per batch instead of once per entry.
+///
+/// Why this exists: the outbox holds one entry per `(serial, 15-min window)`, so a
+/// meter that can never mint — no registry row at all, not merely a missing wallet —
+/// contributes a fresh entry every window, forever, and every one of them is retried
+/// on every drain tick. Observed on the dev stack: 503 outbox entries against 20
+/// unregistered meters with `MINT_RETRY_INTERVAL_SECS=5` produced ~100 identical
+/// `warn!` lines per second (~8.6M/day), which drowns the log without adding
+/// information the `aggregator_mint_total{outcome,reason}` counter doesn't already
+/// carry precisely.
+#[derive(Default)]
+struct DeferralTally {
+    in_flight: usize,
+    no_wallet: usize,
+    invalid_wallet: usize,
+    resolve_err: usize,
+    /// One example, so the summary still points somewhere actionable.
+    sample_serial: Option<String>,
+}
+
+impl DeferralTally {
+    fn note(&mut self, serial: &str) {
+        if self.sample_serial.is_none() {
+            self.sample_serial = Some(serial.to_string());
+        }
+    }
+    fn total(&self) -> usize {
+        self.in_flight + self.no_wallet + self.invalid_wallet + self.resolve_err
+    }
+}
+
+/// Steady-state throttle for the deferral summary. The FIRST summary after a quiet
+/// period always logs, so a new problem is never delayed; a persistent one then
+/// reports at most this often. `0` disables the throttle (every batch logs).
+fn defer_log_interval() -> Duration {
+    Duration::from_secs(
+        std::env::var("MINT_DEFER_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60),
+    )
+}
+
+/// Pure throttle decision: has `interval` passed since `last`? A zero interval and
+/// a never-logged slot both mean "log now".
+///
+/// Kept separate from [`defer_log_due`] deliberately — the policy is then testable
+/// without touching the process-wide slot or a global env var, which two tests
+/// sharing both cannot do without racing each other.
+fn throttle_elapsed(last: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    match last {
+        Some(t) if !interval.is_zero() => now.duration_since(t) >= interval,
+        _ => true,
+    }
+}
+
+/// `true` when the deferral summary is due (and claims the slot).
+fn defer_log_due() -> bool {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    if throttle_elapsed(*last, now, defer_log_interval()) {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
 /// Batched sibling of [`attempt_mint`]: resolves + mints a slice of pending
 /// surpluses in ONE Chain Bridge round-trip. Returns the outbox `field`s of the
 /// recipients that **confirmed** on-chain — the caller removes exactly those and
@@ -214,35 +285,46 @@ pub async fn attempt_mint_batch(
     // batch round-trip so a concurrent tick can't re-publish the same key.
     let mut inputs: Vec<BatchMintInput> = Vec::new();
     let mut guards: Vec<MintInFlightGuard> = Vec::new();
+    // Reasons are tallied and reported once below, not per entry — see `DeferralTally`.
+    // The per-recipient METRICS are unchanged, so dashboards keep full resolution.
+    let mut deferred = DeferralTally::default();
     for p in pending {
         let Some(guard) = inflight.try_begin(p.field()) else {
             metrics::record_mint_outcome("skipped", "in_flight");
+            deferred.in_flight += 1;
+            deferred.note(&p.meter_serial);
             continue;
         };
         let wallet = match reg.resolve_wallet(&p.meter_serial).await {
             Ok(Some(w)) if !wallet_is_valid(&w) => {
-                warn!(
+                debug!(
                     "surplus mint deferred: invalid recipient wallet '{w}' for meter {} (kept for retry)",
                     p.meter_serial
                 );
                 metrics::record_mint_outcome("skipped", "invalid_wallet");
+                deferred.invalid_wallet += 1;
+                deferred.note(&p.meter_serial);
                 continue; // guard drops → key released; nothing published
             }
             Ok(Some(w)) => w,
             Ok(None) => {
-                warn!(
+                debug!(
                     "surplus mint deferred: no wallet registered for meter {} (kept for retry)",
                     p.meter_serial
                 );
                 metrics::record_mint_outcome("skipped", "no_wallet");
+                deferred.no_wallet += 1;
+                deferred.note(&p.meter_serial);
                 continue;
             }
             Err(e) => {
-                warn!(
+                debug!(
                     "surplus mint deferred: wallet lookup failed for {} ({e}); kept for retry",
                     p.meter_serial
                 );
                 metrics::record_mint_outcome("skipped", "resolve_err");
+                deferred.resolve_err += 1;
+                deferred.note(&p.meter_serial);
                 continue;
             }
         };
@@ -254,6 +336,28 @@ pub async fn attempt_mint_batch(
             window_start_ms: p.window_start_ms,
         });
         guards.push(guard);
+    }
+
+    // ONE line for the whole batch's deferrals, throttled in steady state. An entry
+    // deferred for `no_wallet` needs a human to register the meter — no amount of
+    // re-logging changes that, and the per-reason counter is the thing to alert on.
+    if deferred.total() > 0 {
+        let summary = format!(
+            "surplus mint deferred for {} of {} outbox entries (kept for retry): \
+             no_wallet={} invalid_wallet={} lookup_err={} in_flight={}; e.g. meter {}",
+            deferred.total(),
+            pending.len(),
+            deferred.no_wallet,
+            deferred.invalid_wallet,
+            deferred.resolve_err,
+            deferred.in_flight,
+            deferred.sample_serial.as_deref().unwrap_or("?"),
+        );
+        if defer_log_due() {
+            warn!("{summary}");
+        } else {
+            debug!("{summary}");
+        }
     }
 
     if inputs.is_empty() {
@@ -362,6 +466,70 @@ fn mint_failure_reason(e: &anyhow::Error) -> &'static str {
 mod tests {
     use super::*;
     use anyhow::{anyhow, Context};
+
+    /// The tally counts each reason separately and keeps ONE sample serial — the
+    /// summary's only job is to say how much of what, and point somewhere real.
+    #[test]
+    fn deferral_tally_counts_by_reason_and_keeps_first_sample() {
+        let mut t = DeferralTally::default();
+        assert_eq!(t.total(), 0);
+        t.no_wallet += 1;
+        t.note("METER-A");
+        t.no_wallet += 1;
+        t.note("METER-B");
+        t.invalid_wallet += 1;
+        t.note("METER-C");
+        t.in_flight += 1;
+        t.resolve_err += 1;
+        assert_eq!(t.total(), 5, "every reason contributes to the total");
+        assert_eq!(t.no_wallet, 2);
+        assert_eq!(
+            t.sample_serial.as_deref(),
+            Some("METER-A"),
+            "the first serial is kept, not the last"
+        );
+    }
+
+    /// The throttle lets the FIRST summary through — a new problem is never delayed —
+    /// then suppresses immediate repeats, which is what stops ~100 lines/sec. Tested on
+    /// the pure decision so it neither reads the env nor shares the process-wide slot.
+    #[test]
+    fn throttle_logs_first_then_suppresses_until_the_interval_passes() {
+        let t0 = Instant::now();
+        let minute = Duration::from_secs(60);
+
+        assert!(
+            throttle_elapsed(None, t0, minute),
+            "never logged before ⇒ log now"
+        );
+        assert!(
+            !throttle_elapsed(Some(t0), t0, minute),
+            "an immediate repeat is suppressed"
+        );
+        assert!(
+            !throttle_elapsed(Some(t0), t0 + Duration::from_secs(59), minute),
+            "still inside the interval"
+        );
+        assert!(
+            throttle_elapsed(Some(t0), t0 + minute, minute),
+            "exactly at the interval is due — boundary is inclusive"
+        );
+    }
+
+    /// Interval 0 is the escape hatch: every batch logs, for debugging.
+    #[test]
+    fn throttle_interval_zero_never_suppresses() {
+        let t0 = Instant::now();
+        let zero = Duration::ZERO;
+        assert!(throttle_elapsed(Some(t0), t0, zero));
+        assert!(throttle_elapsed(Some(t0), t0 + Duration::from_secs(1), zero));
+    }
+
+    /// The default is a quiet-but-not-silent minute; the env var overrides it.
+    #[test]
+    fn defer_log_interval_defaults_to_a_minute() {
+        assert_eq!(defer_log_interval(), Duration::from_secs(60));
+    }
 
     #[test]
     fn reply_timeout_classified_even_when_wrapped_with_context() {
