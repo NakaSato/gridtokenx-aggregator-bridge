@@ -419,12 +419,33 @@ pub fn feed_enabled() -> bool {
 /// in a `recv()` loop — no new bus is introduced.
 pub struct OwnerReadModelConsumer {
     consumer: StreamConsumer,
+    /// Kept so the loop can rebuild the client after sustained fencing — see
+    /// [`Self::run`].
+    brokers: String,
+    group_id: String,
+    topics: Vec<String>,
 }
+
+/// Consecutive `recv()` failures tolerated before the client is rebuilt. At the
+/// 500ms backoff below this is ~30s of unbroken failure, so a transient broker
+/// blip (which recovers on its own) never triggers a rebuild.
+const REBUILD_AFTER_CONSECUTIVE_ERRORS: u32 = 60;
 
 impl OwnerReadModelConsumer {
     /// Build + subscribe. Mirrors the dispatch listener's builder, subscribing to
     /// multiple topics (user + meter events).
     pub fn new(brokers: &str, group_id: &str, topics: &[&str]) -> Result<Self> {
+        let consumer = Self::connect(brokers, group_id, topics)?;
+        Ok(Self {
+            consumer,
+            brokers: brokers.to_string(),
+            group_id: group_id.to_string(),
+            topics: topics.iter().map(|t| (*t).to_string()).collect(),
+        })
+    }
+
+    /// The client build + subscribe, factored out so [`Self::run`] can redo it.
+    fn connect(brokers: &str, group_id: &str, topics: &[&str]) -> Result<StreamConsumer> {
         let consumer: StreamConsumer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("group.id", group_id)
@@ -441,15 +462,16 @@ impl OwnerReadModelConsumer {
             .subscribe(topics)
             .map_err(|e| anyhow!("owner read-model consumer subscribe failed: {:?}", e))?;
         info!("✅ Owner read-model consumer subscribed to {:?}", topics);
-        Ok(Self { consumer })
+        Ok(consumer)
     }
 
     /// Drain the subscribed topics until `shutdown` resolves, dispatching each
     /// message into `repo`. Never panics: a consume error backs off briefly and
     /// continues; a malformed payload is logged and skipped.
-    pub async fn run(self, repo: OwnerReadModel, shutdown: impl Future<Output = ()>) {
+    pub async fn run(mut self, repo: OwnerReadModel, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
         info!("📡 Owner read-model feed started");
+        let mut consecutive_errors: u32 = 0;
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
@@ -458,14 +480,52 @@ impl OwnerReadModelConsumer {
                 }
                 recv = self.consumer.recv() => {
                     match recv {
-                        Ok(msg) => match msg.payload() {
-                            Some(payload) => Self::dispatch(&repo, payload).await,
-                            None => warn!("owner read-model: empty payload, skipping"),
-                        },
+                        Ok(msg) => {
+                            consecutive_errors = 0;
+                            match msg.payload() {
+                                Some(payload) => Self::dispatch(&repo, payload).await,
+                                None => warn!("owner read-model: empty payload, skipping"),
+                            }
+                        }
                         Err(e) => {
+                            consecutive_errors += 1;
                             error!("❌ Owner read-model consume error: {}", e);
                             // Avoid a hot spin if the broker is transiently down.
                             tokio::time::sleep(Duration::from_millis(500)).await;
+
+                            // Most fencings self-heal: rdkafka rejoins the group and
+                            // `recv()` starts succeeding again. But after a long host
+                            // suspend (observed 2026-08-01: a 68-minute freeze blew
+                            // `max.poll.interval.ms`) the client stayed out of the
+                            // group indefinitely — the loop kept retrying a client
+                            // that would never recover, so ownership events silently
+                            // stopped applying and `meter_owner_read_model` drifted
+                            // from `meters`. That is invisible downstream: readings
+                            // keep attributing to the previous owner and surplus is
+                            // dropped as `no registered owner`. Rebuilding the client
+                            // is exactly what a container restart did to fix it, minus
+                            // the restart — the group id is unchanged, so it resumes
+                            // from the committed offsets rather than replaying.
+                            if consecutive_errors >= REBUILD_AFTER_CONSECUTIVE_ERRORS {
+                                let topics: Vec<&str> =
+                                    self.topics.iter().map(String::as_str).collect();
+                                match Self::connect(&self.brokers, &self.group_id, &topics) {
+                                    Ok(consumer) => {
+                                        self.consumer = consumer;
+                                        consecutive_errors = 0;
+                                        warn!(
+                                            "♻️ Owner read-model consumer rebuilt after {} consecutive errors",
+                                            REBUILD_AFTER_CONSECUTIVE_ERRORS
+                                        );
+                                    }
+                                    // Keep the old client and keep trying; a rebuild
+                                    // that fails must not take the feed down.
+                                    Err(e) => {
+                                        error!("❌ Owner read-model consumer rebuild failed: {e}");
+                                        consecutive_errors = 0;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
