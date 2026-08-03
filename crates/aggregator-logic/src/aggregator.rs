@@ -108,21 +108,65 @@ impl BillingBin {
     }
 }
 
+/// Per-meter ingest progress, used for **event-time** window completion.
+///
+/// Completion used to compare a bin's `end_time` (event time, derived from
+/// reading timestamps) against the wall clock — so a meter whose timestamps run
+/// behind the wall clock (simulator with a past sim-clock, backfill, deep
+/// buffering) had every bin judged "complete" the moment it formed. The bin
+/// settled and minted mid-window, the next reading re-created it, the re-settle
+/// hit Chain Bridge's mint dedup (`mint:{serial}:{window}`) which replays the
+/// prior signature WITHOUT minting — and the write-back then stamped the new
+/// rows minted/confirmed with that replayed signature. Observed 2026-08-03:
+/// DB-claimed minted energy far exceeding the on-chain balance.
+struct MeterProgress {
+    /// Highest reading timestamp seen from this meter — the event-time
+    /// watermark. A window is only over once the meter's own data moves past it.
+    watermark: DateTime<Utc>,
+    /// Wall-clock time the last reading arrived. Idle fallback: a meter that
+    /// stops sending would otherwise strand its final window forever.
+    last_arrival: DateTime<Utc>,
+}
+
+/// How long a settled window's key is remembered (relative to the meter's
+/// watermark) so a straggler cannot re-create — and re-settle — its bin.
+const SETTLED_RETENTION_HOURS: i64 = 24;
+
 pub struct Aggregator {
     /// active_bins: (meter_id, window_start_time) -> BillingBin
     active_bins: HashMap<(Uuid, DateTime<Utc>), BillingBin>,
+    /// Event-time progress per meter (see [`MeterProgress`]).
+    progress: HashMap<Uuid, MeterProgress>,
+    /// Window starts already settled per meter. A reading for one of these is a
+    /// LATE ARRIVAL: its window minted already and the on-chain
+    /// `(meter, window)` PDA permits no top-up, so re-binning it can only
+    /// produce a dedup-replayed "mint" that never happened. Process-local: a
+    /// straggler landing after a restart still re-forms its bin, where the
+    /// bridge dedup remains the (silent) backstop.
+    settled: HashMap<Uuid, std::collections::BTreeSet<DateTime<Utc>>>,
 }
 
 impl Aggregator {
     pub fn new() -> Self {
         Self {
             active_bins: HashMap::new(),
+            progress: HashMap::new(),
+            settled: HashMap::new(),
         }
     }
 
     /// Handles a new meter reading and updates or creates the corresponding billing
     /// bin. Returns a snapshot (clone) of the updated bin so the async edge can
     /// write it through to the durable store (crash-recovery of accumulated energy).
+    ///
+    /// Returns `None` for a **late arrival** — a reading whose window this
+    /// process already settled. Its window minted already and the on-chain
+    /// `(meter, window)` PDA permits no second mint, so binning it again could
+    /// only re-settle into a dedup replay that stamps unminted energy as minted.
+    /// The reading still reaches every non-billing sink (zone streams, InfluxDB,
+    /// Kafka, the Postgres history row) — only the billing bin drops it. The
+    /// caller should count the drop (it is the residual, visible form of energy
+    /// that arrived too late to tokenize).
     #[allow(clippy::too_many_arguments)]
     pub fn handle_reading(
         &mut self,
@@ -140,9 +184,33 @@ impl Aggregator {
         // Zone partition the ingester routed this reading to. Recorded on the bin
         // for per-zone energy balance; see `BillingBin::zone_code`.
         zone_code: Option<u16>,
-    ) -> BillingBin {
+    ) -> Option<BillingBin> {
         let start_time = self.get_window_start(timestamp);
         let end_time = start_time + chrono::Duration::minutes(WINDOW_MINUTES as i64);
+
+        // Progress first — even a late reading is evidence the meter is alive
+        // and of how far its event clock has advanced.
+        let now = gridtokenx_telemetry::time::now();
+        let p = self.progress.entry(meter_id).or_insert(MeterProgress {
+            watermark: timestamp,
+            last_arrival: now,
+        });
+        if timestamp > p.watermark {
+            p.watermark = timestamp;
+        }
+        p.last_arrival = now;
+
+        if self
+            .settled
+            .get(&meter_id)
+            .is_some_and(|w| w.contains(&start_time))
+        {
+            debug!(
+                "late reading for {} window {} — window already settled, excluded from billing",
+                meter_serial, start_time
+            );
+            return None;
+        }
 
         let bin = self
             .active_bins
@@ -201,30 +269,69 @@ impl Aggregator {
             }
         }
 
-        bin.clone()
+        Some(bin.clone())
     }
 
-    /// Returns clones of all billing bins whose window closed at least `grace`
-    /// ago, WITHOUT removing them. The `grace` delay lets late / briefly-buffered
-    /// readings for a just-closed window still land in it before it is read.
-    /// Pass `Duration::zero()` for the strict `end_time <= now` semantics used by
-    /// the dispatch engine's completed-window capacity query.
+    /// Returns clones of all billing bins whose window is complete, WITHOUT
+    /// removing them.
+    ///
+    /// Completion is judged in **event time**, per meter: a window is over when
+    /// the meter's own watermark (highest reading timestamp seen) has moved past
+    /// `end_time + grace`. Judging by wall clock — the old rule — settled a
+    /// window the instant it formed whenever the meter's timestamps ran behind
+    /// the wall clock (sim clock, backfill), minting mid-window and turning
+    /// every subsequent reading into a dedup-replay that falsified the
+    /// write-back. Two fallbacks keep event time from stranding bins:
+    ///
+    /// - **Idle**: a meter quiet for `grace` of wall time is done sending; its
+    ///   bins complete once their `end_time` is also past (skew guard). Only
+    ///   when `grace > 0` — the dispatch engine's zero-grace capacity peek must
+    ///   not see every bin as complete.
+    /// - **No progress entry** (bin restored from the durable store, meter
+    ///   silent since restart): wall-clock completion, the pre-watermark rule.
     ///
     /// Non-destructive on purpose: the dispatch engine only reads completed-window
     /// capacity and never drains bins.
     pub fn peek_completed_bins(&self, grace: chrono::Duration) -> Vec<BillingBin> {
-        let cutoff = gridtokenx_telemetry::time::now() - grace;
+        self.peek_completed_bins_at(gridtokenx_telemetry::time::now(), grace)
+    }
+
+    /// [`Self::peek_completed_bins`] against an explicit `now` (testability —
+    /// the idle and restored-bin arms are wall-clock-dependent).
+    pub fn peek_completed_bins_at(
+        &self,
+        now: DateTime<Utc>,
+        grace: chrono::Duration,
+    ) -> Vec<BillingBin> {
         self.active_bins
             .values()
-            .filter(|bin| bin.end_time <= cutoff)
+            .filter(|bin| match self.progress.get(&bin.meter_id) {
+                Some(p) => {
+                    p.watermark >= bin.end_time + grace
+                        || (grace > chrono::Duration::zero()
+                            && now - p.last_arrival >= grace
+                            && bin.end_time <= now)
+                }
+                None => bin.end_time + grace <= now,
+            })
             .cloned()
             .collect()
     }
 
-    /// Removes the given bins (settled & evicted from the durable store by the caller).
+    /// Removes the given bins (settled & evicted from the durable store by the
+    /// caller), and remembers each settled window so a straggler reading cannot
+    /// re-create — and re-settle — a window that already minted.
     pub fn remove_bins(&mut self, keys: &[BinKey]) {
-        for key in keys {
-            self.active_bins.remove(key);
+        for (meter_id, window_start) in keys {
+            self.active_bins.remove(&(*meter_id, *window_start));
+            let windows = self.settled.entry(*meter_id).or_default();
+            windows.insert(*window_start);
+            // Bounded memory: no straggler arrives a day of event time late —
+            // and if one somehow does, the bridge's mint dedup is the backstop.
+            if let Some(p) = self.progress.get(meter_id) {
+                let horizon = p.watermark - chrono::Duration::hours(SETTLED_RETENTION_HOURS);
+                windows.retain(|w| *w >= horizon);
+            }
         }
     }
 
@@ -278,6 +385,7 @@ mod tests {
             None,
             None,
         )
+        .expect("window not settled — reading must bin")
     }
 
     fn reading_tou(
@@ -299,6 +407,7 @@ mod tests {
             Some(Decimal::from(demand_kw)),
             Some(7),
         )
+        .expect("window not settled — reading must bin")
     }
 
     // --- window floor: timestamp snaps down to the 15-min window start ---
@@ -403,6 +512,9 @@ mod tests {
         let mut agg = Aggregator::new();
         let past = gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25);
         reading(&mut agg, 30, 0, past);
+        // Advance the meter's watermark past the first window's end so it
+        // completes in event time (the newer reading's own window stays open).
+        reading(&mut agg, 1, 0, past + chrono::Duration::minutes(20));
 
         assert_eq!(agg.peek_completed_bins(chrono::Duration::zero()).len(), 1);
         // A second peek still sees it — eviction only happens via remove_bins,
@@ -534,6 +646,100 @@ mod tests {
         assert_eq!(
             agg.peek_completed_bins(chrono::Duration::seconds(20)).len(),
             1
+        );
+    }
+
+    // --- event-time completion: the mint write-back divergence regression ---
+
+    #[test]
+    fn backdated_window_completes_by_watermark_not_wall_clock() {
+        // The 2026-08-03 incident: a simulator with a days-behind sim clock had
+        // every bin judged complete the moment it formed (end_time <= wall now),
+        // so windows settled and minted MID-window, re-formed on the next
+        // reading, and re-settled into Chain Bridge dedup replays that stamped
+        // unminted energy as minted. A still-filling backdated window must NOT
+        // be complete; it completes only when the meter's own data moves past it.
+        let mut agg = Aggregator::new();
+        let sim = at(10, 1, 0); // days behind wall clock in the incident; any past instant works
+        reading(&mut agg, 5, 0, sim);
+        reading(&mut agg, 5, 0, at(10, 8, 0));
+
+        let grace = chrono::Duration::seconds(120);
+        assert!(
+            agg.peek_completed_bins(grace).is_empty(),
+            "window still filling in event time — settling it here is the divergence bug"
+        );
+
+        // The meter's clock passes end + grace → now (and only now) it settles.
+        reading(&mut agg, 1, 0, at(10, 17, 1));
+        let done = agg.peek_completed_bins(grace);
+        assert_eq!(
+            done.len(),
+            1,
+            "watermark past end+grace completes the window"
+        );
+        assert_eq!(
+            done[0].energy_generated,
+            Decimal::from(10),
+            "the FULL window energy settles in one mint — no mid-window partial"
+        );
+    }
+
+    #[test]
+    fn late_reading_for_settled_window_is_excluded_from_billing() {
+        // Once a window settles (mints), the on-chain (meter, window) PDA
+        // permits no top-up: a straggler must not re-create the bin, or the
+        // re-settle dedup-replays the old signature over unminted energy.
+        let mut agg = Aggregator::new();
+        reading(&mut agg, 10, 0, at(10, 1, 0));
+        reading(&mut agg, 1, 0, at(10, 20, 0)); // watermark past window end
+        let done = agg.peek_completed_bins(chrono::Duration::zero());
+        assert_eq!(done.len(), 1);
+        agg.remove_bins(&[done[0].key()]);
+
+        let late = agg.handle_reading(
+            Uuid::nil(),
+            Uuid::nil(),
+            "M1".to_string(),
+            Decimal::from(7),
+            Decimal::ZERO,
+            at(10, 9, 0), // inside the already-settled [10:00,10:15) window
+            None,
+            None,
+            None,
+        );
+        assert!(late.is_none(), "late reading must be excluded from billing");
+        assert!(
+            agg.peek_completed_bins(chrono::Duration::zero())
+                .iter()
+                .all(|b| b.start_time != at(10, 0, 0)),
+            "the settled window must not re-form"
+        );
+    }
+
+    #[test]
+    fn idle_meter_settles_by_wall_clock_fallback() {
+        // A meter that stops sending would strand its final window forever under
+        // pure event-time completion — after `grace` of wall-clock silence its
+        // bins settle anyway.
+        let mut agg = Aggregator::new();
+        reading(&mut agg, 10, 0, at(10, 1, 0)); // watermark stuck inside the window
+        let grace = chrono::Duration::seconds(120);
+
+        assert!(
+            agg.peek_completed_bins(grace).is_empty(),
+            "meter just sent — not idle yet"
+        );
+        let later = gridtokenx_telemetry::time::now() + chrono::Duration::seconds(121);
+        assert_eq!(
+            agg.peek_completed_bins_at(later, grace).len(),
+            1,
+            "after grace of silence the stranded window settles"
+        );
+        assert!(
+            agg.peek_completed_bins_at(later, chrono::Duration::zero())
+                .is_empty(),
+            "zero-grace (dispatch capacity) peek must never use the idle arm"
         );
     }
 }

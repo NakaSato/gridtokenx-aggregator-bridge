@@ -442,10 +442,12 @@ mod tests {
     ) -> DispatchEngine {
         let mut agg = Aggregator::new();
         if seeded {
+            let meter = uuid::Uuid::new_v4();
+            let user = uuid::Uuid::new_v4();
             let ts = gridtokenx_telemetry::time::now() - chrono::Duration::minutes(20);
             agg.handle_reading(
-                uuid::Uuid::new_v4(),
-                uuid::Uuid::new_v4(),
+                meter,
+                user,
                 "test-meter".to_string(),
                 rust_decimal::Decimal::from(10),
                 rust_decimal::Decimal::ZERO,
@@ -453,6 +455,20 @@ mod tests {
                 None,
                 None,
                 None, // zone_code — irrelevant to the dispatch-capacity fixture
+            );
+            // Completion is event-time now: advance the meter's watermark past
+            // the first window's end so the capacity query sees it as complete
+            // (the zero-energy follow-up lands in a later, still-open window).
+            agg.handle_reading(
+                meter,
+                user,
+                "test-meter".to_string(),
+                rust_decimal::Decimal::ZERO,
+                rust_decimal::Decimal::ZERO,
+                ts + chrono::Duration::minutes(20),
+                None,
+                None,
+                None,
             );
         }
         DispatchEngine {

@@ -695,13 +695,23 @@ impl ZoneEventIngester {
                 zone_code,
             );
 
-            // 1b. Durable write-through (crash recovery of the in-flight
-            // window). The channel send is non-blocking — Redis latency never
-            // blocks ingest, the single writer task (spawned in `new`) absorbs
-            // it. A closed channel (writer task gone) or a write fault both
-            // degrade to memory-only, never fatal.
-            if let Some(tx) = &self.bin_write_tx {
-                let _ = tx.send(updated_bin);
+            match updated_bin {
+                // 1b. Durable write-through (crash recovery of the in-flight
+                // window). The channel send is non-blocking — Redis latency never
+                // blocks ingest, the single writer task (spawned in `new`) absorbs
+                // it. A closed channel (writer task gone) or a write fault both
+                // degrade to memory-only, never fatal.
+                Some(updated_bin) => {
+                    if let Some(tx) = &self.bin_write_tx {
+                        let _ = tx.send(updated_bin);
+                    }
+                }
+                // Late arrival: the reading's window already settled (and
+                // minted), so it is excluded from billing — re-binning it could
+                // only re-settle into a bridge dedup replay that stamps unminted
+                // energy as minted. Counted, not warned: the condition persists
+                // per straggling meter and the counter keeps full resolution.
+                None => aggregator_logic::metrics::record_late_reading(),
             }
         }
 

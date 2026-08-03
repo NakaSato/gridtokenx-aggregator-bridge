@@ -24,6 +24,13 @@ pub fn record_ingestion_request(device_type: &str, success: bool, duration_ms: f
     .record(duration_ms);
 }
 
+/// Records a reading excluded from billing because its window already settled
+/// (late arrival). Sustained non-zero means meters are delivering energy too
+/// late to tokenize — alert on this counter, the per-reading log is `debug!`.
+pub fn record_late_reading() {
+    counter!("aggregator_late_readings_dropped_total").increment(1);
+}
+
 /// Records meter reading ingestion metrics
 pub fn record_meter_reading(success: bool, duration_ms: f64) {
     counter!("aggregator_meter_readings_total",

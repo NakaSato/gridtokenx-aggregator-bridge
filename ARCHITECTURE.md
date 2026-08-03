@@ -199,14 +199,31 @@ hop in §6.
 Readings accumulate into **15-minute billing bins**, wall-clock aligned to
 :00/:15/:30/:45 — `WINDOW_MINUTES` (`crates/aggregator-logic/src/aggregator.rs:10`)
 floors the minute-of-hour in `get_window_start`
-(`crates/aggregator-logic/src/aggregator.rs:191`). The window size is a compile-time
+(`crates/aggregator-logic/src/aggregator.rs:350`). The window size is a compile-time
 constant, not configurable.
 
 A bin's identity is `(meter_id, window_start)`
-(`handle_reading`, `crates/aggregator-logic/src/aggregator.rs:84`). `end_time` is
+(`handle_reading`, `crates/aggregator-logic/src/aggregator.rs:171`). `end_time` is
 stored **per bin** rather than recomputed, and `peek_completed_bins`
-(`crates/aggregator-logic/src/aggregator.rs:163`) filters on it — so bins restored
-from a previous run settle on their own original boundaries.
+(`crates/aggregator-logic/src/aggregator.rs:295`) judges completion against it in
+**event time**: a window is complete only once the meter's own watermark — the
+highest reading timestamp seen from it (`MeterProgress`,
+`crates/aggregator-logic/src/aggregator.rs:122`) — has passed `end_time + grace`.
+Wall-clock completion (the old rule) settled a window the instant it formed
+whenever a meter's timestamps ran behind the wall clock (simulator sim-clock,
+backfill): the bin minted mid-window, re-formed on the next reading, and every
+re-settle became a Chain Bridge mint-dedup replay whose signature the write-back
+stamped onto rows whose energy was never minted (observed 2026-08-03). Two
+fallbacks keep event time from stranding bins: a meter **quiet for `grace`** of
+wall time settles its remaining past-dated bins (idle arm; skipped at zero grace
+so the dispatch engine's capacity peek is unaffected), and a bin restored from
+the durable store with **no readings since restart** falls back to wall-clock
+completion. `remove_bins` (`crates/aggregator-logic/src/aggregator.rs:324`)
+remembers each settled window so a straggler cannot re-create — and re-settle —
+a window that already minted; such late readings are excluded from billing
+(counted on `aggregator_late_readings_dropped_total`, the reading still reaches
+every non-billing sink). The settled-window memory is process-local; across a
+restart the bridge's mint dedup remains the backstop.
 
 Each bin carries a **time-of-use split** (peak = tariff rate 1, off-peak = rate 2)
 and the window's **max net import demand** in kW, for demand-charge billing. The
@@ -223,7 +240,7 @@ write-throughs in-flight bins to a Redis hash `gridtokenx:billing:bins`, field
 `{meter_id}:{window_start_ms}` (`BinStore`,
 `crates/aggregator-logic/src/bin_store.rs:46`). They are deleted on settlement
 eviction and **restored** at startup via `restore_bins`
-(`crates/aggregator-logic/src/aggregator.rs:184`), so a crash mid-window no longer
+(`crates/aggregator-logic/src/aggregator.rs:343`), so a crash mid-window no longer
 loses the partial totals. The write is fire-and-forget — Redis latency never
 blocks ingest; a Redis fault degrades to memory-only with a `warn!`.
 
