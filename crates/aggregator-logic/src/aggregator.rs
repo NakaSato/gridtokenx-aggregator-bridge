@@ -425,8 +425,18 @@ mod tests {
         // a still-open window survives for more readings.
         let mut agg = Aggregator::new();
         // Two distinct closed windows (different meters → different bins).
-        reading(&mut agg, 30, 0, gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25));
-        reading(&mut agg, 12, 0, gridtokenx_telemetry::time::now() - chrono::Duration::minutes(40));
+        reading(
+            &mut agg,
+            30,
+            0,
+            gridtokenx_telemetry::time::now() - chrono::Duration::minutes(25),
+        );
+        reading(
+            &mut agg,
+            12,
+            0,
+            gridtokenx_telemetry::time::now() - chrono::Duration::minutes(40),
+        );
         // One open (current-window) bin that must NOT be evicted.
         reading(&mut agg, 5, 0, gridtokenx_telemetry::time::now());
 
@@ -478,9 +488,16 @@ mod tests {
         // A new reading in the SAME [10:00,10:15) window must fold into the
         // restored bin, not start a fresh one.
         let bin = reading(&mut agg, 5, 1, at(10, 7, 0));
-        assert_eq!(bin.energy_generated, Decimal::from(15), "restored 10 + new 5");
+        assert_eq!(
+            bin.energy_generated,
+            Decimal::from(15),
+            "restored 10 + new 5"
+        );
         assert_eq!(bin.energy_consumed, Decimal::from(3), "restored 2 + new 1");
-        assert_eq!(bin.reading_count, 4, "restored count carried forward (3 + 1)");
+        assert_eq!(
+            bin.reading_count, 4,
+            "restored count carried forward (3 + 1)"
+        );
     }
 
     #[test]

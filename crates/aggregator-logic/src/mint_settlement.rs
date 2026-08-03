@@ -522,7 +522,11 @@ mod tests {
         let t0 = Instant::now();
         let zero = Duration::ZERO;
         assert!(throttle_elapsed(Some(t0), t0, zero));
-        assert!(throttle_elapsed(Some(t0), t0 + Duration::from_secs(1), zero));
+        assert!(throttle_elapsed(
+            Some(t0),
+            t0 + Duration::from_secs(1),
+            zero
+        ));
     }
 
     /// The default is a quiet-but-not-silent minute; the env var overrides it.

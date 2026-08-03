@@ -262,9 +262,10 @@ impl SignatureVerifier {
         signature_base58: &str,
     ) -> Result<bool> {
         // 1. Resolve the device public key (hot cache → Redis). Absent ⇒ reject loud.
-        let verifying_key = self.resolve_pubkey(meter_id).await?.ok_or_else(|| {
-            anyhow!("Public key not found in Redis for meter: {}", meter_id)
-        })?;
+        let verifying_key = self
+            .resolve_pubkey(meter_id)
+            .await?
+            .ok_or_else(|| anyhow!("Public key not found in Redis for meter: {}", meter_id))?;
 
         // 2. Decode signature from base58
         let signature_bytes = bs58::decode(signature_base58)
@@ -299,7 +300,10 @@ impl SignatureVerifier {
             );
             debug!("   Payload (string): {}", String::from_utf8_lossy(payload));
             debug!("   Payload (hex): {}", hex::encode(payload));
-            debug!("   Public Key (hex): {}", hex::encode(verifying_key.to_bytes()));
+            debug!(
+                "   Public Key (hex): {}",
+                hex::encode(verifying_key.to_bytes())
+            );
             debug!("   Signature (base58): {}", signature_base58);
         }
 
@@ -405,7 +409,10 @@ fn parse_ed25519_pubkey(meter_id: &str, raw: &str) -> Result<VerifyingKey> {
         s.as_bytes().to_vec()
     };
     if bytes.is_empty() {
-        return Err(anyhow!("Decoded public key is empty for meter: {}", meter_id));
+        return Err(anyhow!(
+            "Decoded public key is empty for meter: {}",
+            meter_id
+        ));
     }
     let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
         anyhow!(
@@ -1008,7 +1015,10 @@ mod tests {
                 expires: Instant::now() - Duration::from_secs(1),
             },
         );
-        assert!(r.key_cache_get("m-old").await.is_none(), "expired must miss");
+        assert!(
+            r.key_cache_get("m-old").await.is_none(),
+            "expired must miss"
+        );
         assert!(
             !r.key_cache.lock().await.map.contains_key("m-old"),
             "expired entry evicted on lookup"
@@ -1091,7 +1101,10 @@ mod tests {
                 expires: Instant::now() - Duration::from_secs(1),
             },
         );
-        assert!(v.pubkey_cache_get("m-old").await.is_none(), "expired must miss");
+        assert!(
+            v.pubkey_cache_get("m-old").await.is_none(),
+            "expired must miss"
+        );
         assert!(
             !v.pubkey_cache.lock().await.map.contains_key("m-old"),
             "expired entry evicted on lookup"

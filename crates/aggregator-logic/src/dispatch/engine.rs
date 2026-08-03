@@ -150,21 +150,14 @@ impl DispatchEngine {
             // No valid config — use the default. Warn only if the user actually
             // set something that resolved to nothing (a bare default is normal).
             if !raw.trim().is_empty() {
-                warn!(
-                    "no valid dispatch adapter in {:?}; using default",
-                    raw
-                );
+                warn!("no valid dispatch adapter in {:?}; using default", raw);
             }
             selected.push(Self::default_adapter_name(adapters));
         }
         selected
     }
 
-    fn last_dispatch_of(
-        &self,
-        action: DispatchType,
-        adapter: &str,
-    ) -> Option<std::time::Instant> {
+    fn last_dispatch_of(&self, action: DispatchType, adapter: &str) -> Option<std::time::Instant> {
         self.last_dispatch
             .iter()
             .find(|(a, name, _)| *a == action && name == adapter)
@@ -464,7 +457,10 @@ mod tests {
         }
         DispatchEngine {
             aggregator: Arc::new(Mutex::new(agg)),
-            adapters: adapters.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            adapters: adapters
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
             active_adapters: active.iter().map(|s| s.to_string()).collect(),
             freq_low_hz: 49.8,
             freq_high_hz: 50.2,
@@ -516,8 +512,20 @@ mod tests {
         let b = Arc::new(AtomicUsize::new(0));
         let mut eng = engine(
             vec![
-                ("a", Arc::new(CountingAdapter { hits: a.clone(), fail: false })),
-                ("b", Arc::new(CountingAdapter { hits: b.clone(), fail: false })),
+                (
+                    "a",
+                    Arc::new(CountingAdapter {
+                        hits: a.clone(),
+                        fail: false,
+                    }),
+                ),
+                (
+                    "b",
+                    Arc::new(CountingAdapter {
+                        hits: b.clone(),
+                        fail: false,
+                    }),
+                ),
             ],
             &["a", "b"],
             true,
@@ -534,8 +542,20 @@ mod tests {
         let bad = Arc::new(AtomicUsize::new(0));
         let mut eng = engine(
             vec![
-                ("bad", Arc::new(CountingAdapter { hits: bad.clone(), fail: true })),
-                ("ok", Arc::new(CountingAdapter { hits: ok.clone(), fail: false })),
+                (
+                    "bad",
+                    Arc::new(CountingAdapter {
+                        hits: bad.clone(),
+                        fail: true,
+                    }),
+                ),
+                (
+                    "ok",
+                    Arc::new(CountingAdapter {
+                        hits: ok.clone(),
+                        fail: false,
+                    }),
+                ),
             ],
             &["bad", "ok"],
             true,
@@ -550,7 +570,13 @@ mod tests {
     async fn all_adapters_failing_returns_err() {
         let bad = Arc::new(AtomicUsize::new(0));
         let mut eng = engine(
-            vec![("bad", Arc::new(CountingAdapter { hits: bad.clone(), fail: true }))],
+            vec![(
+                "bad",
+                Arc::new(CountingAdapter {
+                    hits: bad.clone(),
+                    fail: true,
+                }),
+            )],
             &["bad"],
             true,
         );
@@ -561,19 +587,35 @@ mod tests {
     async fn zero_capacity_skips_all_adapters() {
         let a = Arc::new(AtomicUsize::new(0));
         let mut eng = engine(
-            vec![("a", Arc::new(CountingAdapter { hits: a.clone(), fail: false }))],
+            vec![(
+                "a",
+                Arc::new(CountingAdapter {
+                    hits: a.clone(),
+                    fail: false,
+                }),
+            )],
             &["a"],
             false, // no completed bin → no capacity
         );
         assert!(eng.evaluate_and_dispatch(49.0).await.is_err());
-        assert_eq!(a.load(Ordering::SeqCst), 0, "no adapter called without capacity");
+        assert_eq!(
+            a.load(Ordering::SeqCst),
+            0,
+            "no adapter called without capacity"
+        );
     }
 
     #[tokio::test]
     async fn stable_frequency_dispatches_nothing() {
         let a = Arc::new(AtomicUsize::new(0));
         let mut eng = engine(
-            vec![("a", Arc::new(CountingAdapter { hits: a.clone(), fail: false }))],
+            vec![(
+                "a",
+                Arc::new(CountingAdapter {
+                    hits: a.clone(),
+                    fail: false,
+                }),
+            )],
             &["a"],
             true,
         );

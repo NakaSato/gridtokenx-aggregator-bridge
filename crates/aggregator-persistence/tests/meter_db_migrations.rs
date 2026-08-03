@@ -35,14 +35,18 @@ async fn reg_exists(pool: &sqlx::PgPool, qualified: &str) -> bool {
 #[tokio::test]
 async fn metering_migrations_apply_and_schema_is_present() {
     let Some(url) = test_url() else {
-        eprintln!("SKIP metering_migrations_apply_and_schema_is_present: METER_TEST_DATABASE_URL unset");
+        eprintln!(
+            "SKIP metering_migrations_apply_and_schema_is_present: METER_TEST_DATABASE_URL unset"
+        );
         return;
     };
     let pool = db::connect_pool(&url).await.expect("connect metering DB");
 
     // Apply — and prove idempotency by running twice (second run skips applied).
     db::run_migrations(&pool).await.expect("migrations apply");
-    db::run_migrations(&pool).await.expect("second run is a no-op");
+    db::run_migrations(&pool)
+        .await
+        .expect("second run is a no-op");
 
     // Domain tables (0002/0004/0005/0006 + partitioned parent from 0003).
     for t in [
@@ -106,13 +110,15 @@ async fn metering_migrations_apply_and_schema_is_present() {
     }
 
     // canonicalize_meter_serial is used as a write-time normalizer — exercise it.
-    let canon: String =
-        sqlx::query_scalar("SELECT canonicalize_meter_serial($1)")
-            .bind("  Abc-123 ")
-            .fetch_one(&pool)
-            .await
-            .expect("call canonicalize_meter_serial");
-    assert!(!canon.is_empty(), "canonicalize_meter_serial returns a value");
+    let canon: String = sqlx::query_scalar("SELECT canonicalize_meter_serial($1)")
+        .bind("  Abc-123 ")
+        .fetch_one(&pool)
+        .await
+        .expect("call canonicalize_meter_serial");
+    assert!(
+        !canon.is_empty(),
+        "canonicalize_meter_serial returns a value"
+    );
 }
 
 /// Phase-2 step 4: with the read-model flag ON, `MeterRegistry` resolves owner +
@@ -147,11 +153,17 @@ async fn owner_resolves_from_read_model_without_cross_domain_join() {
     // local read-model. Resolves owner + wallet with zero cross-domain access.
     let reg = MeterRegistry::new(None, Some(pool.clone())).with_read_model(true);
     assert!(
-        reg.resolve_user_id(SERIAL).await.expect("resolve_user_id ok").is_some(),
+        reg.resolve_user_id(SERIAL)
+            .await
+            .expect("resolve_user_id ok")
+            .is_some(),
         "read-model must resolve the owner"
     );
     assert_eq!(
-        reg.resolve_wallet(SERIAL).await.expect("resolve_wallet ok").as_deref(),
+        reg.resolve_wallet(SERIAL)
+            .await
+            .expect("resolve_wallet ok")
+            .as_deref(),
         Some(WALLET),
         "read-model must resolve the wallet"
     );
@@ -172,7 +184,9 @@ async fn owner_resolves_from_read_model_without_cross_domain_join() {
 #[tokio::test]
 async fn read_model_resolves_a_noncanonical_uuid_serial() {
     let Some(url) = test_url() else {
-        eprintln!("SKIP read_model_resolves_a_noncanonical_uuid_serial: METER_TEST_DATABASE_URL unset");
+        eprintln!(
+            "SKIP read_model_resolves_a_noncanonical_uuid_serial: METER_TEST_DATABASE_URL unset"
+        );
         return;
     };
     let pool = db::connect_pool(&url).await.expect("connect");
@@ -195,11 +209,17 @@ async fn read_model_resolves_a_noncanonical_uuid_serial() {
     // Resolve with the UNDASHED variant (redis None + empty caches ⇒ Postgres tier).
     let reg = MeterRegistry::new(None, Some(pool)).with_read_model(true);
     assert!(
-        reg.resolve_user_id(UNDASHED).await.expect("resolve").is_some(),
+        reg.resolve_user_id(UNDASHED)
+            .await
+            .expect("resolve")
+            .is_some(),
         "a dash/case-variant UUID serial must resolve to the canonical read-model row"
     );
     assert_eq!(
-        reg.resolve_wallet(UNDASHED).await.expect("wallet").as_deref(),
+        reg.resolve_wallet(UNDASHED)
+            .await
+            .expect("wallet")
+            .as_deref(),
         Some(WALLET)
     );
 }

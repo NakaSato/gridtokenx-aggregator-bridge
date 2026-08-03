@@ -226,7 +226,10 @@ async fn run_writer(pool: PgPool, mut rx: mpsc::Receiver<ReadingRow>, use_read_m
 /// propagating) a failure so a transient DB fault never kills the sink.
 async fn flush(pool: &PgPool, batch: &mut Vec<ReadingRow>, use_read_model: bool) {
     if let Err(e) = insert_batch(pool, batch, use_read_model).await {
-        error!("meter_readings batch insert failed for {} row(s) ({e})", batch.len());
+        error!(
+            "meter_readings batch insert failed for {} row(s) ({e})",
+            batch.len()
+        );
     }
     batch.clear();
 }
@@ -254,7 +257,11 @@ fn canonicalize_serial(raw: &str) -> String {
 /// `meter_id` is left NULL: its FK points at the dormant `meter_registry`
 /// table (not the meter-service `meters` table), and the dashboard
 /// identifies readings by `meter_serial`/`user_id`.
-async fn insert_batch(pool: &PgPool, rows: &[ReadingRow], use_read_model: bool) -> Result<(), sqlx::Error> {
+async fn insert_batch(
+    pool: &PgPool,
+    rows: &[ReadingRow],
+    use_read_model: bool,
+) -> Result<(), sqlx::Error> {
     if rows.is_empty() {
         return Ok(());
     }
@@ -354,9 +361,17 @@ mod tests {
     /// Every submitted reading that the owner join did not keep was dropped.
     #[test]
     fn unattributed_count_is_submitted_minus_inserted() {
-        assert_eq!(unattributed_count(8, 8), 0, "all attributed ⇒ nothing dropped");
+        assert_eq!(
+            unattributed_count(8, 8),
+            0,
+            "all attributed ⇒ nothing dropped"
+        );
         assert_eq!(unattributed_count(8, 3), 5);
-        assert_eq!(unattributed_count(8, 0), 8, "no owner rows at all ⇒ every reading dropped");
+        assert_eq!(
+            unattributed_count(8, 0),
+            8,
+            "no owner rows at all ⇒ every reading dropped"
+        );
         assert_eq!(unattributed_count(0, 0), 0, "empty batch");
     }
 

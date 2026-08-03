@@ -632,15 +632,13 @@ fn active_window_end(event: &EventRequest, now: DateTime<Utc>) -> DateTime<Utc> 
     let fallback = now + chrono::Duration::hours(24);
     find_setpoints(event)
         .iter()
-        .map(
-            |sp| match sp.period.or(event.interval_period.as_ref()) {
-                Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
-                    Some(d) => p.start + d.to_chrono_at_datetime(p.start),
-                    None => fallback,
-                },
+        .map(|sp| match sp.period.or(event.interval_period.as_ref()) {
+            Some(p) => match p.duration.as_ref().or(event.duration.as_ref()) {
+                Some(d) => p.start + d.to_chrono_at_datetime(p.start),
                 None => fallback,
             },
-        )
+            None => fallback,
+        })
         .max()
         .unwrap_or(fallback)
 }
@@ -746,8 +744,10 @@ mod tests {
     fn relative_setpoint_executes_and_is_flagged() {
         // DISPATCH_SETPOINT_RELATIVE actuates through the same signed-kW FLEX
         // path as absolute, but is tagged relative=true for observability.
-        let event =
-            event_with_payload(EventType::DispatchSetpointRelative, vec![Value::Number(-15.0)]);
+        let event = event_with_payload(
+            EventType::DispatchSetpointRelative,
+            vec![Value::Number(-15.0)],
+        );
         assert_eq!(
             decide(&event, gridtokenx_telemetry::time::now(), &no_executed()),
             EventDecision::Execute {

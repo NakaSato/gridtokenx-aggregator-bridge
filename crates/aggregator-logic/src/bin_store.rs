@@ -170,7 +170,10 @@ mod tests {
     fn load_skips_unparsable_entries_but_keeps_good_ones() {
         let good = sample_bin();
         let map = HashMap::from([
-            (bin_field(&good.key()), serde_json::to_string(&good).unwrap()),
+            (
+                bin_field(&good.key()),
+                serde_json::to_string(&good).unwrap(),
+            ),
             ("0:0".to_string(), "{not valid json".to_string()),
             ("1:1".to_string(), "{}".to_string()), // valid json, wrong shape
         ]);
@@ -193,11 +196,18 @@ mod tests {
             "energy_consumed":"2.0",
             "reading_count":3
         }"#;
-        let map = HashMap::from([("00000000-0000-0000-0000-000000001234:1767261600000".to_string(), json.to_string())]);
+        let map = HashMap::from([(
+            "00000000-0000-0000-0000-000000001234:1767261600000".to_string(),
+            json.to_string(),
+        )]);
         let got = parse_bins(map);
         assert_eq!(got.len(), 1, "legacy bin loads via serde(default)");
         assert_eq!(got[0].meter_serial, "MTR-OLD");
-        assert_eq!(got[0].max_demand_kw, Decimal::ZERO, "missing field defaults");
+        assert_eq!(
+            got[0].max_demand_kw,
+            Decimal::ZERO,
+            "missing field defaults"
+        );
         assert_eq!(got[0].net_surplus_kwh(), Some(3.0));
     }
 }

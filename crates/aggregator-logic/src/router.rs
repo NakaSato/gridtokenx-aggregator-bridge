@@ -427,7 +427,12 @@ fn reading_to_row(reading: &DeviceReading) -> Option<ReadingRow> {
     else {
         return None;
     };
-    let meta = |name: &str| reading.metadata.get(name).and_then(serde_json::Value::as_f64);
+    let meta = |name: &str| {
+        reading
+            .metadata
+            .get(name)
+            .and_then(serde_json::Value::as_f64)
+    };
     Some(ReadingRow {
         serial_number: reading.serial_number.clone(),
         timestamp_ms: reading.timestamp.timestamp_millis(),
@@ -492,7 +497,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, "initial", "cached handle is served as-is");
-        assert_eq!(builds.load(SeqCst), 0, "builder must not run on a cache hit");
+        assert_eq!(
+            builds.load(SeqCst),
+            0,
+            "builder must not run on a cache hit"
+        );
     }
 
     #[tokio::test]
@@ -519,7 +528,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(v2, 42, "second call serves the cached rebuild, not a new build");
+        assert_eq!(
+            v2, 42,
+            "second call serves the cached rebuild, not a new build"
+        );
         assert_eq!(builds.load(SeqCst), 1, "no rebuild on the cached path");
     }
 
@@ -749,7 +761,10 @@ mod tests {
         };
 
         // 1) XADD on the seeded connection.
-        let id1 = router.disseminate(&reading).await.expect("first disseminate");
+        let id1 = router
+            .disseminate(&reading)
+            .await
+            .expect("first disseminate");
         assert!(!id1.is_empty());
 
         // 2) Drop the cached manager, then disseminate again — must rebuild from

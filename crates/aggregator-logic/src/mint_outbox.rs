@@ -55,7 +55,12 @@ impl PendingMint {
     /// Builds a pending mint, stamping `enqueued_at_ms` with the service clock
     /// (NTP-backed `gridtokenx_telemetry::time::now`, the project's wall-clock).
     #[must_use]
-    pub fn new(meter_serial: String, meter_id: Uuid, window_start_ms: i64, energy_kwh: f64) -> Self {
+    pub fn new(
+        meter_serial: String,
+        meter_id: Uuid,
+        window_start_ms: i64,
+        energy_kwh: f64,
+    ) -> Self {
         Self {
             meter_serial,
             meter_id,

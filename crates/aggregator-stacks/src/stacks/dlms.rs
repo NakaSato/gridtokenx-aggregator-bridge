@@ -354,7 +354,11 @@ mod tests {
         });
         let raw = serde_json::to_vec(&payload).unwrap();
 
-        let reading = stack.handle_message("OBIS-BESS", &raw).await.unwrap().unwrap();
+        let reading = stack
+            .handle_message("OBIS-BESS", &raw)
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             reading.metadata.get("battery_soc_percent").unwrap(),

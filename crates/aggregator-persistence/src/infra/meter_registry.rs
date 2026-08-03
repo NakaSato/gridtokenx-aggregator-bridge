@@ -96,7 +96,7 @@ impl MeterRegistry {
             let cache = self.neg_cache.read().await;
             match cache.get(serial) {
                 Some(exp) if *exp > Instant::now() => return true,
-                Some(_) => {}      // expired — fall through to remove under write lock
+                Some(_) => {} // expired — fall through to remove under write lock
                 None => return false,
             }
         }
@@ -202,7 +202,13 @@ impl MeterRegistry {
         .bind(meter_serial)
         .fetch_optional(pool)
         .await
-        .map_err(|e| anyhow!("authoritative owner lookup failed for {}: {}", meter_serial, e))?;
+        .map_err(|e| {
+            anyhow!(
+                "authoritative owner lookup failed for {}: {}",
+                meter_serial,
+                e
+            )
+        })?;
         Ok(row.map(|(uid,)| uid))
     }
 
@@ -485,7 +491,10 @@ mod tests {
     #[tokio::test]
     async fn negative_cache_marks_and_clears() {
         let reg = MeterRegistry::new(None, None);
-        assert!(!reg.negatively_cached("MTR-X").await, "unknown serial not cached");
+        assert!(
+            !reg.negatively_cached("MTR-X").await,
+            "unknown serial not cached"
+        );
         reg.cache_negative("MTR-X").await;
         assert!(
             reg.negatively_cached("MTR-X").await,
@@ -502,11 +511,14 @@ mod tests {
     async fn expired_negative_entry_misses_and_is_evicted() {
         let reg = MeterRegistry::new(None, None);
         // Insert an already-expired marker directly, bypassing cache_negative's TTL.
-        reg.neg_cache
-            .write()
-            .await
-            .insert("MTR-OLD".to_string(), Instant::now() - Duration::from_secs(1));
-        assert!(!reg.negatively_cached("MTR-OLD").await, "expired marker must miss");
+        reg.neg_cache.write().await.insert(
+            "MTR-OLD".to_string(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(
+            !reg.negatively_cached("MTR-OLD").await,
+            "expired marker must miss"
+        );
         assert!(
             !reg.neg_cache.read().await.contains_key("MTR-OLD"),
             "expired marker must be evicted on lookup"

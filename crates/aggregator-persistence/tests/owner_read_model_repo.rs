@@ -21,17 +21,19 @@ fn test_url() -> Option<String> {
 /// non-UUID with no whitespace, so `canonicalize_meter_serial` is the identity —
 /// a plain equality read matches what `upsert_by_serial` canonicalizes on write.
 async fn row(pool: &sqlx::PgPool, serial: &str) -> Option<(Uuid, Option<String>)> {
-    sqlx::query_as("SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1")
-        .bind(serial)
-        .fetch_optional(pool)
-        .await
-        .expect("read row")
+    sqlx::query_as(
+        "SELECT user_id, wallet_address FROM meter_owner_read_model WHERE serial_number = $1",
+    )
+    .bind(serial)
+    .fetch_optional(pool)
+    .await
+    .expect("read row")
 }
 
 async fn setup(url: &str, serials: &[&str]) -> sqlx::PgPool {
     let pool = db::connect_pool(url).await.expect("connect");
     db::run_migrations(&pool).await.expect("migrate"); // idempotent
-    // Clean this test's serials so re-runs against a reused DB are deterministic.
+                                                       // Clean this test's serials so re-runs against a reused DB are deterministic.
     for s in serials {
         sqlx::query("DELETE FROM meter_owner_read_model WHERE serial_number = $1")
             .bind(s)
@@ -53,8 +55,13 @@ async fn upsert_by_serial_is_last_writer_wins_and_preserves_wallet() {
     let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
 
     // First meter event with a wallet.
-    repo.upsert_by_serial("OWNREPO-1", u1, Some("W1")).await.unwrap();
-    assert_eq!(row(&pool, "OWNREPO-1").await, Some((u1, Some("W1".to_string()))));
+    repo.upsert_by_serial("OWNREPO-1", u1, Some("W1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&pool, "OWNREPO-1").await,
+        Some((u1, Some("W1".to_string())))
+    );
 
     // A later meter event with NO wallet must NOT blank the existing wallet
     // (COALESCE-preserve): meters often re-register without a wallet.
@@ -67,8 +74,13 @@ async fn upsert_by_serial_is_last_writer_wins_and_preserves_wallet() {
 
     // Owner CHANGE (re-registration to a different user): take the event's fresh
     // snapshot — the previous owner's wallet is wrong for the new owner.
-    repo.upsert_by_serial("OWNREPO-1", u2, Some("W2")).await.unwrap();
-    assert_eq!(row(&pool, "OWNREPO-1").await, Some((u2, Some("W2".to_string()))));
+    repo.upsert_by_serial("OWNREPO-1", u2, Some("W2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&pool, "OWNREPO-1").await,
+        Some((u2, Some("W2".to_string())))
+    );
 }
 
 #[tokio::test]
@@ -86,13 +98,23 @@ async fn stale_meter_redelivery_does_not_regress_iam_wallet() {
     let owner = Uuid::new_v4();
 
     // Meter registered with the owner's then-current wallet W1.
-    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1")).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1"))
+        .await
+        .unwrap();
     // IAM moves the primary to W2 (the authoritative user-event path).
-    assert_eq!(repo.update_wallet_by_user(owner, Some("W2")).await.unwrap(), 1);
-    assert_eq!(row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(), Some("W2"));
+    assert_eq!(
+        repo.update_wallet_by_user(owner, Some("W2")).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(),
+        Some("W2")
+    );
 
     // Kafka redelivers the ORIGINAL MeterRegistered(W1) for the SAME owner.
-    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1")).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-REG", owner, Some("W1"))
+        .await
+        .unwrap();
     assert_eq!(
         row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(),
         Some("W2"),
@@ -100,8 +122,13 @@ async fn stale_meter_redelivery_does_not_regress_iam_wallet() {
     );
 
     // But a first-touch fill (no wallet yet) still works: fresh serial, no IAM event.
-    repo.upsert_by_serial("OWNREPO-REG", owner, None).await.unwrap(); // same owner, no wallet ⇒ keep W2
-    assert_eq!(row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(), Some("W2"));
+    repo.upsert_by_serial("OWNREPO-REG", owner, None)
+        .await
+        .unwrap(); // same owner, no wallet ⇒ keep W2
+    assert_eq!(
+        row(&pool, "OWNREPO-REG").await.unwrap().1.as_deref(),
+        Some("W2")
+    );
 }
 
 #[tokio::test]
@@ -115,15 +142,27 @@ async fn update_wallet_by_user_touches_all_owned_and_can_clear() {
     let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
 
     // Two serials for `owner`, one for a different user (must stay untouched).
-    repo.upsert_by_serial("OWNREPO-A", owner, None).await.unwrap();
-    repo.upsert_by_serial("OWNREPO-B", owner, None).await.unwrap();
-    repo.upsert_by_serial("OWNREPO-C", other, Some("OTHER")).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-A", owner, None)
+        .await
+        .unwrap();
+    repo.upsert_by_serial("OWNREPO-B", owner, None)
+        .await
+        .unwrap();
+    repo.upsert_by_serial("OWNREPO-C", other, Some("OTHER"))
+        .await
+        .unwrap();
 
     // An IAM wallet event (keyed by user) fills every serial that user owns.
     let n = repo.update_wallet_by_user(owner, Some("WU")).await.unwrap();
     assert_eq!(n, 2, "wallet event must touch both of the owner's meters");
-    assert_eq!(row(&pool, "OWNREPO-A").await.unwrap().1.as_deref(), Some("WU"));
-    assert_eq!(row(&pool, "OWNREPO-B").await.unwrap().1.as_deref(), Some("WU"));
+    assert_eq!(
+        row(&pool, "OWNREPO-A").await.unwrap().1.as_deref(),
+        Some("WU")
+    );
+    assert_eq!(
+        row(&pool, "OWNREPO-B").await.unwrap().1.as_deref(),
+        Some("WU")
+    );
     assert_eq!(
         row(&pool, "OWNREPO-C").await.unwrap().1.as_deref(),
         Some("OTHER"),
@@ -134,7 +173,10 @@ async fn update_wallet_by_user_touches_all_owned_and_can_clear() {
     // serial upsert, which only fills an absent wallet).
     let n2 = repo.update_wallet_by_user(owner, None).await.unwrap();
     assert_eq!(n2, 2);
-    assert!(row(&pool, "OWNREPO-A").await.unwrap().1.is_none(), "wallet cleared to NULL");
+    assert!(
+        row(&pool, "OWNREPO-A").await.unwrap().1.is_none(),
+        "wallet cleared to NULL"
+    );
     assert!(row(&pool, "OWNREPO-B").await.unwrap().1.is_none());
 }
 
@@ -148,17 +190,37 @@ async fn clear_wallet_if_matches_only_clears_the_matching_wallet() {
     let repo = OwnerReadModel::new(pool.clone());
     let owner = Uuid::new_v4();
 
-    repo.upsert_by_serial("OWNREPO-CLR1", owner, Some("WALLET-A")).await.unwrap();
-    repo.upsert_by_serial("OWNREPO-CLR2", owner, Some("WALLET-A")).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-CLR1", owner, Some("WALLET-A"))
+        .await
+        .unwrap();
+    repo.upsert_by_serial("OWNREPO-CLR2", owner, Some("WALLET-A"))
+        .await
+        .unwrap();
 
     // Unlinking a DIFFERENT wallet than the stored one is a no-op (a non-primary
     // wallet the read-model never held).
-    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-OTHER").await.unwrap(), 0);
-    assert_eq!(row(&pool, "OWNREPO-CLR1").await.unwrap().1.as_deref(), Some("WALLET-A"));
+    assert_eq!(
+        repo.clear_wallet_if_matches(owner, "WALLET-OTHER")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        row(&pool, "OWNREPO-CLR1").await.unwrap().1.as_deref(),
+        Some("WALLET-A")
+    );
 
     // Unlinking the STORED (mint-recipient) wallet clears it on every row the user owns.
-    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-A").await.unwrap(), 2);
-    assert!(row(&pool, "OWNREPO-CLR1").await.unwrap().1.is_none(), "stored wallet cleared on unlink");
+    assert_eq!(
+        repo.clear_wallet_if_matches(owner, "WALLET-A")
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        row(&pool, "OWNREPO-CLR1").await.unwrap().1.is_none(),
+        "stored wallet cleared on unlink"
+    );
     assert!(row(&pool, "OWNREPO-CLR2").await.unwrap().1.is_none());
 }
 
@@ -171,7 +233,9 @@ async fn wallet_event_before_first_meter_event_is_not_lost() {
     // "no wallet registered" (observed live 2026-07-18). The durable
     // user_wallet_read_model edge makes the merge order-independent.
     let Some(url) = test_url() else {
-        eprintln!("SKIP wallet_event_before_first_meter_event_is_not_lost: METER_TEST_DATABASE_URL unset");
+        eprintln!(
+            "SKIP wallet_event_before_first_meter_event_is_not_lost: METER_TEST_DATABASE_URL unset"
+        );
         return;
     };
     let pool = setup(&url, &["OWNREPO-RACE1", "OWNREPO-RACE2"]).await;
@@ -180,12 +244,17 @@ async fn wallet_event_before_first_meter_event_is_not_lost() {
 
     // 1. Wallet event first — user owns no meters yet: 0 meter rows touched,
     //    but the user → wallet edge must be recorded durably.
-    let n = repo.update_wallet_by_user(owner, Some("WALLET-EARLY")).await.unwrap();
+    let n = repo
+        .update_wallet_by_user(owner, Some("WALLET-EARLY"))
+        .await
+        .unwrap();
     assert_eq!(n, 0, "no meter rows yet");
 
     // 2. Meter event arrives later WITHOUT a wallet snapshot (registration-time
     //    wallet was not provisioned yet) — the upsert must fill from the edge.
-    repo.upsert_by_serial("OWNREPO-RACE1", owner, None).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-RACE1", owner, None)
+        .await
+        .unwrap();
     assert_eq!(
         row(&pool, "OWNREPO-RACE1").await.unwrap().1.as_deref(),
         Some("WALLET-EARLY"),
@@ -194,14 +263,28 @@ async fn wallet_event_before_first_meter_event_is_not_lost() {
 
     // 3. A meter event that DOES carry a snapshot still wins over the edge for
     //    a fresh row (COALESCE order: event snapshot first).
-    repo.upsert_by_serial("OWNREPO-RACE2", owner, Some("WALLET-SNAP")).await.unwrap();
-    assert_eq!(row(&pool, "OWNREPO-RACE2").await.unwrap().1.as_deref(), Some("WALLET-SNAP"));
+    repo.upsert_by_serial("OWNREPO-RACE2", owner, Some("WALLET-SNAP"))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&pool, "OWNREPO-RACE2").await.unwrap().1.as_deref(),
+        Some("WALLET-SNAP")
+    );
 
     // 4. Unlink clears BOTH the meter rows and the durable edge — a later meter
     //    event must not resurrect the unlinked wallet.
-    repo.update_wallet_by_user(owner, Some("WALLET-EARLY")).await.unwrap(); // realign both rows
-    assert_eq!(repo.clear_wallet_if_matches(owner, "WALLET-EARLY").await.unwrap(), 2);
-    repo.upsert_by_serial("OWNREPO-RACE1", owner, None).await.unwrap();
+    repo.update_wallet_by_user(owner, Some("WALLET-EARLY"))
+        .await
+        .unwrap(); // realign both rows
+    assert_eq!(
+        repo.clear_wallet_if_matches(owner, "WALLET-EARLY")
+            .await
+            .unwrap(),
+        2
+    );
+    repo.upsert_by_serial("OWNREPO-RACE1", owner, None)
+        .await
+        .unwrap();
     assert!(
         row(&pool, "OWNREPO-RACE1").await.unwrap().1.is_none(),
         "unlinked wallet must not come back from the edge table"
@@ -225,11 +308,10 @@ async fn backfill_seeds_from_local_meters_when_users_table_absent() {
 
     // Precondition: this throwaway DB must be the post-split shape (no `users`),
     // else the legacy join succeeds and the fallback under test never runs.
-    let users_exists: bool =
-        sqlx::query_scalar("SELECT to_regclass('public.users') IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .expect("regclass probe");
+    let users_exists: bool = sqlx::query_scalar("SELECT to_regclass('public.users') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("regclass probe");
     assert!(
         !users_exists,
         "test DB has a users table — fallback path not exercised; point METER_TEST_DATABASE_URL at a bridge-migrations-only DB"
@@ -256,9 +338,14 @@ async fn backfill_seeds_from_local_meters_when_users_table_absent() {
         .expect("insert meter 2");
     // u_walleted already has a durable wallet edge (0 meter rows in the read-model
     // yet, so this writes only user_wallet_read_model); u_bare has none.
-    repo.update_wallet_by_user(u_walleted, Some("W-EDGE")).await.unwrap();
+    repo.update_wallet_by_user(u_walleted, Some("W-EDGE"))
+        .await
+        .unwrap();
 
-    let n = repo.backfill().await.expect("backfill must not error on a users-less DB");
+    let n = repo
+        .backfill()
+        .await
+        .expect("backfill must not error on a users-less DB");
     assert!(n >= 2, "both meters rows must seed (got {n})");
     assert_eq!(
         row(&pool, "OWNREPO-BF1").await,
@@ -282,7 +369,9 @@ async fn backfill_seeds_the_reverse_user_wallet_edge() {
     // invisible to repair_missing_wallets (it only targets NULL wallets), so the
     // hole was permanent and blanked the wallet on meter-service's list/map.
     let Some(url) = test_url() else {
-        eprintln!("SKIP backfill_seeds_the_reverse_user_wallet_edge: METER_TEST_DATABASE_URL unset");
+        eprintln!(
+            "SKIP backfill_seeds_the_reverse_user_wallet_edge: METER_TEST_DATABASE_URL unset"
+        );
         return;
     };
     let pool = setup(&url, &["OWNREPO-REV1", "OWNREPO-REV2"]).await;
@@ -359,16 +448,24 @@ async fn repair_missing_wallets_resolves_via_callback() {
     // Ok(None) ("no wallet yet") and Err (IAM down) both leave NULL for the
     // next boot.
     let Some(url) = test_url() else {
-        eprintln!("SKIP repair_missing_wallets_resolves_via_callback: METER_TEST_DATABASE_URL unset");
+        eprintln!(
+            "SKIP repair_missing_wallets_resolves_via_callback: METER_TEST_DATABASE_URL unset"
+        );
         return;
     };
     let pool = setup(&url, &["OWNREPO-RP1", "OWNREPO-RP2", "OWNREPO-RP3"]).await;
     let repo = OwnerReadModel::new(pool.clone());
     let (u_fixed, u_no_wallet, u_iam_down) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
 
-    repo.upsert_by_serial("OWNREPO-RP1", u_fixed, None).await.unwrap();
-    repo.upsert_by_serial("OWNREPO-RP2", u_no_wallet, None).await.unwrap();
-    repo.upsert_by_serial("OWNREPO-RP3", u_iam_down, None).await.unwrap();
+    repo.upsert_by_serial("OWNREPO-RP1", u_fixed, None)
+        .await
+        .unwrap();
+    repo.upsert_by_serial("OWNREPO-RP2", u_no_wallet, None)
+        .await
+        .unwrap();
+    repo.upsert_by_serial("OWNREPO-RP3", u_iam_down, None)
+        .await
+        .unwrap();
 
     // The scan is table-wide (other tests' NULL rows may be in flight in the same
     // DB), so the stub answers by user_id and the assertions check rows, not counts.
@@ -383,8 +480,14 @@ async fn repair_missing_wallets_resolves_via_callback() {
             }
         })
         .await;
-    assert!(checked >= 3, "all three NULL-wallet users must be scanned (got {checked})");
-    assert!(fixed >= 1, "the resolvable user's row must be counted as fixed");
+    assert!(
+        checked >= 3,
+        "all three NULL-wallet users must be scanned (got {checked})"
+    );
+    assert!(
+        fixed >= 1,
+        "the resolvable user's row must be counted as fixed"
+    );
 
     assert_eq!(
         row(&pool, "OWNREPO-RP1").await.unwrap().1.as_deref(),
@@ -402,13 +505,12 @@ async fn repair_missing_wallets_resolves_via_callback() {
 
     // The repair writes through update_wallet_by_user, so the durable edge is
     // recorded too — a later meter event for this user back-fills from it.
-    let edge: Option<String> = sqlx::query_scalar(
-        "SELECT wallet_address FROM user_wallet_read_model WHERE user_id = $1",
-    )
-    .bind(u_fixed)
-    .fetch_one(&pool)
-    .await
-    .expect("edge row");
+    let edge: Option<String> =
+        sqlx::query_scalar("SELECT wallet_address FROM user_wallet_read_model WHERE user_id = $1")
+            .bind(u_fixed)
+            .fetch_one(&pool)
+            .await
+            .expect("edge row");
     assert_eq!(edge.as_deref(), Some("W-REPAIRED"));
 }
 
@@ -452,11 +554,9 @@ async fn stale_projection_is_distinguishable_from_an_unattributed_meter() {
     .await
     .expect("insert authoritative meter");
 
-    let registry = aggregator_persistence::infra::meter_registry::MeterRegistry::new(
-        None,
-        Some(pool.clone()),
-    )
-    .with_read_model(true);
+    let registry =
+        aggregator_persistence::infra::meter_registry::MeterRegistry::new(None, Some(pool.clone()))
+            .with_read_model(true);
 
     // Precondition: the projection really is empty for this serial.
     assert!(

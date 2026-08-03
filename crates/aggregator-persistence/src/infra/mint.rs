@@ -76,9 +76,7 @@ pub fn wallet_is_valid(wallet: &str) -> bool {
 /// `gridtokenx-blockchain-core`'s `rpc::nats_provider::connect_with_url_creds`
 /// (this crate stays chain-light, so no shared dep). Credentials are used
 /// verbatim (no percent-decoding).
-async fn connect_with_url_creds(
-    url: &str,
-) -> Result<async_nats::Client, async_nats::ConnectError> {
+async fn connect_with_url_creds(url: &str) -> Result<async_nats::Client, async_nats::ConnectError> {
     match url_userinfo(url) {
         Some((user, pass)) => {
             async_nats::ConnectOptions::with_user_and_password(user, pass)
@@ -521,15 +519,21 @@ mod tests {
     #[test]
     fn real_solana_pubkey_is_valid() {
         // The SPL token program id — a canonical 32-byte Base58 address.
-        assert!(wallet_is_valid("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"));
+        assert!(wallet_is_valid(
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        ));
     }
 
     #[test]
     fn e2e_fake_wallet_with_non_base58_chars_is_invalid() {
         // The 30_settlement fixture shape: `Wa11et{meter}` padded with '1's.
         // Meter ids like I8438032 inject 'I'/'0' — not in the Base58 alphabet.
-        assert!(!wallet_is_valid("Wa11etI843803211111111111111111111111111111"));
-        assert!(!wallet_is_valid("Wa11etS478130111111111111111111111111111111"));
+        assert!(!wallet_is_valid(
+            "Wa11etI843803211111111111111111111111111111"
+        ));
+        assert!(!wallet_is_valid(
+            "Wa11etS478130111111111111111111111111111111"
+        ));
     }
 
     #[test]
@@ -740,11 +744,23 @@ mod tests {
         field("item_count", &2u64.to_le_bytes());
         field(
             "item",
-            &item_bytes("mint:m1:1000", "Wa11etA", 7.5, &[7u8; 16], 1_700_000_000_000),
+            &item_bytes(
+                "mint:m1:1000",
+                "Wa11etA",
+                7.5,
+                &[7u8; 16],
+                1_700_000_000_000,
+            ),
         );
         field(
             "item",
-            &item_bytes("mint:m2:1000", "Wa11etB", 3.25, &[9u8; 16], 1_700_000_000_000),
+            &item_bytes(
+                "mint:m2:1000",
+                "Wa11etB",
+                3.25,
+                &[9u8; 16],
+                1_700_000_000_000,
+            ),
         );
 
         assert_eq!(
