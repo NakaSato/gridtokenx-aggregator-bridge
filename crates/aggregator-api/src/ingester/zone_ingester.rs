@@ -54,6 +54,10 @@ where
 
 /// Zone-based event ingester with parallel processing and batch forwarding
 pub struct ZoneEventIngester {
+    /// Kept so each zone loop can open its OWN connection (see
+    /// `process_zone_stream`); the shared manager below must never carry a
+    /// blocking command.
+    redis_client: Client,
     connection_manager: ConnectionManager,
     aggregator: Arc<Mutex<Aggregator>>,
     #[allow(dead_code)]
@@ -165,6 +169,7 @@ impl ZoneEventIngester {
         });
 
         Ok(Self {
+            redis_client: client,
             connection_manager,
             aggregator,
             metrics,
@@ -460,7 +465,16 @@ impl ZoneEventIngester {
         stream_name: &str,
         zone_idx: usize,
     ) -> Result<()> {
-        let mut conn = self.connection_manager.clone();
+        // A DEDICATED connection per zone loop, never the shared manager. The
+        // XREADGROUP below uses BLOCK, and a blocking command on a multiplexed
+        // connection stalls every other command queued on it: with the shared
+        // manager, each IDLE zone's 2s block serialized all ten zone reads (plus
+        // acks and reclaims) onto one pipe, capping every trafficked zone at
+        // roughly one 25-entry batch per few seconds regardless of processing
+        // speed — observed 2026-08-03 as an ever-growing stream backlog on the
+        // busy zones while the process sat idle. Acks/reclaims stay on the
+        // shared manager, which now carries only non-blocking commands.
+        let mut conn = Self::create_connection_manager(&self.redis_client).await?;
         let semaphore = Arc::new(Semaphore::new(ZONE_SEMAPHORE_SIZE));
         let mut pending_count = 0;
         let mut total_processed = 0;
