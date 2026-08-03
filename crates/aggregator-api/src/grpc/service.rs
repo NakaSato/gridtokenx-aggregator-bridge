@@ -335,11 +335,10 @@ impl OracleService for AggregatorServiceImpl {
         // --- UTT-H hardened anti-replay verification ---
         // Fail-CLOSED by default: signed-but-invalid is always rejected; unsigned
         // is rejected unless AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY=true.
-        let sig_verified = if let Some(signature) = request.signature.as_deref() {
+        let sig_verified = if let Some(signature) = request.signature {
             // Reconstruct canonical target with sequence/ms support (UTT-H Protocol)
             // Note: In a real deployment, sequence would be tracked in Redis to prevent reuse.
-            let sign_target =
-                grpc_sign_target(&request.meter_id, &request.kwh, request.timestamp);
+            let sign_target = grpc_sign_target(&request.meter_id, &request.kwh, request.timestamp);
 
             // Try the canonical target, then fall back to the raw binary payload
             // (CRC-32 + versioned). Mirrors verify_rest_signature's ladder: a
@@ -351,7 +350,7 @@ impl OracleService for AggregatorServiceImpl {
             // behind an unlogged "forged signature" rejection.
             let mut candidates: Vec<(&str, &[u8])> = vec![("", sign_target.as_bytes())];
             if !request.raw_payload.is_empty() {
-                candidates.push(("binary payload", &request.raw_payload));
+                candidates.push(("binary payload", request.raw_payload));
             }
 
             let mut verify_result: anyhow::Result<bool> = Ok(false);
@@ -359,7 +358,7 @@ impl OracleService for AggregatorServiceImpl {
                 match self
                     .state
                     .signature_verifier
-                    .verify_telemetry_signature(&request.meter_id, target, signature)
+                    .verify_telemetry_signature(request.meter_id, target, signature)
                     .await
                 {
                     Ok(true) => {
@@ -415,18 +414,16 @@ impl OracleService for AggregatorServiceImpl {
 
         let mut generated_kwh = request
             .energy_generated
-            .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let mut consumed_kwh = request
             .energy_consumed
-            .as_deref()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
         let mut timestamp = Utc
             .timestamp_opt(request.timestamp, 0)
             .single()
-            .unwrap_or_else(|| gridtokenx_telemetry::time::now());
+            .unwrap_or_else(gridtokenx_telemetry::time::now);
         let mut metadata = HashMap::new();
 
         // DLMS/COSEM (IEC 62056) Decoding
@@ -434,32 +431,29 @@ impl OracleService for AggregatorServiceImpl {
             // Decode the secure frame if it carries one; on skip (None) we keep the request's
             // standard signed fields (the signature gate above already passed) — same fallback
             // the legacy parse-error path used.
-            match self.decode_secure_frame(&request.raw_payload).await {
-                Some(frame) => {
-                    timestamp = frame.timestamp;
-                    if let Some(wh) = frame.active_energy_export_wh {
-                        generated_kwh = (wh as f64) / 1000.0;
-                    }
-                    if let Some(wh) = frame.active_energy_import_wh {
-                        consumed_kwh = (wh as f64) / 1000.0;
-                    }
-                    if let Some(cv) = frame.voltage_cv {
-                        metadata.insert("voltage_v".to_string(), json!((cv as f64) / 100.0));
-                    }
-                    if let Some(ma) = frame.current_ma {
-                        metadata.insert("current_a".to_string(), json!((ma as f64) / 1000.0));
-                    }
-                    if let Some(bps) = frame.battery_soc_bps {
-                        metadata
-                            .insert("battery_level_pct".to_string(), json!((bps as f64) / 100.0));
-                    }
-                    metadata.insert(
-                        "dlms_manufacturer_id".to_string(),
-                        json!(frame.manufacturer_id),
-                    );
+            // Frame skipped (None) ⇒ decode_secure_frame already logged why — fall
+            // back to the standard fields.
+            if let Some(frame) = self.decode_secure_frame(request.raw_payload).await {
+                timestamp = frame.timestamp;
+                if let Some(wh) = frame.active_energy_export_wh {
+                    generated_kwh = (wh as f64) / 1000.0;
                 }
-                // Frame skipped (decode_secure_frame already logged why) — fall back to standard fields.
-                None => {}
+                if let Some(wh) = frame.active_energy_import_wh {
+                    consumed_kwh = (wh as f64) / 1000.0;
+                }
+                if let Some(cv) = frame.voltage_cv {
+                    metadata.insert("voltage_v".to_string(), json!((cv as f64) / 100.0));
+                }
+                if let Some(ma) = frame.current_ma {
+                    metadata.insert("current_a".to_string(), json!((ma as f64) / 1000.0));
+                }
+                if let Some(bps) = frame.battery_soc_bps {
+                    metadata.insert("battery_level_pct".to_string(), json!((bps as f64) / 100.0));
+                }
+                metadata.insert(
+                    "dlms_manufacturer_id".to_string(),
+                    json!(frame.manufacturer_id),
+                );
             }
         }
 
@@ -471,7 +465,7 @@ impl OracleService for AggregatorServiceImpl {
             device_id: request.meter_id.to_string(),
             device_type: DeviceType::SmartMeter,
             serial_number: request.meter_serial.to_string(),
-            zone_code: request.zone_code.as_deref().map(|s| s.to_string()),
+            zone_code: request.zone_code.map(|s| s.to_string()),
             timestamp,
             metrics: DeviceMetrics::Energy {
                 generated_kwh,
@@ -513,17 +507,15 @@ impl OracleService for AggregatorServiceImpl {
             // Signature verification (required for UTT). Fail-CLOSED by default:
             // signed-but-invalid and unsigned are both rejected unless
             // AGGREGATOR_ALLOW_UNVERIFIED_TELEMETRY=true.
-            let sig_verified = if let Some(signature) = tel.signature.as_deref() {
+            let sig_verified = if let Some(signature) = tel.signature {
                 let sign_target = grpc_sign_target(tel.meter_id, tel.kwh, tel.timestamp);
-                let is_verified = match self
-                    .state
-                    .signature_verifier
-                    .verify_telemetry_signature(&tel.meter_id, sign_target.as_bytes(), signature)
-                    .await
-                {
-                    Ok(true) => true,
-                    _ => false,
-                };
+                let is_verified = matches!(
+                    self.state
+                        .signature_verifier
+                        .verify_telemetry_signature(tel.meter_id, sign_target.as_bytes(), signature)
+                        .await,
+                    Ok(true)
+                );
 
                 if !is_verified {
                     warn!("🚫 Invalid signature in batch for meter={}", tel.meter_id);
@@ -540,22 +532,20 @@ impl OracleService for AggregatorServiceImpl {
 
             let mut generated_kwh = tel
                 .energy_generated
-                .as_deref()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
             let mut consumed_kwh = tel
                 .energy_consumed
-                .as_deref()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0.0);
             let mut timestamp = Utc
                 .timestamp_opt(tel.timestamp, 0)
                 .single()
-                .unwrap_or_else(|| gridtokenx_telemetry::time::now());
+                .unwrap_or_else(gridtokenx_telemetry::time::now);
             let mut metadata = HashMap::new();
 
             if !tel.raw_payload.is_empty() {
-                if let Some(frame) = self.decode_secure_frame(&tel.raw_payload).await {
+                if let Some(frame) = self.decode_secure_frame(tel.raw_payload).await {
                     timestamp = frame.timestamp;
                     if let Some(wh) = frame.active_energy_export_wh {
                         generated_kwh = (wh as f64) / 1000.0;
@@ -575,7 +565,7 @@ impl OracleService for AggregatorServiceImpl {
                 device_id: tel.meter_id.to_string(),
                 device_type: DeviceType::SmartMeter,
                 serial_number: tel.meter_serial.to_string(),
-                zone_code: tel.zone_code.as_deref().map(|s| s.to_string()),
+                zone_code: tel.zone_code.map(|s| s.to_string()),
                 timestamp,
                 metrics: DeviceMetrics::Energy {
                     generated_kwh,
@@ -775,7 +765,11 @@ mod tests {
         payload.extend_from_slice(&[0xFF, 0xFF]);
 
         let out = split_bulk_frames(&payload);
-        assert_eq!(out.len(), 1, "the complete entry parses; the truncated tail is dropped");
+        assert_eq!(
+            out.len(),
+            1,
+            "the complete entry parses; the truncated tail is dropped"
+        );
         assert_eq!(out[0].0, &[0x01]);
     }
 
@@ -809,7 +803,10 @@ mod tests {
 
     #[test]
     fn grpc_sign_target_is_meter_kwh_timestamp() {
-        assert_eq!(grpc_sign_target("METER042", "12.5", 1_700_000_000), "METER042:12.5:1700000000");
+        assert_eq!(
+            grpc_sign_target("METER042", "12.5", 1_700_000_000),
+            "METER042:12.5:1700000000"
+        );
         // Zero / negative timestamps render verbatim (no flooring on the gRPC path).
         assert_eq!(grpc_sign_target("M", "0", 0), "M:0:0");
     }

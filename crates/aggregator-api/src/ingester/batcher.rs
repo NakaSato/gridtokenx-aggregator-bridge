@@ -92,8 +92,7 @@ impl BatchHandle {
 fn group_entry_ids_by_stream(
     entries: &[BatchEntry],
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for entry in entries {
         map.entry(entry.stream_name.clone())
             .or_default()
@@ -318,7 +317,11 @@ mod tests {
         ];
         let map = group_entry_ids_by_stream(&entries);
         assert_eq!(map.len(), 2, "one bucket per distinct stream");
-        assert_eq!(map["stream-a"], vec!["1-0", "3-0"], "ids kept in order, none dropped");
+        assert_eq!(
+            map["stream-a"],
+            vec!["1-0", "3-0"],
+            "ids kept in order, none dropped"
+        );
         assert_eq!(map["stream-b"], vec!["2-0"]);
     }
 

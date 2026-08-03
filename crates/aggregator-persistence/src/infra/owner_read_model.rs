@@ -666,7 +666,7 @@ impl OwnerReadModelConsumer {
 }
 
 /// The gate. When `AGGREGATOR_OWNER_READMODEL_FEED` is truthy AND a Postgres pool
-/// + `KAFKA_BOOTSTRAP_SERVERS` are present, run the backfill once (idempotent)
+/// plus `KAFKA_BOOTSTRAP_SERVERS` are present, run the backfill once (idempotent)
 /// then spawn the consumer on the shared `shutdown` future. Disabled by default:
 /// unset/false ⇒ this is a no-op and nothing about the existing service changes.
 ///

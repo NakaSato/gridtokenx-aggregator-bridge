@@ -17,7 +17,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 // Send/sign wire types + canonical-bytes scheme now come from the shared light
@@ -27,7 +27,7 @@ use gridtokenx_blockchain_types::envelope_auth::{
     canonical_mint_batch_bytes, canonical_mint_bytes, EnvelopeSigner,
 };
 use gridtokenx_blockchain_types::nats_schema::{
-    BatchMintItem, EnvelopeAuth, MintEnergyBatchMessage, MintEnergyMessage,
+    BatchMintItem, MintEnergyBatchMessage, MintEnergyMessage,
 };
 
 // Test-only: signing/verify primitives + the scheme tag, used by the

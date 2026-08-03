@@ -21,6 +21,12 @@ pub struct Metrics {
     pub total_grpc_latency_us: AtomicU64,
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Metrics {
     pub fn new() -> Self {
         Self {

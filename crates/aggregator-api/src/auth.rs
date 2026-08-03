@@ -78,9 +78,7 @@ fn iam_breaker() -> Option<&'static gridtokenx_telemetry::breaker::CircuitBreake
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(5);
-        info!(
-            "⚡ IAM circuit breaker enabled (threshold={threshold}, cooldown={cooldown_secs}s)"
-        );
+        info!("⚡ IAM circuit breaker enabled (threshold={threshold}, cooldown={cooldown_secs}s)");
         Some(gridtokenx_telemetry::breaker::CircuitBreaker::new(
             threshold,
             Duration::from_secs(cooldown_secs),
@@ -174,7 +172,11 @@ fn cache_lookup(key: &str) -> Option<bool> {
 /// negative verdicts the shorter `API_KEY_NEGATIVE_TTL`.
 fn cache_store(key: &str, valid: bool) {
     let now = Instant::now();
-    let ttl = if valid { positive_ttl() } else { negative_ttl() };
+    let ttl = if valid {
+        positive_ttl()
+    } else {
+        negative_ttl()
+    };
     let mut cache = match api_key_cache().lock() {
         Ok(c) => c,
         Err(p) => p.into_inner(),
@@ -325,7 +327,11 @@ mod tests {
     #[test]
     fn stored_key_is_a_cache_hit() {
         let key = "test-stored-key-unique-1";
-        assert_eq!(cache_lookup(key), None, "unknown key must miss before store");
+        assert_eq!(
+            cache_lookup(key),
+            None,
+            "unknown key must miss before store"
+        );
         cache_store(key, true);
         assert_eq!(
             cache_lookup(key),
@@ -342,7 +348,11 @@ mod tests {
     #[test]
     fn rejected_key_is_cached_negative() {
         let key = "test-rejected-key-unique-neg";
-        assert_eq!(cache_lookup(key), None, "unknown key must miss before store");
+        assert_eq!(
+            cache_lookup(key),
+            None,
+            "unknown key must miss before store"
+        );
         cache_store(key, false);
         assert_eq!(
             cache_lookup(key),

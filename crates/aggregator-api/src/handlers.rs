@@ -476,7 +476,10 @@ pub async fn ingest_private_network(
                 Err(e) => format!("Verification failed: {}", e),
                 Ok(true) => unreachable!("sig_failure_status returns None for Ok(true)"),
             };
-            warn!("🚫 REST signature rejected for {}: {}", payload.device_id, msg);
+            warn!(
+                "🚫 REST signature rejected for {}: {}",
+                payload.device_id, msg
+            );
             return (code, Json(json!({ "error": msg }))).into_response();
         }
         match result {
@@ -615,7 +618,7 @@ pub async fn ingest_legacy_batch(
                 .collect(),
         };
 
-        let reading_id = reading.reading_id.clone();
+        let reading_id = reading.reading_id;
         let device_type = reading.device_type;
 
         let status = match state.router.disseminate(&reading).await {
@@ -672,9 +675,8 @@ pub async fn ingest_private_network_batch(
     // once: empty/`auto` are allowed (they resolve to dlms), else it must be a
     // supported resolved protocol.
     let top_protocol = payload.protocol.to_lowercase();
-    let top_ok = top_protocol.is_empty()
-        || top_protocol == "auto"
-        || is_supported_protocol(&top_protocol);
+    let top_ok =
+        top_protocol.is_empty() || top_protocol == "auto" || is_supported_protocol(&top_protocol);
     if !top_ok {
         return (
             StatusCode::BAD_REQUEST,
@@ -726,19 +728,18 @@ pub async fn ingest_private_network_batch(
         let is_verified = if protocol == "simulator" && simulator_bypass_allowed() {
             true // Skip signature for simulator mode (dev only)
         } else {
-            match verify_rest_signature(
-                &state,
-                device_id,
-                &item,
-                signature,
-                &canonical_value,
-                timestamp_ms,
+            matches!(
+                verify_rest_signature(
+                    &state,
+                    device_id,
+                    &item,
+                    signature,
+                    &canonical_value,
+                    timestamp_ms,
+                )
+                .await,
+                Ok(true)
             )
-            .await
-            {
-                Ok(true) => true,
-                _ => false,
-            }
         };
 
         if !is_verified && !signature_enforcement_disabled() {
